@@ -1,5 +1,14 @@
 name: Sync the installer from the development site
 
+# The installer is developed in aslater3/LibreEcho-Docs-dev under install/ and
+# published here so it can be served from its own hostname.
+#
+# This workflow deploys Pages itself rather than relying on the push below to
+# trigger pages.yml: a push made with the default GITHUB_TOKEN does not start
+# another workflow, so a synced commit would otherwise land without ever being
+# published. Both workflows share the `pages` concurrency group, so a
+# simultaneous run cancels rather than races.
+
 on:
   schedule:
     - cron: '23 4 * * *'
@@ -7,14 +16,19 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
-  group: sync-installer
+  group: pages
   cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Check out the published site
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,3 +79,20 @@ jobs:
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -am "chore(sync): update the installer from LibreEcho-Docs-dev@dev"
           git push
+
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Stage the site
+        run: |
+          mkdir -p "$RUNNER_TEMP/site"
+          rsync -a --exclude='.git' --exclude='.github' published/ "$RUNNER_TEMP/site/"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
