@@ -71,8 +71,10 @@
       <section class="card">
         <h2>4 · Device</h2>
         <p>Fastboot is where the no-short route starts. Put the device into fastboot, then grant access in the browser prompt. The device identifier is masked here and is never written to the log in full.</p>
+        <p class="fine-print">If the chooser lists nothing, the device is not presenting an identity this page knows (they are listed in <a href="NOTES.html">the installer notes</a>). Use the unfiltered chooser — these devices report device class 0, so a class-based filter cannot match them.</p>
         <div class="actions">
           <button id="btn-connect" class="primary" type="button">Connect device (fastboot)</button>
+          <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
           <button id="btn-recovery" class="ghost" type="button">Find recovery over ADB</button>
         </div>
         <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>

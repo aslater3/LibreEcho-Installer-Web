@@ -66,6 +66,20 @@
       <li>Direct device connection: a data-capable cable, and no hub in between if the device is fussy about enumeration.</li>
     </ul>
 
+    <h2>USB identities the installer expects</h2>
+    <p>The device chooser is filtered with the identities an Echo presents in each mode. The page needs no filter entry for a mode it does not use, but a missing entry means an empty chooser, so the unfiltered <em>Show all USB devices…</em> button exists as the escape hatch.</p>
+    <table>
+      <thead><tr><th>Mode</th><th>USB identity</th><th>How it presents</th></tr></thead>
+      <tbody>
+        <tr><td>Fastboot (stock or unlocked)</td><td><code>18d1:4ee0</code>–<code>18d1:4ee7</code>, <code>18d1:d00d</code>, <code>0e8d:201c</code>, <code>0e8d:2001</code></td><td>Vendor-specific interface with a bulk in/out pair; <code>getvar product</code> answers.</td></tr>
+        <tr><td>ADB — installed LibreEcho image</td><td><code>18d1:d001</code> <em>(measured)</em></td><td>Interface at class <code>0xFF</code> subclass <code>0x42</code> protocol <code>0x01</code>; product string <code>MT8163-ARM32-ADB</code>.</td></tr>
+        <tr><td>ADB — TWRP recovery</td><td><code>18d1:4ee0</code>–<code>18d1:4ee7</code>, <code>18d1:d00d</code></td><td>Same ADB interface triple; TWRP answers without an authentication token.</td></tr>
+        <tr><td>Preloader USB download</td><td><code>0e8d:2000</code> <em>(measured)</em></td><td>CDC-ACM pair, device class <code>2</code>, product string like <code>Failed to load LK</code>. This is a download-mode state awaiting a host tool, <strong>not</strong> fastboot, and it resets on a timer if nothing connects.</td></tr>
+        <tr><td>Boot ROM (BROM)</td><td><code>0e8d:0003</code></td><td>Reached with the eMMC short or a cleared preloader header.</td></tr>
+      </tbody>
+    </table>
+    <p>These devices report device class <code>0</code> with per-interface classes, so a WebUSB <code>classCode</code> filter never matches them: an identity has to be named, or the chooser left unfiltered.</p>
+
     <h2>What the installer will not do</h2>
     <ul>
       <li>It never downloads or guesses an unlock payload. Payload selection is bound to the device's own LK build description, and the file must come from the operator.</li>

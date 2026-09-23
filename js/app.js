@@ -45,6 +45,7 @@ const dom = {
     run: document.getElementById("btn-run"),
     abort: document.getElementById("btn-abort"),
     recovery: document.getElementById("btn-recovery"),
+    connectAny: document.getElementById("btn-connect-any"),
   },
 };
 
@@ -246,10 +247,11 @@ async function verifyBundle(fileList) {
 
 // --- device ----------------------------------------------------------------
 
-async function connectFastboot() {
+async function connectFastboot({ any = false } = {}) {
   currentStage("device");
   try {
-    const session = await openFastboot({ onLog: (line) => terminal.line(line) });
+    if (any) terminal.info("unfiltered chooser: the browser will list every USB device on this machine");
+    const session = await openFastboot({ onLog: (line) => terminal.line(line), any });
     state.fastboot = session;
     terminal.ok(`fastboot device ready: ${describeUsbDevice(session.device)}`);
     currentStage("identity");
@@ -492,6 +494,11 @@ dom.payloadInput?.addEventListener("change", (event) => {
 });
 dom.buttons.connect?.addEventListener("click", () => {
   connectFastboot().catch((error) => terminal.error(`device connection failed: ${error.message}`));
+});
+dom.buttons.connectAny?.addEventListener("click", () => {
+  connectFastboot({ any: true }).catch((error) =>
+    terminal.error(`device connection failed (unfiltered): ${error.message}`),
+  );
 });
 dom.buttons.recovery?.addEventListener("click", () => {
   findRecovery().catch((error) => terminal.error(`recovery connection failed: ${error.message}`));

@@ -6,22 +6,28 @@
 // mass-storage interface, which is why nothing here depends on one.
 
 export const MODES = {
+  // Identities measured on real hardware are marked [measured]; the rest come
+  // from the platform documentation. Note that these devices report
+  // bDeviceClass 0 (classing is per-interface), so a WebUSB `classCode` filter
+  // never matches them — an unfiltered chooser is the fallback, not a
+  // class-based filter.
   brom: {
     id: "brom",
     label: "Boot ROM (BROM)",
-    detail: "MediaTek boot ROM. Used by the short-based recovery route.",
-    filters: [{ vendorId: 0x0e8d, productId: 0x0003 }, { vendorId: 0x0e8d, productId: 0x2000 }],
+    detail: "MediaTek boot ROM. Reached with the eMMC short (or a cleared preloader header).",
+    filters: [{ vendorId: 0x0e8d, productId: 0x0003 }],
   },
   preloader: {
     id: "preloader",
     label: "Preloader USB download",
-    detail: "Insecure preloader download port. Reported identity 0e8d:2000.",
+    detail:
+      "The preloader awaiting a download-agent handshake. [measured] It presents a CDC-ACM pair with the product string \"Failed to load LK\" when the boot chain fell back to download mode.",
     filters: [{ vendorId: 0x0e8d, productId: 0x2000 }],
   },
   fastboot: {
     id: "fastboot",
     label: "Fastboot",
-    detail: "Android/MTK fastboot. This is where the no-short install starts.",
+    detail: "Android/MediaTek fastboot. This is where the no-short install starts.",
     filters: [
       { vendorId: 0x18d1, productId: 0x4ee0 },
       { vendorId: 0x18d1, productId: 0x4ee1 },
@@ -31,11 +37,9 @@ export const MODES = {
       { vendorId: 0x18d1, productId: 0x4ee5 },
       { vendorId: 0x18d1, productId: 0x4ee6 },
       { vendorId: 0x18d1, productId: 0x4ee7 },
+      { vendorId: 0x18d1, productId: 0xd00d },
       { vendorId: 0x0e8d, productId: 0x201c },
       { vendorId: 0x0e8d, productId: 0x2001 },
-      // Last-resort catch-all: the request prompt still needs the operator to
-      // choose the device, and classification happens from descriptors after.
-      { classCode: 0xff },
     ],
   },
   adb: {
@@ -43,6 +47,11 @@ export const MODES = {
     label: "ADB (TWRP recovery or the installed image)",
     detail: "Used to push the bundle, drive the recovery installer and read receipts.",
     filters: [
+      // [measured] LibreEcho's own adbd on the running image: 18d1:d001 with the
+      // interface at class 0xFF subclass 0x42 protocol 0x01.
+      { vendorId: 0x18d1, productId: 0xd001 },
+      { vendorId: 0x18d1, productId: 0xd00d },
+      { vendorId: 0x18d1, productId: 0x4ee0 },
       { vendorId: 0x18d1, productId: 0x4ee1 },
       { vendorId: 0x18d1, productId: 0x4ee2 },
       { vendorId: 0x18d1, productId: 0x4ee3 },
@@ -50,12 +59,14 @@ export const MODES = {
       { vendorId: 0x18d1, productId: 0x4ee5 },
       { vendorId: 0x18d1, productId: 0x4ee6 },
       { vendorId: 0x18d1, productId: 0x4ee7 },
-      { vendorId: 0x18d1, productId: 0xd00d },
       { vendorId: 0x0e8d, productId: 0x201d },
-      { classCode: 0xff },
     ],
   },
 };
+
+/** Unfiltered chooser: every USB device the machine exposes. */
+export const NO_FILTERS = [];
+
 
 export function webusbSupport() {
   if (typeof navigator === "undefined" || !navigator.usb) {

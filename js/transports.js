@@ -12,7 +12,7 @@
 //   webusb-adb-transport.js      WebUsbAdbTransport.requestDevice({filters}) /
 //                                .attachExisting({filters}) / new + open()
 
-import { MODES } from "./device.js";
+import { MODES, webusbSupport } from "./device.js";
 
 const FASTBOOT_MODULE = "../lib/fastboot/fastboot.js";
 const FASTBOOT_TRANSPORT = "../lib/fastboot/webusb-fastboot-transport.js";
@@ -25,9 +25,25 @@ export function fastbootFilters(mode = "fastboot") {
 }
 
 function adbFilters() {
-  // The transport requires a vendorId in every filter; the class-only catch-all
-  // is not usable there, so it is dropped rather than silently ignored.
+  // The transport requires a vendorId in every filter, so only vendor-keyed
+  // entries are usable there.
   return MODES.adb.filters.filter((filter) => typeof filter.vendorId === "number");
+}
+
+/**
+ * Prompts for any USB device, with no filter list.
+ *
+ * The fastboot transport's own helper rejects an empty filter array, and a
+ * classCode filter cannot help here: these devices report bDeviceClass 0, so
+ * class-based filters never match them. Asking WebUSB for an unfiltered chooser
+ * is the only way to see an identity that is not already in the table above.
+ */
+export async function promptAnyDevice({ onLog } = {}) {
+  const support = webusbSupport();
+  if (!support.ok) throw new Error(support.reason);
+  const device = await navigator.usb.requestDevice({ filters: [] });
+  if (onLog) onLog(`unfiltered chooser returned ${device.vendorId}:${device.productId}${device.productName ? ` (${device.productName})` : ""}`);
+  return device;
 }
 
 async function importOrNull(path) {
@@ -68,16 +84,22 @@ export async function protocolSupport() {
 /**
  * Opens a fastboot session. Without a device the transport prompts the operator
  * through the browser's own device chooser; with one it attaches directly.
+ * `any: true` uses an unfiltered chooser, for an identity not in the table.
  */
-export async function openFastboot({ device = null, onLog } = {}) {
+export async function openFastboot({ device = null, onLog, any = false } = {}) {
   const support = await protocolSupport();
   if (!support.fastboot.ok) throw new Error(support.fastboot.reason);
   if (!support.fastbootTransport.ok) throw new Error(support.fastbootTransport.reason);
   const TransportClass = support.fastbootTransport.value;
-  const filter = fastbootFilters("fastboot");
-  const transport = device
-    ? await TransportClass.fromDevice(device)
-    : await TransportClass.open(filter);
+  let transport;
+  if (device) {
+    transport = await TransportClass.fromDevice(device);
+  } else if (any) {
+    const chosen = await promptAnyDevice({ onLog });
+    transport = await TransportClass.fromDevice(chosen);
+  } else {
+    transport = await TransportClass.open(fastbootFilters("fastboot"));
+  }
   const client = new support.fastboot.value(transport, {
     onInfo: (line) => onLog && onLog(`fastboot: ${line}`),
   });
@@ -86,14 +108,20 @@ export async function openFastboot({ device = null, onLog } = {}) {
 }
 
 /** Opens an ADB session, prompting for the device when one is not supplied. */
-export async function openAdb({ device = null, onLog } = {}) {
+export async function openAdb({ device = null, onLog, any = false } = {}) {
   const support = await protocolSupport();
   if (!support.adb.ok) throw new Error(support.adb.reason);
   if (!support.adbTransport.ok) throw new Error(support.adbTransport.reason);
   const TransportClass = support.adbTransport.value;
-  const transport = device
-    ? await new TransportClass(device, {}).open()
-    : await TransportClass.requestDevice({ filters: adbFilters() });
+  let transport;
+  if (device) {
+    transport = await new TransportClass(device, {}).open();
+  } else if (any) {
+    const chosen = await promptAnyDevice({ onLog });
+    transport = await new TransportClass(chosen, {}).open();
+  } else {
+    transport = await TransportClass.requestDevice({ filters: adbFilters() });
+  }
   const client = new support.adb.value(transport);
   const info = await client.connect({ banner: "host::libreecho-browser-installer" });
   if (onLog) {
