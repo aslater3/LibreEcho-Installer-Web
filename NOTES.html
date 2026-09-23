@@ -71,7 +71,7 @@
     <table>
       <thead><tr><th>Mode</th><th>USB identity</th><th>How it presents</th></tr></thead>
       <tbody>
-        <tr><td>Fastboot (stock or unlocked)</td><td><code>18d1:4ee0</code>–<code>18d1:4ee7</code>, <code>18d1:d00d</code>, <code>0e8d:201c</code>, <code>0e8d:2001</code></td><td>Vendor-specific interface with a bulk in/out pair; <code>getvar product</code> answers.</td></tr>
+        <tr><td>Fastboot (stock or unlocked)</td><td><code>0bb4:0c01</code> <em>(measured)</em>, <code>18d1:4ee0</code>–<code>18d1:4ee7</code>, <code>18d1:d00d</code>, <code>0e8d:201c</code>, <code>0e8d:2001</code></td><td>Vendor-specific interface with a bulk in/out pair; <code>getvar product</code> answers. <code>0bb4</code> is HTC's vendor id and is what this platform has been seen to present in fastboot.</td></tr>
         <tr><td>ADB — installed LibreEcho image</td><td><code>18d1:d001</code> <em>(measured)</em></td><td>Interface at class <code>0xFF</code> subclass <code>0x42</code> protocol <code>0x01</code>; product string <code>MT8163-ARM32-ADB</code>.</td></tr>
         <tr><td>ADB — TWRP recovery</td><td><code>18d1:4ee0</code>–<code>18d1:4ee7</code>, <code>18d1:d00d</code></td><td>Same ADB interface triple; TWRP answers without an authentication token.</td></tr>
         <tr><td>Preloader USB download</td><td><code>0e8d:2000</code> <em>(measured)</em></td><td>CDC-ACM pair, device class <code>2</code>, product string like <code>Failed to load LK</code>. This is a download-mode state awaiting a host tool, <strong>not</strong> fastboot, and it resets on a timer if nothing connects.</td></tr>
