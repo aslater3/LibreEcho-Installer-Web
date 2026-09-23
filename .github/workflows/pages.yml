@@ -1,0 +1,85 @@
+name: Deploy installer site to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '47 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the site contract
+        run: |
+          set -euo pipefail
+          test -f index.html
+          test -f NOTES.html
+          test -f css/installer.css
+          test -f js/app.js
+          test -f lib/fastboot/fastboot.js
+          test -f lib/adb/adb.js
+          # Every relative reference in the page must exist in the artifact, and
+          # no page may reach outside the site root.
+          python3 - <<'PY'
+          import pathlib, re, sys
+          root = pathlib.Path('.')
+          problems = []
+          for page in sorted(root.glob('*.html')):
+              text = page.read_text(encoding='utf-8')
+              for ref in re.findall(r'(?:href|src)="([^"]+)"', text):
+                  if ref.startswith(('#', 'http://', 'https://', 'mailto:', 'data:', '//')):
+                      continue
+                  target = (page.parent / ref.split('#')[0].split('?')[0])
+                  if ref.endswith('/'):
+                      target = target / 'index.html'
+                  resolved = target.resolve()
+                  if not resolved.exists():
+                      problems.append(f'{page}: missing {ref}')
+                  elif root.resolve() not in resolved.parents and resolved != root.resolve():
+                      problems.append(f'{page}: {ref} escapes the site root')
+          if problems:
+              print('\n'.join(problems))
+              sys.exit(1)
+          print('site contract OK')
+          PY
+      - name: Unit-test the protocol layers
+        run: |
+          set -euo pipefail
+          (cd lib/fastboot && node --test test_fastboot.mjs)
+          (cd lib/adb && node --test test_adb.mjs)
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Stage the site
+        run: |
+          mkdir -p "$RUNNER_TEMP/site"
+          rsync -a --exclude='.git' --exclude='.github' ./ "$RUNNER_TEMP/site/"
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

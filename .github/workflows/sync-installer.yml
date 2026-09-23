@@ -1,0 +1,67 @@
+name: Sync the installer from the development site
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-installer
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the published site
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: published
+
+      - name: Check out the development site
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: aslater3/LibreEcho-Docs-dev
+          ref: dev
+          path: source
+          persist-credentials: false
+
+      - name: Copy install/ and rewrite the two parent-relative artwork paths
+        run: |
+          set -euo pipefail
+          rm -rf published/css published/js published/lib
+          cp -r source/install/css published/css
+          cp -r source/install/js published/js
+          cp -r source/install/lib published/lib
+          cp source/install/index.html source/install/NOTES.html published/
+          mkdir -p published/assets/images
+          cp source/assets/images/mark.svg source/assets/images/favicon.svg published/assets/images/
+          sed -i 's#"\.\./assets/images/#"assets/images/#g' published/index.html published/NOTES.html
+          if grep -rn '\.\./assets' published --include='*.html'; then
+            echo "a parent-relative reference survived the rewrite" >&2
+            exit 1
+          fi
+
+      - name: Verify the synced site
+        run: |
+          set -euo pipefail
+          (cd published/lib/fastboot && node --test test_fastboot.mjs)
+          (cd published/lib/adb && node --test test_adb.mjs)
+
+      - name: Commit when the installer changed
+        run: |
+          set -euo pipefail
+          cd published
+          rm -rf source
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "installer is already current"
+            exit 0
+          fi
+          git diff --stat
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -am "chore(sync): update the installer from LibreEcho-Docs-dev@dev"
+          git push

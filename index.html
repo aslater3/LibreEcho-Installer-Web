@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="LibreEcho browser installer preview: verify a published release, talk to the device over USB with WebUSB, and run the one-shot install with a terminal progress monitor.">
+  <meta name="theme-color" content="#081622">
+  <meta name="robots" content="noindex">
+  <title>LibreEcho browser installer — preview</title>
+  <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml" onerror="this.remove()">
+  <link rel="stylesheet" href="css/installer.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="installer-header">
+    <a class="brand" href="https://dev.libreecho.org/">
+      <img src="assets/images/mark.svg" alt="" width="30" height="30" onerror="this.remove()">
+      <span>LibreEcho</span>
+    </a>
+    <nav aria-label="Installer navigation">
+      <a href="NOTES.html">Installer notes</a>
+      <a href="https://dev.libreecho.org/demo/">Control Centre demo</a>
+      <a href="https://github.com/aslater3/LibreEcho" rel="noopener">Product repository</a>
+      <a href="https://libreecho.org/">Public site</a>
+    </nav>
+  </header>
+
+  <section class="installer-intro">
+    <p class="eyebrow">Browser one-shot installer · preview</p>
+    <h1>Install LibreEcho from the browser.</h1>
+    <p>This page runs the install from your browser: it verifies a published release, asks the browser for USB access to the device, and drives the same stages the reviewed host installer drives — fastboot identity, the no-short unlock submission, the recovery-side initial install and a readback receipt after every write.</p>
+    <p>No Python, no platform tools, no drivers: the browser is the host. Only Chromium-based desktop browsers expose WebUSB.</p>
+    <div class="preview-banner">
+      <strong>Preview, not a supported path.</strong> This runs on recoverable hardware only, it modifies device storage, and the install stages are not hardware-validated yet. If you have one device you care about, do not be the first to try it. The supported route today is the published release and its installation guide.
+    </div>
+  </section>
+
+  <div class="layout">
+    <div>
+      <section class="card">
+        <h2>1 · Browser capability</h2>
+        <p>WebUSB and the protocol modules are checked before anything touches a device.</p>
+        <div id="capability" aria-live="polite"></div>
+      </section>
+
+      <section class="card">
+        <h2>2 · Release</h2>
+        <div class="field">
+          <label for="release-select">Release to install</label>
+          <select id="release-select" aria-describedby="release-meta"></select>
+        </div>
+        <div class="actions">
+          <button id="btn-refresh" class="ghost" type="button">Refresh release list</button>
+        </div>
+        <div id="release-meta" class="status-line" style="display:block"></div>
+        <p class="status-line">Release state: <span id="status-release" class="pill" data-state="pending">not loaded</span></p>
+      </section>
+
+      <section class="card">
+        <h2>3 · Verified bundle</h2>
+        <p>The release download endpoint does not allow cross-origin reads, so the browser cannot pull the payloads for you. Download the release assets from the release page, then select them here: every file is hashed locally and compared with the release's own <code>SHA256SUMS</code> before anything is pushed to the device.</p>
+        <input id="bundle-input" type="file" multiple aria-label="Release bundle files">
+        <input id="bundle-folder-input" type="file" multiple webkitdirectory directory aria-label="Release bundle folder">
+        <div class="actions">
+          <button id="btn-bundle" type="button">Select bundle files…</button>
+          <button class="ghost" type="button" onclick="document.getElementById('bundle-folder-input').click()">Select the whole folder…</button>
+        </div>
+        <p class="status-line">Bundle state: <span id="status-bundle" class="pill" data-state="pending">nothing selected</span></p>
+      </section>
+
+      <section class="card">
+        <h2>4 · Device</h2>
+        <p>Fastboot is where the no-short route starts. Put the device into fastboot, then grant access in the browser prompt. The device identifier is masked here and is never written to the log in full.</p>
+        <div class="actions">
+          <button id="btn-connect" class="primary" type="button">Connect device (fastboot)</button>
+          <button id="btn-recovery" class="ghost" type="button">Find recovery over ADB</button>
+        </div>
+        <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
+        <div id="device-panel" aria-live="polite"></div>
+      </section>
+
+      <section class="card">
+        <h2>5 · Unlock payload (only for a locked device)</h2>
+        <p>The unlock submission is bound to the device's own LK build description. The payload is distributed inside the community unlock archive rather than in any repository, so it is never downloaded by this page: select the file you obtained, and the installer will submit it only if the detected build has a declared payload. A timeout after submission is reported as an unknown outcome and is never retried automatically.</p>
+        <input id="payload-input" type="file" aria-label="Unlock payload image">
+        <div class="actions">
+          <button class="ghost" type="button" onclick="document.getElementById('payload-input').click()">Select unlock payload…</button>
+        </div>
+        <p class="status-line">Payload state: <span id="status-payload" class="pill" data-state="pending">none selected</span></p>
+      </section>
+
+      <section class="card">
+        <h2>6 · Stages</h2>
+        <ol id="step-list" class="step-list"></ol>
+        <div class="actions">
+          <button id="btn-dry-run" class="ghost" type="button">Rehearse (no writes)</button>
+          <button id="btn-run" class="primary" type="button">Run the install</button>
+          <button id="btn-abort" class="ghost" type="button" disabled>Stop</button>
+        </div>
+      </section>
+    </div>
+
+    <div>
+      <section class="card terminal-card">
+        <div class="terminal-head">
+          <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <strong>install progress</strong>
+          <button id="download-log" class="ghost" type="button">Save log</button>
+        </div>
+        <ol id="terminal" aria-live="polite" aria-label="Install progress log"></ol>
+      </section>
+
+      <section class="card">
+        <h2>What each stage verifies</h2>
+        <ul>
+          <li><strong>Release</strong> — the published <code>SHA256SUMS</code> inventory is read and required assets are present.</li>
+          <li><strong>Bundle</strong> — every selected file is hashed in the browser and compared with the release digest.</li>
+          <li><strong>Device</strong> — <code>getvar product</code>, <code>unlock_status</code> and the LK build description are read from the device itself; an unknown target stops the run.</li>
+          <li><strong>Unlock</strong> — the payload for the detected LK build only, with an explicit unknown-outcome state.</li>
+          <li><strong>Recovery</strong> — TWRP is confirmed over ADB before any write.</li>
+          <li><strong>Stage</strong> — the pushed files are re-hashed with the device's own <code>sha256sum</code>, not trusted because the push reported success.</li>
+          <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+</div>
+
+<footer class="installer-footer">
+  <div class="wrap">
+    <p>An independent open-source project. Not affiliated with, authorised by, or endorsed by Amazon. Reading, writing or reflashing a device can make it unrecoverable; keep a recovery route.</p>
+    <p><a href="NOTES.html">Installer notes and limitations</a> · <a href="https://github.com/aslater3/LibreEcho/issues">Report a problem</a></p>
+  </div>
+</footer>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="LibreEcho browser installer notes: what it does, what it refuses to do, which browser features it needs, and how to configure an asset mirror.">
+  <meta name="theme-color" content="#081622">
+  <title>LibreEcho browser installer — notes</title>
+  <link rel="icon" href="assets/images/favicon.svg" type="image/svg+xml" onerror="this.remove()">
+  <link rel="stylesheet" href="css/installer.css">
+  <style>
+    .notes ul{max-width:88ch}
+    .notes .wrap{padding-bottom:4rem}
+    .back{display:inline-block;margin:1.5rem 0 0}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header class="installer-header">
+    <a class="brand" href="index.html">
+      <img src="assets/images/mark.svg" alt="" width="30" height="30" onerror="this.remove()">
+      <span>LibreEcho installer notes</span>
+    </a>
+    <nav aria-label="Installer navigation">
+      <a href="index.html">Installer</a>
+      <a href="https://dev.libreecho.org/">Development site</a>
+      <a href="https://libreecho.org/">Public site</a>
+    </nav>
+  </header>
+
+  <main class="notes">
+    <section class="installer-intro">
+      <p class="eyebrow">Browser one-shot installer</p>
+      <h1>What this installer does, and what it refuses to do.</h1>
+      <p>This page is the operator's reference for the browser installer preview at <code>/install/</code> — published for now as part of the development site, and intended to move to its own hostname (<code>install.dev.libreecho.org</code>) once the site is promoted.</p>
+    </section>
+
+    <h2>The install route</h2>
+    <p>The browser installer implements the same no-short route as the host installer, with the browser as the USB host:</p>
+    <table>
+      <thead><tr><th>Stage</th><th>What happens</th><th>What it checks</th></tr></thead>
+      <tbody>
+        <tr><td>Release</td><td>The published release inventory is read.</td><td><code>SHA256SUMS</code> is fetched or supplied, and the required assets are present.</td></tr>
+        <tr><td>Bundle</td><td>Payload bytes are selected locally.</td><td>Each file is hashed in the browser and compared with the release digest before it is used.</td></tr>
+        <tr><td>Device</td><td>WebUSB permission prompt, then a fastboot session.</td><td><code>product</code>, <code>unlock_status</code>, the LK build description and the download size limit are read from the device.</td></tr>
+        <tr><td>Unlock</td><td>The per-LK-build payload is submitted to the <code>brick</code> target.</td><td>The payload is only eligible if the detected build has a declared entry; the name is reported and the outcome is explicit.</td></tr>
+        <tr><td>Recovery</td><td>ADB connects to TWRP.</td><td>Recovery is confirmed before any write.</td></tr>
+        <tr><td>Stage</td><td>The verified files are pushed to <code>/cache/libreecho-bundle</code>.</td><td>Every pushed file is re-hashed with the device's own <code>sha256sum</code>.</td></tr>
+        <tr><td>Prepare / Install</td><td>The recovery installer zip is run over ADB, twice if a reboot is required.</td><td>The installer's own receipt at <code>/cache/libreecho-install-receipt</code> is read back after each run.</td></tr>
+        <tr><td>Verify</td><td>The device is rebooted.</td><td>A successful receipt is required; nothing is claimed about runtime behaviour.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Why the payloads come from your own download</h2>
+    <p>Measured from a GitHub Pages origin (the development site), a browser can read <code>api.github.com</code> and <code>raw.githubusercontent.com</code>, but it cannot read <code>github.com/&lt;owner&gt;/&lt;repo&gt;/releases/download/…</code>: the redirect response carries no <code>Access-Control-Allow-Origin</code> header, so the fetch fails before any bytes are readable. The network path itself works — the response simply cannot be read by a page.</p>
+    <p>Two honest consequences:</p>
+    <ul>
+      <li><strong>Default:</strong> download the release assets with your browser from the release page, then select them (or the whole folder) in the installer. Verification against the release's own <code>SHA256SUMS</code> still happens in the browser, so the integrity gate is unchanged.</li>
+      <li><strong>Optional:</strong> if you run a CORS-enabled mirror of the release assets (for example a small worker in front of the release URLs), point the installer at it with <code>?mirror=https://…</code> or a <code>window.LIBREECHO_INSTALLER_CONFIG = { mirrorBase: "…" }</code> script tag, and the payloads are fetched in-page with progress. Nothing in the installer requires this.</li>
+    </ul>
+
+    <h2>Browser requirements</h2>
+    <ul>
+      <li>Desktop Chromium-family browser (Chrome, Edge, Brave, Opera). Firefox and Safari do not expose WebUSB.</li>
+      <li>HTTPS (or <code>localhost</code>): WebUSB requires a secure context. GitHub Pages is HTTPS.</li>
+      <li>Direct device connection: a data-capable cable, and no hub in between if the device is fussy about enumeration.</li>
+    </ul>
+
+    <h2>What the installer will not do</h2>
+    <ul>
+      <li>It never downloads or guesses an unlock payload. Payload selection is bound to the device's own LK build description, and the file must come from the operator.</li>
+      <li>It never retries an unlock submission after an unknown outcome. A timeout during <code>flash brick</code> is reported as unknown and the run stops.</li>
+      <li>It never writes to <code>expdb</code>, <code>lk_a</code>, <code>lk_b</code>, <code>tee1</code>, <code>tee2</code>, <code>preloader</code>, the GPT, <code>persist</code>, <code>recovery</code>, <code>system_a</code> or <code>system_b</code>. The recovery installer enforces that list; this page cannot widen it.</li>
+      <li>It never trusts a transfer result: pushed files are re-hashed on the device, and the install result comes from the installer's receipt.</li>
+      <li>It never publishes a device identifier. Serials are masked in the UI and are not written to the log.</li>
+      <li>It does not format or reshape partitions from the browser. That work exists in recovery (<code>sgdisk</code>, <code>mke2fs</code>) and is done there, by the installer zip, on the device.</li>
+    </ul>
+
+    <h2>Status</h2>
+    <p>This is a preview. The protocol layers (fastboot and ADB over WebUSB) are implemented and unit-tested against scripted devices; the browser UI, release verification and stage orchestration are implemented and exercised in the browser. <strong>No stage has been run against Echo hardware from a browser yet</strong> — that validation is the next gate, and until it is done the supported install route remains the published release and its guide.</p>
+
+    <h2>Reporting</h2>
+    <p>Use the installer's <em>Save log</em> button and attach the log with the exact release tag, the device mode you started from (stock fastboot or recovery), and the first message that did not match this page. Do not paste device serials, MAC addresses, Wi-Fi credentials or provider tokens.</p>
+    <a class="back text-link" href="index.html">← Back to the installer</a>
+  </main>
+</div>
+<footer class="installer-footer">
+  <div class="wrap">
+    <p>An independent open-source project. Not affiliated with, authorised by, or endorsed by Amazon.</p>
+  </div>
+</footer>
+</body>
+</html>
