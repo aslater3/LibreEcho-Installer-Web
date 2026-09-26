@@ -34,6 +34,13 @@ parent-relative in the development tree. Run it (or the equivalent manual copy)
 whenever the installer changes upstream; do not edit the published copy by hand
 unless the change is meant to exist only here.
 
+**Temporary sync safety pin:** while upstream PR #5 is not merged into `dev`,
+the scheduled workflow checks out exact Docs-dev commit
+`a4978f7ecc53f643bdd953d89e513c94b5e162da` rather than the older `dev`
+branch. This prevents an automatic rollback of the fail-closed preview after
+publication. Restore `ref: dev` only after upstream `dev` contains those tested
+installer bytes and the sync checks pass against that ref.
+
 ## Deployment
 
 Pages is configured with **build_type: workflow**, `.github/workflows/pages.yml`
@@ -52,8 +59,24 @@ CNAME  install.dev  →  aslater3.github.io
 
 * Preview: the page carries `noindex`, and `robots.txt` denies crawling. Both
   should be flipped when the installer is announced publicly.
-* The installer has not been run against Echo hardware from a browser. Protocol
-  layers are unit-tested against scripted devices; the rest is browser-tested
-  only up to the USB permission prompt.
+* The installer is a fail-closed preview: **Run is disabled** until the exact
+  target board has a hardware-accepted, marker-safe boot image. The Dot can
+  experimentally run a Radar image on its shared MT8163 hardware, but that is
+  not a qualified Biscuit one-shot installation. Rehearse performs no writes.
+* The sync and Pages jobs run protocol tests **and** the browser stage safety
+  tests before publication. These are scripted-device/host checks, not a WebUSB
+  hardware install or proof that an oversized fastbrick is accepted by the LK.
+* The read-only Query Device step was exercised on an Echo Dot 2 through a
+  temporary local Chrome profile; it returned targeted fastboot getvars and
+  left the unit locked. Its full serial appeared only in the local device
+  panel, not the saved terminal log. The unlock, recovery and install write
+  stages have **not** been run from a browser.
+* Amonet acquisition now accepts an exact SHA-256-pinned community ZIP and
+  automatically extracts/hashes the LK-build-specific fastbrick member. A
+  separately configured HTTPS/CORS mirror can supply that ZIP automatically;
+  no mirror is configured by default because the XDA attachment is not
+  browser-readable, and the binary is not redistributed in this repository.
+  The pinned Biscuit ZIP was verified host-side and in a browser against a
+  temporary loopback CORS mirror without requesting USB permission.
 * Licence: MIT for the website source, as in the development repository. See
   `LICENSE` and `THIRD_PARTY_NOTICES.md`.

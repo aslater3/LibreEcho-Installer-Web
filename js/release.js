@@ -36,14 +36,29 @@ export function installerConfig() {
     const params = new URLSearchParams(window.location.search);
     query = {
       mirror: params.get("mirror") ?? undefined,
+      amonetMirror: params.get("amonetMirror") ?? undefined,
       release: params.get("release") ?? undefined,
     };
   }
   return {
     repository: query.repository ?? global.repository ?? DEFAULT_REPOSITORY,
     mirrorBase: (query.mirror ?? global.mirrorBase ?? "").replace(/\/+$/, ""),
+    amonetMirrorBase: (query.amonetMirror ?? global.amonetMirrorBase ?? "").replace(/\/+$/, ""),
     releaseTag: query.release ?? global.releaseTag ?? "",
   };
+}
+
+export function amonetArchiveUrl(base, archiveName) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.zip$/.test(archiveName) || archiveName.includes('..')) {
+    throw new Error('invalid pinned Amonet archive name');
+  }
+  const url = new URL(base);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) {
+    throw new Error('Amonet mirror must use HTTPS (loopback HTTP is for local tests only)');
+  }
+  if (url.username || url.password || url.search || url.hash) throw new Error('invalid Amonet mirror URL');
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/${encodeURIComponent(archiveName)}`;
+  return url.toString();
 }
 
 export function releaseAssetUrl(tag, name, repository = DEFAULT_REPOSITORY) {
@@ -81,6 +96,7 @@ export async function fetchReleaseIndex(repository = DEFAULT_REPOSITORY) {
           name: asset.name,
           size: asset.size,
           url: asset.browser_download_url,
+          digest: asset.digest,
         })),
       };
     })
@@ -106,8 +122,13 @@ export function parseSums(text) {
     const line = rawLine.trim();
     if (!line) continue;
     const match = /^(?<hash>[0-9a-fA-F]{64})\s+\*?(?<name>.+)$/.exec(line);
-    if (!match) continue;
-    sums.set(match.groups.name.trim(), match.groups.hash.toLowerCase());
+    if (!match) throw new Error(`invalid SHA256SUMS line: ${line.slice(0, 80)}`);
+    const name = match.groups.name.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name === '.' || name === '..') {
+      throw new Error(`invalid checksum filename: ${name.slice(0, 80)}`);
+    }
+    if (sums.has(name)) throw new Error(`duplicate checksum filename: ${name}`);
+    sums.set(name, match.groups.hash.toLowerCase());
   }
   if (sums.size === 0) throw new Error("no usable digests found in SHA256SUMS");
   return sums;
@@ -199,6 +220,7 @@ export async function verifyBundleFiles(files, { sums, onProgress, onFile }) {
     if (base && !byName.has(base)) byName.set(base, file);
   }
   const checked = [];
+  const verified = new Map();
   const missing = [];
   const failed = [];
   let index = 0;
@@ -213,8 +235,10 @@ export async function verifyBundleFiles(files, { sums, onProgress, onFile }) {
       onProgress: (fraction) => onProgress && onProgress(index / sums.size, name, fraction),
     });
     if (onFile) onFile(name, file, actual, expected);
-    if (actual === expected) checked.push({ name, size: file.size, sha256: actual });
-    else failed.push({ name, expected, actual, file });
+    if (actual === expected) {
+      checked.push({ name, size: file.size, sha256: actual });
+      verified.set(name, file);
+    } else failed.push({ name, expected, actual, file });
   }
-  return { checked, missing, failed, byName };
+  return { checked, missing, failed, byName: verified };
 }

@@ -39,7 +39,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: aslater3/LibreEcho-Docs-dev
-          ref: dev
+          # Safety pin until LibreEcho-Docs-dev#5 lands on dev. Do not sync the
+          # older dev source over the fail-closed publication preview.
+          ref: a4978f7ecc53f643bdd953d89e513c94b5e162da
           path: source
           persist-credentials: false
 
@@ -64,6 +66,7 @@ jobs:
           set -euo pipefail
           (cd published/lib/fastboot && node --test test_fastboot.mjs)
           (cd published/lib/adb && node --test test_adb.mjs)
+          (cd published && node --test js/test_*.mjs)
 
       - name: Commit when the installer changed
         run: |
