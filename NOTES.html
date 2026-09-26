@@ -56,7 +56,7 @@
     <p>Two honest consequences:</p>
     <ul>
       <li><strong>Default:</strong> download the release assets with your browser from the release page, then select them (or the whole folder) in the installer. Include both <code>SHA256SUMS</code> and <code>TWRPINSTALL-SHA256SUMS</code>, the <code>libreecho-install.zip</code> and <code>bundle.manifest</code>. Both inventories are checked against the GitHub release API's asset digests before their listed files are accepted.</li>
-      <li><strong>Optional mirror:</strong> a CORS-enabled mirror may help fetch release metadata/checksum listings, but this preview's bundle upload path still requires operator-selected local files. The mirror does not bypass their digest or board gates.</li>
+      <li><strong>Optional mirrors:</strong> <code>?mirror=</code> may help fetch release checksum listings. A separate operator-approved <code>?amonetMirror=https://…</code> enables the pinned Amonet ZIP fetch button. Neither option bypasses the archive, payload, release, board or marker-safety digests/gates; the normal release bundle still requires operator-selected files.</li>
     </ul>
 
     <h2>Browser requirements</h2>
@@ -83,7 +83,7 @@
 
     <h2>What the installer will not do</h2>
     <ul>
-      <li>It never downloads or guesses an unlock payload. Payload selection is bound to the device's own LK build description, and the file must come from the operator.</li>
+      <li>It never guesses an unlock payload. After Query Device, it selects the exact LK-build member from a SHA-256-pinned Amonet ZIP. The ZIP may come from an explicitly configured CORS mirror or a local file selection; the extracted member is separately size/hash-checked before use. The site does not bundle or redistribute Amonet binaries.</li>
       <li>It records a hashed device/payload unlock attempt in local browser storage before submission. A timeout or disconnect is unknown; a second tab or page reload cannot silently resubmit the same payload. Each recovery ZIP phase is similarly recorded before execution and cannot be replayed without manual state classification.</li>
       <li>The page never directly writes an ASCII <code>FASTBOOT_PLEASE</code> marker. The fastbrick unlock payload itself writes critical boot-chain regions (including Kaeru in <code>expdb</code>, preloader, LK, TEE, recovery and RPMB). A recovery ZIP and boot image are separate execution inputs; no "never writes expdb" claim covers them. Development images and the legacy fastboot reboot-request path can overwrite Kaeru with the marker, so no install is enabled without exact marker-safe image qualification.</li>
       <li>It never trusts a transfer result: pushed files are re-hashed on the device, and the install result comes from the installer's receipt.</li>

@@ -64,5 +64,12 @@ CNAME  install.dev  →  aslater3.github.io
   left the unit locked. Its full serial appeared only in the local device
   panel, not the saved terminal log. The unlock, recovery and install write
   stages have **not** been run from a browser.
+* Amonet acquisition now accepts an exact SHA-256-pinned community ZIP and
+  automatically extracts/hashes the LK-build-specific fastbrick member. A
+  separately configured HTTPS/CORS mirror can supply that ZIP automatically;
+  no mirror is configured by default because the XDA attachment is not
+  browser-readable, and the binary is not redistributed in this repository.
+  The pinned Biscuit ZIP was verified host-side and in a browser against a
+  temporary loopback CORS mirror without requesting USB permission.
 * Licence: MIT for the website source, as in the development repository. See
   `LICENSE` and `THIRD_PARTY_NOTICES.md`.

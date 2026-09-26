@@ -89,6 +89,69 @@ test('Query Device uses only targeted getvars and shows local model/full serial 
   assert.equal(app.terminal.lines.slice(before).some((line) => line.textContent.includes(values.serialno)), false);
 });
 
+test('querying another device clears a previously selected Amonet payload', async () => {
+  assert.equal(typeof app.queryDevice, 'function');
+  app.state.payloadBytes = new Uint8Array([1, 2, 3]);
+  app.state.payloadName = 'old.img';
+  const client = { getVar: async (key) => ({ product: 'BISCUIT', unlock_status: 'false',
+    lk_build_desc: '63cb91b-20221007_072309', serialno: 'NEW-DOT' }[key] ?? '') };
+  await app.queryDevice({ open: async () => ({ device: { vendorId: 0x0bb4, productId: 0x0c01 }, client }) });
+  assert.equal(app.state.payloadBytes, null);
+  assert.equal(app.state.payloadName, '');
+});
+
+test('a pinned Amonet ZIP selects the matching payload without USB writes', async () => {
+  assert.equal(typeof app.loadAmonetArchive, 'function');
+  const writes = [];
+  setup(writes);
+  const tiny = new Uint8Array([1, 2, 3]);
+  const tinyProfile = { ...profile,
+    archive: { name: 'amonet-biscuit-v2.0.0.zip', size: 3, sha256: 'a'.repeat(64) },
+    lkBuildMap: { '63cb91b-20221007_072309': { payload: 'fastbrick-20221007.img',
+      size: 3, sha256: digest } } };
+  app.state.identity.profile = tinyProfile;
+  const calls = [];
+  const file = { name: tinyProfile.archive.name, size: tinyProfile.archive.size };
+  await app.loadAmonetArchive({ file, acquire: async (args) => {
+    calls.push(args);
+    return { bytes: tiny, source: 'local pinned ZIP' };
+  } });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].archiveBlob, file);
+  assert.equal(calls[0].archiveSha256, tinyProfile.archive.sha256);
+  assert.equal(calls[0].archiveSize, tinyProfile.archive.size);
+  assert.equal(calls[0].memberPath, 'amonet/bin/fastbrick-20221007.img');
+  assert.equal(calls[0].payloadSha256, digest);
+  assert.equal(app.state.payloadName, 'fastbrick-20221007.img');
+  assert.deepEqual(app.state.payloadBytes, tiny);
+  assert.deepEqual(writes, []);
+});
+
+test('an unpinned Amonet archive is refused before extraction', async () => {
+  assert.equal(typeof app.loadAmonetArchive, 'function');
+  setup([]);
+  app.state.identity.profile = { ...profile,
+    archive: { name: 'amonet-biscuit-v2.0.0.zip', size: 3, sha256: 'a'.repeat(64) } };
+  let invoked = false;
+  await assert.rejects(app.loadAmonetArchive({ file: { name: 'wrong.zip', size: 3 },
+    acquire: async () => { invoked = true; } }), /archive|name|pinned/i);
+  assert.equal(invoked, false);
+});
+
+test('advanced raw payload selection refuses a same-name hash mismatch and clears old bytes', async () => {
+  assert.equal(typeof app.loadPayload, 'function');
+  setup([]);
+  app.state.identity.profile = { ...profile, lkBuildMap: { '63cb91b-20221007_072309': {
+    payload: 'test.img', size: 3, sha256: digest } } };
+  app.state.payloadBytes = new Uint8Array([1, 2, 3]);
+  app.state.payloadName = 'test.img';
+  const file = new Blob([new Uint8Array([4, 5, 6])]);
+  file.name = 'test.img';
+  await assert.rejects(app.loadPayload(file), /hash|digest|pinned|mismatch/i);
+  assert.equal(app.state.payloadBytes, null);
+  assert.equal(app.state.payloadName, '');
+});
+
 test('the page rehearsal never submits brick even with a valid selected payload', async () => {
   const writes = [];
   setup(writes);

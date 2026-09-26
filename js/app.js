@@ -18,9 +18,10 @@ import {
   parseSums,
   releasePageUrl,
   assetPrefix,
+  amonetArchiveUrl,
 } from "./release.js";
 import { STAGES, StageError, readFastbootIdentity, assessIdentity, submitUnlockPayload, waitForRecovery, readKaeruHeader, pushBundle, verifyStagedBundle, runRecoveryPhase, rebootAndWait } from "./stages.js";
-import { payloadNameCandidates, requiredBundleMembers } from "./profiles.js";
+import { payloadForProfile, requiredBundleMembers } from "./profiles.js";
 
 const config = installerConfig();
 
@@ -32,6 +33,7 @@ const dom = {
   bundleInput: document.getElementById("bundle-input"),
   bundleFolderInput: document.getElementById("bundle-folder-input"),
   payloadInput: document.getElementById("payload-input"),
+  archiveInput: document.getElementById("amonet-archive-input"),
   statusRelease: document.getElementById("status-release"),
   statusBundle: document.getElementById("status-bundle"),
   statusDevice: document.getElementById("status-device"),
@@ -42,6 +44,8 @@ const dom = {
     refresh: document.getElementById("btn-refresh"),
     verifyBundle: document.getElementById("btn-bundle"),
     connect: document.getElementById("btn-connect"),
+    selectArchive: document.getElementById("btn-amonet-archive"),
+    fetchArchive: document.getElementById("btn-fetch-amonet"),
     dryRun: document.getElementById("btn-dry-run"),
     run: document.getElementById("btn-run"),
     abort: document.getElementById("btn-abort"),
@@ -297,6 +301,9 @@ export async function queryDevice({ any = false, open = openFastboot } = {}) {
     currentStage("identity");
     const identity = await readFastbootIdentity(session.client, terminal);
     state.identity = identity;
+    state.payloadBytes = null;
+    state.payloadName = "";
+    setStatus(dom.statusPayload, "select the pinned archive for this device", "pending");
     state.adb = null;
     state.recoverySerial = null;
     state.kaeruHeader = null;
@@ -374,23 +381,63 @@ export async function grantRecovery({ request = requestDevice, openSession = nul
 
 // --- unlock payload --------------------------------------------------------
 
-async function loadPayload(file) {
+export async function loadAmonetArchive({ file = null, url = null, acquire = null } = {}) {
+  if (state.running) throw new StageError("unlock", "cannot change the Amonet archive during an active run");
+  const identity = state.identity;
+  const profile = identity?.profile;
+  const archive = profile?.archive;
+  const selection = payloadForProfile(profile, identity?.lkBuild);
+  if (!archive || !selection?.sha256 || !Number.isSafeInteger(selection.size)) {
+    throw new StageError("unlock", "query a supported device and exact LK build before selecting Amonet");
+  }
+  if ((file && url) || (!file && !url)) throw new StageError("unlock", "select one pinned ZIP or one configured mirror URL");
+  if (file && (file.name !== archive.name || file.size !== archive.size)) {
+    throw new StageError("unlock", `wrong Amonet archive: expected ${archive.name} (${archive.size} bytes)`);
+  }
+  state.payloadBytes = null;
+  state.payloadName = "";
+  setStatus(dom.statusPayload, "verifying Amonet ZIP", "pending");
+  const verify = acquire ?? (await import("./amonet.js")).acquireAmonetPayload;
+  const result = await verify({ archiveBlob: file, url, archiveSha256: archive.sha256,
+    archiveSize: archive.size, memberPath: `amonet/bin/${selection.payload}`, payloadSha256: selection.sha256,
+    payloadSize: selection.size });
+  if (state.identity !== identity || !(result.bytes instanceof Uint8Array) || result.bytes.length !== selection.size) {
+    throw new StageError("unlock", "Amonet payload size or device identity changed during verification");
+  }
+  state.payloadBytes = result.bytes;
+  state.payloadName = selection.payload;
+  terminal.ok(`verified ${archive.name} and extracted pinned ${selection.payload} (${selection.size} bytes)`);
+  setStatus(dom.statusPayload, `${selection.payload} — verified from pinned ZIP`, "ok");
+  return result;
+}
+
+export async function fetchPinnedAmonetArchive() {
+  const archive = state.identity?.profile?.archive;
+  if (!archive) throw new StageError("unlock", "query the device before fetching its Amonet archive");
+  if (!config.amonetMirrorBase) throw new StageError("unlock", "no approved CORS Amonet mirror is configured; select the pinned ZIP instead");
+  return loadAmonetArchive({ url: amonetArchiveUrl(config.amonetMirrorBase, archive.name) });
+}
+
+export async function loadPayload(file) {
+  state.payloadBytes = null;
+  state.payloadName = "";
   if (!file) return;
+  const selection = payloadForProfile(state.identity?.profile, state.identity?.lkBuild);
+  if (!selection || file.name !== selection.payload || file.size !== selection.size) {
+    setStatus(dom.statusPayload, "raw payload not pinned for this device", "bad");
+    throw new StageError("unlock", "raw payload name or size does not match the pinned LK build");
+  }
   const bytes = new Uint8Array(await file.arrayBuffer());
   const { sha256Bytes } = await import("./sha256.js");
   const digest = await sha256Bytes(bytes);
+  if (digest !== selection.sha256) {
+    setStatus(dom.statusPayload, "raw payload digest mismatch", "bad");
+    throw new StageError("unlock", "raw payload digest mismatch against pinned image");
+  }
   state.payloadBytes = bytes;
   state.payloadName = file.name;
-  const candidates = payloadNameCandidates(state.identity?.profile);
-  const looksRight = candidates.length === 0 || candidates.includes(file.name);
-  terminal.info(`unlock payload: ${file.name} (${bytes.length} bytes) sha256=${digest}`);
-  if (!looksRight) {
-    terminal.warn(
-      `this payload name is not in the declared map for the detected device (${candidates.join(", ") || "none"}). ` +
-        "Confirm the release archive the payload came from before submitting it.",
-    );
-  }
-  setStatus(dom.statusPayload, `${file.name} — sha256 ${digest.slice(0, 12)}…`, looksRight ? "ok" : "warn");
+  terminal.ok(`verified pinned raw fastbrick image ${file.name} (${bytes.length} bytes)`);
+  setStatus(dom.statusPayload, `${file.name} — verified sha256 ${digest.slice(0, 12)}…`, "ok");
 }
 
 // --- run -------------------------------------------------------------------
@@ -403,6 +450,9 @@ function setRunning(running) {
   dom.bundleInput.disabled = running;
   dom.bundleFolderInput.disabled = running;
   dom.payloadInput.disabled = running;
+  dom.archiveInput.disabled = running;
+  dom.buttons.selectArchive.disabled = running;
+  dom.buttons.fetchArchive.disabled = running || !config.amonetMirrorBase;
   dom.releaseSelect.disabled = running;
   dom.buttons.connect.disabled = running;
   dom.buttons.grantRecovery.disabled = running;
@@ -586,6 +636,14 @@ dom.bundleInput?.addEventListener("change", (event) => {
 });
 dom.bundleFolderInput?.addEventListener("change", (event) => {
   verifyBundle(event.target.files).catch((error) => terminal.error(`bundle verification failed: ${error.message}`));
+});
+dom.buttons.selectArchive?.addEventListener("click", () => dom.archiveInput.click());
+dom.archiveInput?.addEventListener("change", (event) => {
+  const file = event.target.files?.[0];
+  if (file) loadAmonetArchive({ file }).catch((error) => terminal.error(`Amonet archive rejected: ${error.message}`));
+});
+dom.buttons.fetchArchive?.addEventListener("click", () => {
+  fetchPinnedAmonetArchive().catch((error) => terminal.error(`Amonet archive fetch failed: ${error.message}`));
 });
 dom.payloadInput?.addEventListener("change", (event) => {
   loadPayload(event.target.files?.[0]).catch((error) => terminal.error(`payload read failed: ${error.message}`));

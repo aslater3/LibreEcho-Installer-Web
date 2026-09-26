@@ -36,14 +36,29 @@ export function installerConfig() {
     const params = new URLSearchParams(window.location.search);
     query = {
       mirror: params.get("mirror") ?? undefined,
+      amonetMirror: params.get("amonetMirror") ?? undefined,
       release: params.get("release") ?? undefined,
     };
   }
   return {
     repository: query.repository ?? global.repository ?? DEFAULT_REPOSITORY,
     mirrorBase: (query.mirror ?? global.mirrorBase ?? "").replace(/\/+$/, ""),
+    amonetMirrorBase: (query.amonetMirror ?? global.amonetMirrorBase ?? "").replace(/\/+$/, ""),
     releaseTag: query.release ?? global.releaseTag ?? "",
   };
+}
+
+export function amonetArchiveUrl(base, archiveName) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.zip$/.test(archiveName) || archiveName.includes('..')) {
+    throw new Error('invalid pinned Amonet archive name');
+  }
+  const url = new URL(base);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) {
+    throw new Error('Amonet mirror must use HTTPS (loopback HTTP is for local tests only)');
+  }
+  if (url.username || url.password || url.search || url.hash) throw new Error('invalid Amonet mirror URL');
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/${encodeURIComponent(archiveName)}`;
+  return url.toString();
 }
 
 export function releaseAssetUrl(tag, name, repository = DEFAULT_REPOSITORY) {

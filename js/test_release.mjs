@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as release from './release.js';
 import { fetchReleaseIndex, parseSums, verifyBundleFiles } from './release.js';
 import { requiredBundleMembers } from './profiles.js';
 
@@ -34,4 +35,12 @@ test('a complete recovery handoff requires both separately published ZIP members
   assert.ok(required.includes('libreecho-install.zip'));
   assert.ok(required.includes('bundle.manifest'));
   assert.ok(required.includes('libreecho-radar-puffin-v0.14.0-TWRPINSTALL-SHA256SUMS'));
+});
+
+test('Amonet mirror URL is explicit, pinned to archive name and HTTPS-only', () => {
+  assert.equal(typeof release.amonetArchiveUrl, 'function');
+  assert.equal(release.amonetArchiveUrl('https://mirror.example/amonet/', 'amonet-biscuit-v2.0.0.zip'),
+    'https://mirror.example/amonet/amonet-biscuit-v2.0.0.zip');
+  assert.throws(() => release.amonetArchiveUrl('http://mirror.example/amonet', 'amonet-biscuit-v2.0.0.zip'), /HTTPS|secure/i);
+  assert.throws(() => release.amonetArchiveUrl('https://mirror.example', '../other.zip'), /archive|name|invalid/i);
 });

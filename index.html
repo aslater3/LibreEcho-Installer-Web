@@ -83,12 +83,17 @@
       </section>
 
       <section class="card">
-        <h2>5 · Unlock payload (only for a locked device)</h2>
-        <p>The unlock submission is bound to the device's own LK build description. The payload is distributed inside the community unlock archive rather than in any repository, so it is never downloaded by this page: select the file you obtained, and the installer will submit it only if the detected build has a declared payload. A timeout after submission is reported as an unknown outcome and is never retried automatically.</p>
-        <input id="payload-input" type="file" aria-label="Unlock payload image">
+        <h2>5 · Pinned Amonet archive (only for a locked device)</h2>
+        <p>Query the device first. Select the matching <code>amonet-*.zip</code>; the browser verifies the entire archive, extracts the exact LK-build fastbrick member and verifies that member's size and SHA-256. With an approved CORS mirror configured, the fetch button obtains the same pinned ZIP automatically. XDA's attachment is not fetched directly from this page because it does not provide a reliable CORS-readable source. No archive or payload is sent to USB by these preparation controls.</p>
+        <input id="amonet-archive-input" type="file" accept=".zip" aria-label="Pinned Amonet archive">
         <div class="actions">
-          <button class="ghost" type="button" onclick="document.getElementById('payload-input').click()">Select unlock payload…</button>
+          <button id="btn-amonet-archive" type="button">Select pinned Amonet ZIP…</button>
+          <button id="btn-fetch-amonet" class="ghost" type="button" disabled>Fetch pinned ZIP from configured mirror</button>
         </div>
+        <details><summary>Advanced: select the extracted fastbrick image instead</summary>
+          <input id="payload-input" type="file" aria-label="Pinned fastbrick payload image">
+          <button class="ghost" type="button" onclick="document.getElementById('payload-input').click()">Select pinned fastbrick image…</button>
+        </details>
         <p class="status-line">Payload state: <span id="status-payload" class="pill" data-state="pending">none selected</span></p>
       </section>
 
