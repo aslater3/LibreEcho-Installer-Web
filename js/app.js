@@ -460,7 +460,7 @@ export async function runInstall({ dryRun = false } = {}) {
     const blockReason = boardMismatch
       ? `release board mismatch: ${release.tag} is not a qualified ${profile?.board ?? "unknown"} image`
       : profile.id === "biscuit"
-        ? "no qualified Biscuit image has been published; refusing unlock and install"
+        ? "Radar image operation on Biscuit is experimental; no marker-safe Biscuit-qualified one-shot image is published"
         : assessment.findings[0] ?? null;
     if (dryRun) {
       if (blockReason) terminal.warn(blockReason);

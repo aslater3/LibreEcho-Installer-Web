@@ -159,7 +159,7 @@ export function assessIdentity(identity, terminal) {
     terminal?.ok(`recognised target: ${identity.profile.marketing} (${identity.profile.board})`);
     if (identity.profile.id === "biscuit") {
       terminal?.warn(
-        "biscuit bring-up is planned rather than shipped: no LibreEcho image is published for the Echo Dot yet.",
+        "Radar LibreEcho images can run experimentally on Biscuit, but no marker-safe Biscuit-qualified one-shot image is published.",
       );
     }
   }

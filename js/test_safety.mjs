@@ -145,6 +145,13 @@ test('a disconnected recovery ZIP remains pending and cannot be retried', async 
 });
 
 const biscuit = PROFILES.find((profile) => profile.id === 'biscuit');
+test('Biscuit identity describes the Radar image as experimental, not impossible', () => {
+  const warnings = [];
+  assessIdentity({ product: 'BISCUIT', profile: biscuit, unlockStatus: 'false', serialRaw: 'TEST-DOT' },
+    { ok() {}, warn: (message) => warnings.push(message) });
+  assert.match(warnings.join(' '), /radar.*experimental|experimental.*radar/i);
+});
+
 const quiet = { line() {}, info() {}, ok() {}, warn() {}, error() {}, command() {}, endProgress() {} };
 
 test('rehearsal never sends a recovery command or creates a device flag', async () => {

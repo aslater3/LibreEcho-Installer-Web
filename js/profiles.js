@@ -37,7 +37,7 @@ export const PROFILES = [
     marketing: "Amazon Echo Dot 2nd Generation (2016)",
     board: "biscuit",
     soc: "MediaTek MT8163V",
-    libreEcho: "bring-up planned, no shipped image",
+    libreEcho: "Radar image runs experimentally; no qualified Biscuit one-shot image",
     lkBuildMap: {
       "63cb91b-20221007_072309": { payload: "fastbrick-20221007.img", size: 114349580, sha256: "1100a16f152d713a3c9794f5954c657075db7a602e42f53b6775d4a7f31a4395" },
     },
