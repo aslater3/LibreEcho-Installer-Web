@@ -34,6 +34,13 @@ parent-relative in the development tree. Run it (or the equivalent manual copy)
 whenever the installer changes upstream; do not edit the published copy by hand
 unless the change is meant to exist only here.
 
+**Temporary sync safety pin:** while upstream PR #5 is not merged into `dev`,
+the scheduled workflow checks out exact Docs-dev commit
+`a4978f7ecc53f643bdd953d89e513c94b5e162da` rather than the older `dev`
+branch. This prevents an automatic rollback of the fail-closed preview after
+publication. Restore `ref: dev` only after upstream `dev` contains those tested
+installer bytes and the sync checks pass against that ref.
+
 ## Deployment
 
 Pages is configured with **build_type: workflow**, `.github/workflows/pages.yml`
