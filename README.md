@@ -58,8 +58,10 @@ CNAME  install.dev  →  aslater3.github.io
 * The sync and Pages jobs run protocol tests **and** the browser stage safety
   tests before publication. These are scripted-device/host checks, not a WebUSB
   hardware install or proof that an oversized fastbrick is accepted by the LK.
-* The installer has not been run against Echo hardware from a browser. Protocol
-  layers are unit-tested against scripted devices; the rest is browser-tested
-  only without granting USB access.
+* The read-only Query Device step was exercised on an Echo Dot 2 through a
+  temporary local Chrome profile; it returned targeted fastboot getvars and
+  left the unit locked. Its full serial appeared only in the local device
+  panel, not the saved terminal log. The unlock, recovery and install write
+  stages have **not** been run from a browser.
 * Licence: MIT for the website source, as in the development repository. See
   `LICENSE` and `THIRD_PARTY_NOTICES.md`.

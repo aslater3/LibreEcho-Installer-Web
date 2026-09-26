@@ -31,7 +31,7 @@
     <p>This page runs the install from your browser: it verifies a published release, asks the browser for USB access to the device, and drives the same stages the reviewed host installer drives — fastboot identity, the no-short unlock submission, the recovery-side initial install and a readback receipt after every write.</p>
     <p>No Python, no platform tools, no drivers: the browser is the host. Only Chromium-based desktop browsers expose WebUSB.</p>
     <div class="preview-banner">
-      <strong>Preview, not a supported path.</strong> This runs on recoverable hardware only, it modifies device storage, and the install stages are not hardware-validated yet. If you have one device you care about, do not be the first to try it. The supported route today is the published release and its installation guide.
+      <strong>Preview, not a supported install path.</strong> The read-only device query has been tested on Echo hardware; unlock and install writes have not. Run stays disabled until a marker-safe image is qualified. These operations can make a device unrecoverable; the supported route remains the published release and its installation guide.
     </div>
   </section>
 
@@ -70,10 +70,10 @@
 
       <section class="card">
         <h2>4 · Device</h2>
-        <p>Fastboot is where the no-short route starts. Put the device into fastboot, then grant access in the browser prompt. The device identifier is masked here and is never written to the log in full.</p>
+        <p>Query the device in fastboot before any install decision. This reads selected <code>getvar</code> values only; it does not send <code>download</code>, <code>flash</code>, <code>erase</code> or a reboot. The model is inferred from the bootloader-reported product, not independently proven silicon identity. The full serial appears only in the local panel so you can verify the target; the terminal/downloadable log masks it.</p>
         <p class="fine-print">If the chooser lists nothing, the device is not presenting an identity this page knows (they are listed in <a href="NOTES.html">the installer notes</a>). Use the unfiltered chooser — these devices report device class 0, so a class-based filter cannot match them.</p>
         <div class="actions">
-          <button id="btn-connect" class="primary" type="button">Connect device (fastboot)</button>
+          <button id="btn-connect" class="primary" type="button">Query device (read-only fastboot)</button>
           <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
           <button id="btn-recovery" class="ghost" type="button">Find previously authorised recovery</button>
           <button id="btn-grant-recovery" class="ghost" type="button">Grant TWRP USB permission…</button>

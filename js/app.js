@@ -287,11 +287,11 @@ export async function verifyBundle(fileList) {
 
 // --- device ----------------------------------------------------------------
 
-async function connectFastboot({ any = false } = {}) {
+export async function queryDevice({ any = false, open = openFastboot } = {}) {
   currentStage("device");
   try {
     if (any) terminal.info("unfiltered chooser: the browser will list every USB device on this machine");
-    const session = await openFastboot({ onLog: (line) => terminal.line(line), any });
+    const session = await open({ onLog: (line) => terminal.line(line), any });
     state.fastboot = session;
     terminal.ok(`fastboot device ready: ${describeUsbDevice(session.device)}`);
     currentStage("identity");
@@ -317,14 +317,19 @@ async function connectFastboot({ any = false } = {}) {
 function renderDevicePanel(identity, assessment) {
   dom.devicePanel.innerHTML = "";
   const rows = [
+    ["model", identity.profile ? `${identity.profile.marketing} (inferred from LK product)` : "unrecognised LK product"],
     ["fastboot product", identity.product || "(not reported)"],
+    ["USB serial", identity.serialRaw || "(not reported)"],
     ["unlock_status", identity.unlockStatus || "(not reported)"],
     ["LK build description", identity.lkBuild || "(not reported)"],
+    ["preloader build description", identity.plBuild || "(not reported)"],
+    ["secure", identity.secure || "(not reported)"],
+    ["rpmb_state", identity.rpmbState || "(not reported)"],
     ["max-download-size", identity.maxDownload || "(not reported)"],
-    ["device id", `${identity.serialMasked} (masked in this page)`],
+    ["serial privacy", "shown only in this local panel; masked in the log"],
     ["recognised target", identity.profile ? `${identity.profile.marketing} — ${identity.profile.libreEcho}` : "not a declared LibreEcho target"],
     ["userdata contract", identity.profile ? `${identity.profile.userdataContractSectors.join(" or ")} sectors` : "—"],
-    ["next step", assessment.unlocked ? "unlocked: continue to the recovery install" : "locked: an unlock payload is required"],
+    ["next step", state.markerSafe ? (assessment.unlocked ? "recovery verification" : "qualified unlock preflight") : "install blocked: no marker-safe board image qualified"],
   ];
   for (const [label, value] of rows) {
     const row = document.createElement("div");
@@ -443,7 +448,7 @@ export async function runInstall({ dryRun = false } = {}) {
 
     if (!state.identity) {
       currentStage("device");
-      await connectFastboot();
+      await queryDevice();
     }
     state.stageProgress.device = "done";
     assertNotAborted("device");
@@ -586,11 +591,11 @@ dom.payloadInput?.addEventListener("change", (event) => {
   loadPayload(event.target.files?.[0]).catch((error) => terminal.error(`payload read failed: ${error.message}`));
 });
 dom.buttons.connect?.addEventListener("click", () => {
-  connectFastboot().catch((error) => terminal.error(`device connection failed: ${error.message}`));
+  queryDevice().catch((error) => terminal.error(`device query failed: ${error.message}`));
 });
 dom.buttons.connectAny?.addEventListener("click", () => {
-  connectFastboot({ any: true }).catch((error) =>
-    terminal.error(`device connection failed (unfiltered): ${error.message}`),
+  queryDevice({ any: true }).catch((error) =>
+    terminal.error(`device query failed (unfiltered): ${error.message}`),
   );
 });
 dom.buttons.recovery?.addEventListener("click", () => {

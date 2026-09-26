@@ -7,6 +7,7 @@ class Element {
   constructor() {
     this.children = [];
     this.listeners = new Map();
+    this.queryNodes = new Map();
     this.dataset = {};
     this.style = {};
     this.classList = { add() {}, remove() {} };
@@ -17,7 +18,10 @@ class Element {
   addEventListener(event, listener) { this.listeners.set(event, listener); }
   appendChild(child) { this.children.push(child); return child; }
   append(...children) { this.children.push(...children); }
-  querySelector() { return new Element(); }
+  querySelector(selector) {
+    if (!this.queryNodes.has(selector)) this.queryNodes.set(selector, new Element());
+    return this.queryNodes.get(selector);
+  }
   remove() {}
 }
 const elements = new Map();
@@ -55,6 +59,35 @@ const setup = (writes) => {
   app.state.kaeruHeader = null;
   app.state.running = false;
 };
+
+test('Query Device uses only targeted getvars and shows local model/full serial without logging it', async () => {
+  assert.equal(typeof app.queryDevice, 'function');
+  const requested = [];
+  const forbidden = [];
+  const values = { product: 'BISCUIT', unlock_status: 'false', lk_build_desc: '63cb91b-20221007_072309',
+    pl_build_desc: 'bd7ae89-20221003_215949', 'max-download-size': '0x6d00000',
+    serialno: 'TEST-DOT-FULL-SERIAL', secure: 'yes', rpmb_state: '1' };
+  const client = {
+    getVar: async (key) => { requested.push(key); return values[key] ?? ''; },
+    flash: async () => { forbidden.push('flash'); },
+    erase: async () => { forbidden.push('erase'); },
+  };
+  const before = app.terminal.lines.length;
+  const identity = await app.queryDevice({ open: async () => ({
+    device: { vendorId: 0x0bb4, productId: 0x0c01, productName: 'Android' }, client,
+  }) });
+  assert.equal(identity.profile.marketing, 'Amazon Echo Dot 2nd Generation (2016)');
+  assert.equal(identity.serialRaw, values.serialno);
+  assert.deepEqual(forbidden, []);
+  assert.deepEqual(requested, ['product', 'unlock_status', 'lk_build_desc', 'pl_build_desc',
+    'max-download-size', 'serialno', 'secure', 'rpmb_state']);
+  const panelRows = elements.get('device-panel').children.map((row) => [
+    row.querySelector('span').textContent, row.querySelector('strong').textContent,
+  ]);
+  assert.ok(panelRows.some(([label, value]) => label === 'model' && value.includes('Echo Dot')));
+  assert.ok(panelRows.some(([label, value]) => label === 'USB serial' && value === values.serialno));
+  assert.equal(app.terminal.lines.slice(before).some((line) => line.textContent.includes(values.serialno)), false);
+});
 
 test('the page rehearsal never submits brick even with a valid selected payload', async () => {
   const writes = [];

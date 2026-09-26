@@ -123,6 +123,8 @@ export async function readFastbootIdentity(client, terminal) {
   const plBuild = (await read("pl_build_desc")).trim();
   const maxDownload = (await read("max-download-size")).trim();
   const serialRaw = (await read("serialno")).trim();
+  const secure = (await read("secure")).trim();
+  const rpmbState = (await read("rpmb_state")).trim();
   const identity = {
     product,
     unlockStatus,
@@ -130,6 +132,8 @@ export async function readFastbootIdentity(client, terminal) {
     plBuild,
     maxDownload,
     serialRaw,
+    secure,
+    rpmbState,
     serialMasked: maskSerial(serialRaw),
     profile: profileForProduct(product),
   };
@@ -137,6 +141,8 @@ export async function readFastbootIdentity(client, terminal) {
   terminal?.line(`unlock_status:  ${unlockStatus || "not reported"}`);
   terminal?.line(`lk_build_desc:  ${lkBuild || "not reported"}`);
   terminal?.line(`pl_build_desc:  ${plBuild || "not reported"}`);
+  terminal?.line(`secure:         ${secure || "not reported"}`);
+  terminal?.line(`rpmb_state:     ${rpmbState || "not reported"}`);
   terminal?.line(`max-download:   ${maxDownload || "not reported"}`);
   terminal?.line(`device id:      ${identity.serialMasked} (masked; never logged in full)`);
   return identity;
