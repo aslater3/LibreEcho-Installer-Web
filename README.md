@@ -52,8 +52,14 @@ CNAME  install.dev  →  aslater3.github.io
 
 * Preview: the page carries `noindex`, and `robots.txt` denies crawling. Both
   should be flipped when the installer is announced publicly.
+* The installer is a fail-closed preview: **Run is disabled** until the exact
+  target board has a hardware-accepted, marker-safe boot image. Biscuit has no
+  qualified image yet. Rehearse performs no device writes.
+* The sync and Pages jobs run protocol tests **and** the browser stage safety
+  tests before publication. These are scripted-device/host checks, not a WebUSB
+  hardware install or proof that an oversized fastbrick is accepted by the LK.
 * The installer has not been run against Echo hardware from a browser. Protocol
   layers are unit-tested against scripted devices; the rest is browser-tested
-  only up to the USB permission prompt.
+  only without granting USB access.
 * Licence: MIT for the website source, as in the development repository. See
   `LICENSE` and `THIRD_PARTY_NOTICES.md`.

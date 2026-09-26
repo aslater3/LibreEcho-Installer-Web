@@ -40,11 +40,11 @@
     <table>
       <thead><tr><th>Stage</th><th>What happens</th><th>What it checks</th></tr></thead>
       <tbody>
-        <tr><td>Release</td><td>The published release inventory is read.</td><td><code>SHA256SUMS</code> is fetched or supplied, and the required assets are present.</td></tr>
+        <tr><td>Release</td><td>The published release inventory is read.</td><td>The normal and TWRP checksum files, ZIP, manifest and required assets must each match SHA-256 digests reported by the release API. A compatible, marker-safe image qualification is a separate gate.</td></tr>
         <tr><td>Bundle</td><td>Payload bytes are selected locally.</td><td>Each file is hashed in the browser and compared with the release digest before it is used.</td></tr>
         <tr><td>Device</td><td>WebUSB permission prompt, then a fastboot session.</td><td><code>product</code>, <code>unlock_status</code>, the LK build description and the download size limit are read from the device.</td></tr>
         <tr><td>Unlock</td><td>The per-LK-build payload is submitted to the <code>brick</code> target.</td><td>The payload is only eligible if the detected build has a declared entry; the name is reported and the outcome is explicit.</td></tr>
-        <tr><td>Recovery</td><td>ADB connects to TWRP.</td><td>Recovery is confirmed before any write.</td></tr>
+        <tr><td>Recovery</td><td>ADB connects to TWRP.</td><td>The ADB serial must match the earlier fastboot serial, and <code>expdb</code> must contain an intact Kaeru header before staging or running the ZIP.</td></tr>
         <tr><td>Stage</td><td>The verified files are pushed to <code>/cache/libreecho-bundle</code>.</td><td>Every pushed file is re-hashed with the device's own <code>sha256sum</code>.</td></tr>
         <tr><td>Prepare / Install</td><td>The recovery installer zip is run over ADB, twice if a reboot is required.</td><td>The installer's own receipt at <code>/cache/libreecho-install-receipt</code> is read back after each run.</td></tr>
         <tr><td>Verify</td><td>The device is rebooted.</td><td>A successful receipt is required; nothing is claimed about runtime behaviour.</td></tr>
@@ -55,8 +55,8 @@
     <p>Measured from a GitHub Pages origin (the development site), a browser can read <code>api.github.com</code> and <code>raw.githubusercontent.com</code>, but it cannot read <code>github.com/&lt;owner&gt;/&lt;repo&gt;/releases/download/…</code>: the redirect response carries no <code>Access-Control-Allow-Origin</code> header, so the fetch fails before any bytes are readable. The network path itself works — the response simply cannot be read by a page.</p>
     <p>Two honest consequences:</p>
     <ul>
-      <li><strong>Default:</strong> download the release assets with your browser from the release page, then select them (or the whole folder) in the installer. Verification against the release's own <code>SHA256SUMS</code> still happens in the browser, so the integrity gate is unchanged.</li>
-      <li><strong>Optional:</strong> if you run a CORS-enabled mirror of the release assets (for example a small worker in front of the release URLs), point the installer at it with <code>?mirror=https://…</code> or a <code>window.LIBREECHO_INSTALLER_CONFIG = { mirrorBase: "…" }</code> script tag, and the payloads are fetched in-page with progress. Nothing in the installer requires this.</li>
+      <li><strong>Default:</strong> download the release assets with your browser from the release page, then select them (or the whole folder) in the installer. Include both <code>SHA256SUMS</code> and <code>TWRPINSTALL-SHA256SUMS</code>, the <code>libreecho-install.zip</code> and <code>bundle.manifest</code>. Both inventories are checked against the GitHub release API's asset digests before their listed files are accepted.</li>
+      <li><strong>Optional mirror:</strong> a CORS-enabled mirror may help fetch release metadata/checksum listings, but this preview's bundle upload path still requires operator-selected local files. The mirror does not bypass their digest or board gates.</li>
     </ul>
 
     <h2>Browser requirements</h2>
@@ -64,6 +64,7 @@
       <li>Desktop Chromium-family browser (Chrome, Edge, Brave, Opera). Firefox and Safari do not expose WebUSB.</li>
       <li>HTTPS (or <code>localhost</code>): WebUSB requires a secure context. GitHub Pages is HTTPS.</li>
       <li>Direct device connection: a data-capable cable, and no hub in between if the device is fussy about enumeration.</li>
+      <li>After fastbrick, TWRP may enumerate under a different USB identity. Use <em>Grant TWRP USB permission…</em> from a fresh button click if the browser has not authorised that identity; the page checks the original fastboot serial and Kaeru header before any recovery write.</li>
     </ul>
 
     <h2>USB identities the installer expects</h2>
@@ -83,15 +84,15 @@
     <h2>What the installer will not do</h2>
     <ul>
       <li>It never downloads or guesses an unlock payload. Payload selection is bound to the device's own LK build description, and the file must come from the operator.</li>
-      <li>It never retries an unlock submission after an unknown outcome. A timeout during <code>flash brick</code> is reported as unknown and the run stops.</li>
-      <li>It never writes to <code>expdb</code>, <code>lk_a</code>, <code>lk_b</code>, <code>tee1</code>, <code>tee2</code>, <code>preloader</code>, the GPT, <code>persist</code>, <code>recovery</code>, <code>system_a</code> or <code>system_b</code>. The recovery installer enforces that list; this page cannot widen it.</li>
+      <li>It records a hashed device/payload unlock attempt in local browser storage before submission. A timeout or disconnect is unknown; a second tab or page reload cannot silently resubmit the same payload. Each recovery ZIP phase is similarly recorded before execution and cannot be replayed without manual state classification.</li>
+      <li>The page never directly writes an ASCII <code>FASTBOOT_PLEASE</code> marker. The fastbrick unlock payload itself writes critical boot-chain regions (including Kaeru in <code>expdb</code>, preloader, LK, TEE, recovery and RPMB). A recovery ZIP and boot image are separate execution inputs; no "never writes expdb" claim covers them. Development images and the legacy fastboot reboot-request path can overwrite Kaeru with the marker, so no install is enabled without exact marker-safe image qualification.</li>
       <li>It never trusts a transfer result: pushed files are re-hashed on the device, and the install result comes from the installer's receipt.</li>
       <li>It never publishes a device identifier. Serials are masked in the UI and are not written to the log.</li>
       <li>It does not format or reshape partitions from the browser. That work exists in recovery (<code>sgdisk</code>, <code>mke2fs</code>) and is done there, by the installer zip, on the device.</li>
     </ul>
 
     <h2>Status</h2>
-    <p>This is a preview. The protocol layers (fastboot and ADB over WebUSB) are implemented and unit-tested against scripted devices; the browser UI, release verification and stage orchestration are implemented and exercised in the browser. <strong>No stage has been run against Echo hardware from a browser yet</strong> — that validation is the next gate, and until it is done the supported install route remains the published release and its guide.</p>
+    <p>This is a fail-closed preview. Protocol and browser state-machine tests are host-only; no browser install has been run against Echo hardware. <strong>The Run button is blocked until the selected board has a hardware-accepted release and the exact boot image has positive proof that it cannot write <code>FASTBOOT_PLEASE</code> to the Kaeru-bearing <code>expdb</code>.</strong> No qualified Biscuit image is shipped. <em>Rehearse</em> performs local/read-only checks only and cannot submit an unlock payload or install ZIP.</p>
 
     <h2>Reporting</h2>
     <p>Use the installer's <em>Save log</em> button and attach the log with the exact release tag, the device mode you started from (stock fastboot or recovery), and the first message that did not match this page. Do not paste device serials, MAC addresses, Wi-Fi credentials or provider tokens.</p>

@@ -12,12 +12,12 @@
 //   install   run it again after the reboot: format, boot slots, features
 //   verify    reboot and confirm the device is reachable
 //
-// Everything the installer can determine is read from the device; nothing is
-// assumed from a product name. Writes are limited to what each stage declares,
-// and the recovery installer itself refuses to touch expdb, lk, tee, preloader,
-// the GPT, persist, recovery, system_a or system_b.
+// The page's recovery stages are narrower than the fastbrick unlock: the
+// build-selected fastbrick payload itself writes preloader/LK/TEE/RPMB/Kaeru.
+// No install write is enabled until the board, exact ZIP and marker-safe boot
+// image are positively qualified. Never write FASTBOOT_PLEASE to expdb.
 
-import { Sha256 } from "./sha256.js";
+import { Sha256, sha256Blob, sha256Bytes } from "./sha256.js";
 import { parseSums, fetchSums, releaseAssetUrl, releasePageUrl, assetPrefix } from "./release.js";
 import { maskSerial, describeUsbDevice } from "./device.js";
 import { profileForProduct, payloadForProfile } from "./profiles.js";
@@ -120,19 +120,23 @@ export async function readFastbootIdentity(client, terminal) {
   const product = (await read("product")).trim();
   const unlockStatus = (await read("unlock_status")).trim();
   const lkBuild = (await read("lk_build_desc")).trim();
+  const plBuild = (await read("pl_build_desc")).trim();
   const maxDownload = (await read("max-download-size")).trim();
   const serialRaw = (await read("serialno")).trim();
   const identity = {
     product,
     unlockStatus,
     lkBuild,
+    plBuild,
     maxDownload,
+    serialRaw,
     serialMasked: maskSerial(serialRaw),
     profile: profileForProduct(product),
   };
   terminal?.line(`product:        ${product || "not reported"}`);
   terminal?.line(`unlock_status:  ${unlockStatus || "not reported"}`);
   terminal?.line(`lk_build_desc:  ${lkBuild || "not reported"}`);
+  terminal?.line(`pl_build_desc:  ${plBuild || "not reported"}`);
   terminal?.line(`max-download:   ${maxDownload || "not reported"}`);
   terminal?.line(`device id:      ${identity.serialMasked} (masked; never logged in full)`);
   return identity;
@@ -140,6 +144,7 @@ export async function readFastbootIdentity(client, terminal) {
 
 export function assessIdentity(identity, terminal) {
   const findings = [];
+  if (!identity.serialRaw) findings.push("fastboot serialno is missing; cannot bind recovery to this device");
   if (!identity.profile) {
     findings.push(
       `fastboot product ${identity.product || "(empty)"} is not a LibreEcho target. The installer only supports RADAR and BISCUIT.`,
@@ -152,7 +157,11 @@ export function assessIdentity(identity, terminal) {
       );
     }
   }
-  const unlocked = /^(true|unlocked|yes|1)$/i.test(identity.unlockStatus);
+  const unlockStatus = String(identity.unlockStatus ?? "").trim().toLowerCase();
+  const unlocked = /^(true|unlocked|yes|1)$/.test(unlockStatus);
+  if (!unlocked && !/^(false|locked|no|0)$/.test(unlockStatus)) {
+    findings.push("unlock_status was not a recognised true/false value; refusing an unlock write");
+  }
   return { unlocked, findings };
 }
 
@@ -166,41 +175,50 @@ export function assessIdentity(identity, terminal) {
  * while the payload runs. That ambiguity is surfaced, never retried silently:
  * a timeout is reported as an unknown outcome, which is a stop condition.
  */
-export async function submitUnlockPayload({ client, profile, lkBuild, payloadBytes, timeoutMs = 8000, terminal }) {
+export async function submitUnlockPayload({ client, profile, lkBuild, payloadBytes, payloadName, serialRaw, terminal }) {
   if (!profile) throw new StageError("unlock", "device is not a recognised LibreEcho target");
   const selection = payloadForProfile(profile, lkBuild);
-  if (!selection) {
-    throw new StageError(
-      "unlock",
-      `no unlock payload is declared for LK build description "${lkBuild}". Refusing to guess a payload.`,
-    );
+  if (!selection || !selection.sha256 || !Number.isSafeInteger(selection.size)) {
+    throw new StageError("unlock", `no pinned unlock payload is declared for LK build description "${lkBuild}"`);
   }
-  if (!payloadBytes) {
-    throw new StageError(
-      "unlock",
-      `the unlock payload for ${selection.payload} must be supplied by the operator (it is not distributed in any repository).`,
-    );
+  if (!(payloadBytes instanceof Uint8Array) || payloadName !== selection.payload || payloadBytes.length !== selection.size) {
+    throw new StageError("unlock", `unlock payload must be ${selection.payload} with pinned size ${selection.size}`);
+  }
+  const digest = await sha256Bytes(payloadBytes);
+  if (digest !== selection.sha256) {
+    throw new StageError("unlock", `unlock payload digest mismatch for ${selection.payload}`);
+  }
+  if (!serialRaw || typeof localStorage === "undefined") {
+    throw new StageError("unlock", "persistent device-bound unlock attempt storage is unavailable");
+  }
+  const key = `libreecho.unlock.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${profile.id}:${digest}`))}`;
+  try {
+    if (localStorage.getItem(key)) throw new StageError("unlock", "unlock attempt already submitted; do not re-submit");
+    // Persist BEFORE sending, because a disconnect, new tab or reload has an unknown outcome.
+    localStorage.setItem(key, "submitted-or-unknown");
+  } catch (error) {
+    if (error instanceof StageError) throw error;
+    throw new StageError("unlock", "cannot persist the single-submission guard");
   }
   terminal?.command(`fastboot flash brick <${selection.payload}>`);
   try {
-    // onProgress from the fastboot client is (sent, total).
+    // Single whole-image download, never chunk this AMNT payload into buffers.
     await client.flash("brick", payloadBytes, {
+      singleDownload: true,
       onProgress: (sent, total) => terminal?.progress("submitting unlock payload", sent / total, `${sent} / ${total} bytes`),
       onInfo: (line) => terminal?.line(line),
     });
     terminal?.endProgress();
-    terminal?.ok("the bootloader accepted the payload command");
-    return { outcome: "accepted" };
+    terminal?.warn("payload command returned; unlock state requires recovery and readback verification");
+    return { outcome: "unknown" };
   } catch (error) {
     terminal?.endProgress();
-    if (/timeout/i.test(String(error.message))) {
-      terminal?.warn(
-        "the fastboot command timed out. In this flow that usually means the payload started. " +
-          "The outcome is UNKNOWN: do not re-submit. Watch the device for a recovery boot.",
-      );
-      return { outcome: "unknown" };
+    const detail = String(error.message ?? error);
+    if (/Device mismatch|eMMC-RO/i.test(detail)) {
+      throw new StageError("unlock", `payload explicitly refused the device: ${detail}`);
     }
-    throw new StageError("unlock", `unlock submission failed: ${error.message}`);
+    terminal?.warn(`unlock submission outcome UNKNOWN (${detail}); do not re-submit`);
+    return { outcome: "unknown" };
   }
 }
 
@@ -208,44 +226,63 @@ export async function submitUnlockPayload({ client, profile, lkBuild, payloadByt
 // Stage 5 — recovery
 // ---------------------------------------------------------------------------
 
+export async function readKaeruHeader(adb) {
+  const meta = await adb.shell("cat /sys/class/block/mmcblk0p7/uevent");
+  const sectors = await adb.shell("cat /sys/class/block/mmcblk0p7/size");
+  if (!/^PARTNAME=expdb$/m.test(meta.stdout ?? "") || (sectors.stdout ?? "").trim() !== "20480") {
+    throw new StageError("recovery", "expdb identity or geometry is not the pinned Kaeru partition");
+  }
+  const bytes = await adb.shell("dd if=/dev/mmcblk0p7 bs=16 count=1 2>/dev/null | od -An -tx1");
+  const fields = (bytes.stdout ?? "").trim().split(/\s+/);
+  if (fields.length !== 16 || fields.some((field) => !/^[0-9a-fA-F]{2}$/.test(field))) {
+    throw new StageError("recovery", "cannot read the complete expdb Kaeru header");
+  }
+  const hex = fields.join("").toLowerCase();
+  if (hex.startsWith("46415354424f4f545f504c45415345")) {
+    throw new StageError("recovery", "FASTBOOT_PLEASE has overwritten the expdb Kaeru header");
+  }
+  if (!hex.startsWith("88168858") || hex.slice(16, 20) !== "4c4b") {
+    throw new StageError("recovery", "expdb does not contain the expected Kaeru LK header");
+  }
+  return hex;
+}
+
 /**
  * Waits for TWRP to appear over ADB. The browser keeps the USB permission it
  * was granted, so re-attachment after a USB mode change needs no new prompt;
  * the device chooser is only used when nothing has been granted yet.
  */
-export async function waitForRecovery({ timeoutMs = 180000, intervalMs = 4000, terminal, adbDevice = null } = {}) {
+export async function waitForRecovery({ timeoutMs = 180000, intervalMs = 4000, terminal,
+  adbDevice = null, expectedSerial = "", openSession = null } = {}) {
   const { reattachAdb } = await import("./transports.js");
   const deadline = Date.now() + timeoutMs;
   let attempt = 0;
   while (Date.now() < deadline) {
     attempt += 1;
     try {
-      const session = adbDevice
-        ? await openAdb({ device: adbDevice, onLog: (line) => terminal?.line(line) })
-        : await reattachAdb({ timeoutMs: Math.min(intervalMs * 3, 12000), onLog: null });
-      const probe = await session.client.shell("getprop ro.twrp.version; getprop ro.product.device");
-      const lines = String(probe.stdout ?? "")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const [twrpVersion = "", device = ""] = lines;
-      terminal?.line(`adb probe ${attempt}: twrp=${twrpVersion || "(none)"} device=${device || "(none)"}`);
-      if (/^\d/.test(twrpVersion)) {
-        terminal?.ok(`TWRP ${twrpVersion} is reachable over ADB${device ? ` (${device})` : ""}`);
+      const session = openSession
+        ? await openSession()
+        : adbDevice
+          ? await openAdb({ device: adbDevice, onLog: (line) => terminal?.line(line) })
+          : await reattachAdb({ timeoutMs: Math.min(intervalMs * 3, 12000), expectedSerial, onLog: null });
+      const probe = await session.client.shell("getprop ro.twrp.version; getprop ro.product.device; getprop ro.serialno");
+      const lines = String(probe.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
+      const [twrpVersion = "", device = "", serial = ""] = lines;
+      terminal?.line(`adb probe ${attempt}: twrp=${twrpVersion || "(none)"} device=${device || "(none)"} serial=${maskSerial(serial)}`);
+      if (/^\d/.test(twrpVersion) && expectedSerial && serial === expectedSerial) {
+        terminal?.ok(`TWRP ${twrpVersion} is reachable over ADB on the selected device`);
         return session;
       }
-      terminal?.warn("ADB answered but this is not TWRP; waiting for recovery to come back");
+      terminal?.warn("ADB answered but TWRP or serial did not match the selected fastboot device");
       await session.client.close();
     } catch (error) {
       if (attempt === 1 || attempt % 5 === 0) {
-        terminal?.line(
-          `waiting for recovery over ADB (${Math.round((deadline - Date.now()) / 1000)}s left): ${error.message}`,
-        );
+        terminal?.line(`waiting for the selected recovery (${Math.round((deadline - Date.now()) / 1000)}s left): ${error.message}`);
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await sleep(intervalMs);
   }
-  throw new StageError("recovery", "timed out waiting for TWRP over ADB");
+  throw new StageError("recovery", "timed out waiting for TWRP on the selected serial");
 }
 
 // ---------------------------------------------------------------------------
@@ -253,14 +290,20 @@ export async function waitForRecovery({ timeoutMs = 180000, intervalMs = 4000, t
 // ---------------------------------------------------------------------------
 
 export async function pushBundle({ adb, files, sums, terminal, onProgress }) {
-  const names = [...sums.keys()];
-  const present = names.filter((name) => files.has(name));
-  if (present.length === 0) throw new StageError("stage", "no verified bundle files were provided");
+  const names = [...sums.keys()].filter((name) => files.has(name));
+  if (names.length === 0) throw new StageError("stage", "no verified bundle files were provided");
+  // Validate every byte before the first device-side mkdir or push.
+  for (const name of names) {
+    const digest = await sha256Blob(files.get(name));
+    if (digest !== sums.get(name)) {
+      throw new StageError("stage", `${name}: digest mismatch before ADB push`);
+    }
+  }
   await adb.shell(`mkdir -p ${BUNDLE_DIR}`);
   let pushed = 0;
   let totalBytes = 0;
-  for (const name of present) totalBytes += files.get(name).size;
-  for (const name of present) {
+  for (const name of names) totalBytes += files.get(name).size;
+  for (const name of names) {
     const file = files.get(name);
     const remote = `${BUNDLE_DIR}/${name}`;
     terminal?.command(`adb push ${name} → ${remote} (${(file.size / 1048576).toFixed(1)} MiB)`);
@@ -281,7 +324,7 @@ export async function pushBundle({ adb, files, sums, terminal, onProgress }) {
     terminal?.ok(`pushed ${name}`);
   }
   terminal?.endProgress();
-  return { pushedBytes: totalBytes, fileCount: present.length };
+  return { pushedBytes: totalBytes, fileCount: names.length };
 }
 
 /** Re-hashes the pushed files on the device and compares with the release digests. */
@@ -315,14 +358,24 @@ export async function verifyStagedBundle({ adb, sums, files, terminal }) {
  * partition against the image contract. The host's job is only to run it, read
  * the receipt, and reboot between the two runs when asked.
  */
-export async function runRecoveryPhase({ adb, tag }, { dryRun = false, terminal } = {}) {
-  const zip = `${BUNDLE_DIR}/${assetPrefix(tag)}-install.zip`;
+export async function runRecoveryPhase({ adb, tag, serialRaw, phase = "prepare" }, { dryRun = false, terminal } = {}) {
   if (dryRun) {
-    await adb.shell(`: > ${DRY_RUN_FLAG}`);
-    terminal?.info("dry-run flag created: every check runs, nothing is written");
-  } else {
-    await adb.shell(`rm -f ${DRY_RUN_FLAG} ${RECEIPT_PATH}`);
+    terminal?.info("rehearsal is host-only; no recovery command was issued");
+    return { result: "rehearsal", writes_performed: [] };
   }
+  if (!serialRaw || !tag || !["prepare", "install"].includes(phase) || typeof localStorage === "undefined") {
+    throw new StageError("install", "persistent device-bound recovery attempt storage is unavailable");
+  }
+  const key = `libreecho.recovery.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${tag}:${phase}`))}`;
+  try {
+    if (localStorage.getItem(key)) throw new StageError("install", `${phase} ZIP already attempted; classify the device and receipt before any repeat`);
+    localStorage.setItem(key, "pending-or-completed");
+  } catch (error) {
+    if (error instanceof StageError) throw error;
+    throw new StageError("install", "cannot persist the recovery attempt guard");
+  }
+  const zip = `${BUNDLE_DIR}/libreecho-install.zip`;
+  await adb.shell(`rm -f ${DRY_RUN_FLAG} ${RECEIPT_PATH}`);
   terminal?.command(`twrp install ${zip}`);
   const result = await adb.shell(
     `twrp install ${zip} 2>&1; echo "__RECEIPT__"; cat ${RECEIPT_PATH} 2>/dev/null || true`,
@@ -343,15 +396,16 @@ export async function runRecoveryPhase({ adb, tag }, { dryRun = false, terminal 
   return receipt;
 }
 
-export async function rebootAndWait({ adb, target = "recovery", timeoutMs = 180000, terminal }) {
-  terminal?.command(`adb reboot ${target}`);
+export async function rebootAndWait({ adb, target = "recovery", terminal, settleMs = 8000 }) {
+  const command = target === "recovery" ? "/sbin/twrp reboot recovery" : "/sbin/twrp reboot";
+  terminal?.command(command);
   try {
-    await adb.shell(`reboot ${target}`);
+    await adb.shell(command);
   } catch (error) {
-    terminal?.warn(`reboot command returned: ${error.message}`);
+    terminal?.warn(`reboot transport disconnected or failed: ${error.message}; the next device state is unverified`);
   }
-  terminal?.info(`waiting up to ${Math.round(timeoutMs / 1000)}s for the device to come back (${target})`);
-  await sleep(8000);
+  terminal?.info("reboot requested; a new serial-bound session is required before any further write");
+  await sleep(settleMs);
 }
 
 // ---------------------------------------------------------------------------

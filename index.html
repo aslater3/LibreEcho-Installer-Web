@@ -58,7 +58,7 @@
 
       <section class="card">
         <h2>3 · Verified bundle</h2>
-        <p>The release download endpoint does not allow cross-origin reads, so the browser cannot pull the payloads for you. Download the release assets from the release page, then select them here: every file is hashed locally and compared with the release's own <code>SHA256SUMS</code> before anything is pushed to the device.</p>
+        <p>The release endpoint does not allow in-page cross-origin asset reads. Download the exact release assets, including both checksum inventories, <code>libreecho-install.zip</code> and <code>bundle.manifest</code>, then select them here. The browser compares their hashes with the GitHub release API and refuses a missing or mismatched member before any device write.</p>
         <input id="bundle-input" type="file" multiple aria-label="Release bundle files">
         <input id="bundle-folder-input" type="file" multiple webkitdirectory directory aria-label="Release bundle folder">
         <div class="actions">
@@ -75,7 +75,8 @@
         <div class="actions">
           <button id="btn-connect" class="primary" type="button">Connect device (fastboot)</button>
           <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
-          <button id="btn-recovery" class="ghost" type="button">Find recovery over ADB</button>
+          <button id="btn-recovery" class="ghost" type="button">Find previously authorised recovery</button>
+          <button id="btn-grant-recovery" class="ghost" type="button">Grant TWRP USB permission…</button>
         </div>
         <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
         <div id="device-panel" aria-live="polite"></div>
@@ -96,7 +97,7 @@
         <ol id="step-list" class="step-list"></ol>
         <div class="actions">
           <button id="btn-dry-run" class="ghost" type="button">Rehearse (no writes)</button>
-          <button id="btn-run" class="primary" type="button">Run the install</button>
+          <button id="btn-run" class="primary" type="button" disabled>Run the install (blocked pending marker-safe image)</button>
           <button id="btn-abort" class="ghost" type="button" disabled>Stop</button>
         </div>
       </section>
@@ -115,12 +116,12 @@
       <section class="card">
         <h2>What each stage verifies</h2>
         <ul>
-          <li><strong>Release</strong> — the published <code>SHA256SUMS</code> inventory is read and required assets are present.</li>
+          <li><strong>Release</strong> — both checksum inventories and the recovery ZIP/manifest are verified against the release API's digests before any write.</li>
           <li><strong>Bundle</strong> — every selected file is hashed in the browser and compared with the release digest.</li>
           <li><strong>Device</strong> — <code>getvar product</code>, <code>unlock_status</code> and the LK build description are read from the device itself; an unknown target stops the run.</li>
-          <li><strong>Unlock</strong> — the payload for the detected LK build only, with an explicit unknown-outcome state.</li>
-          <li><strong>Recovery</strong> — TWRP is confirmed over ADB before any write.</li>
-          <li><strong>Stage</strong> — the pushed files are re-hashed with the device's own <code>sha256sum</code>, not trusted because the push reported success.</li>
+          <li><strong>Unlock</strong> — the pinned build-specific payload is checked locally; fastbrick itself changes early boot-chain storage. A timeout is not accepted as proof of success and is never auto-retried.</li>
+          <li><strong>Recovery</strong> — TWRP's ADB serial must match the fastboot serial, and the Kaeru header in <code>expdb</code> must be intact before staging files.</li>
+          <li><strong>Stage</strong> — only files that matched the API-anchored normal and TWRP checksum inventories are pushed and re-hashed on the device.</li>
           <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>
         </ul>
       </section>

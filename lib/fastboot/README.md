@@ -79,7 +79,7 @@ methods).
 | `getVar(name)` | `getvar:<name>` | value string; multi-line INFO payloads joined with `\n` |
 | `getPartitionSize(name)` | `getvar:partition-size:<name>` | number (decimal or `0x` hex) |
 | `download(bytes, opts)` | `download:<8 hex>` + payload | returns bytes sent |
-| `flash(partition, bytes, opts)` | `download:` … then `flash:<part>` | `bytes` optional: omit to flash the download buffer |
+| `flash(partition, bytes, opts)` | `download:` … then `flash:<part>` | `bytes` optional: omit to flash the download buffer; `singleDownload: true` opts into whole-image brick-only mode |
 | `erase(partition)` | `erase:<part>` | returns the INFO lines |
 | `reboot(target?)` | `reboot` / `reboot-bootloader` | silence tolerated (device resets) |
 | `continue()` | `continue` | silence tolerated |
@@ -92,10 +92,23 @@ methods).
 - `chunkSize` — upper bound for one `download:` command (the device's
   `max-download-size` still wins if smaller).
 - `onInfo(line)` — INFO/TEXT progress lines as they arrive.
+- `singleDownload: true` (only for `flash('brick', image, ...)`) — send one
+  `download:<full size>` and the complete raw image before `flash:brick`, even
+  when `getvar:max-download-size` is smaller. Requires DATA to offer exactly
+  the full image size and an OKAY for the payload; refusal/short window/timeout
+  aborts without flashing and never falls back to chunked downloads. Rejects
+  empty or larger-than-128-MiB images, missing bytes, and `chunkSize` together
+  with this option. The installer must independently verify the selected image
+  and its expected length before calling this API. This is host-only behavior,
+  not proof the bootloader can accept the image.
+- `writeTimeoutMs` — in single-download mode, the whole raw payload write
+  deadline (default and maximum 900000 ms). A timed-out WebUSB write cannot be
+  cancelled by this client; disconnect/reconnect instead of reusing the session.
 
 Constructor: `new FastbootClient(transport, { timeout = 10000, onInfo })`.
 `client.maxDownloadSize` caches `getvar:max-download-size` (queried once,
-lazily, by the first `download()`).
+lazily, by the first ordinary `download()`). The single-download brick mode
+never queries or obeys that variable.
 
 Exported helpers: `parsePartitionSize(value)`, `toHex8(n)`, `cleanValue(text)`,
 `concatBytes(...)`, `createFastbootClient(transport, options)`,
@@ -170,12 +183,12 @@ tolerance for `okay`-prefixed values, trailing NULs and a `<name>:` echo.
 node --test test_fastboot.mjs     # or: node test_fastboot.mjs
 ```
 
-52 tests, no hardware required, run against a scripted fake transport and a
+Tests require no hardware and run against a scripted fake transport and a
 fake bootloader that speaks the protocol: framing, split and multi-message
 reads, FAIL reasons (including split across transfers), chunked downloads,
-window narrowing, flash/erase/reboot/oem, the timeout path, and the WebUSB
-transport's write splitting, buffering and interface selection against an
-in-memory `USBDevice`.
+whole-image brick download and fail-closed short-window handling, flash/erase/
+reboot/oem, the timeout path, and the WebUSB transport's write splitting,
+buffering and interface selection against an in-memory `USBDevice`.
 
 ## Troubleshooting
 

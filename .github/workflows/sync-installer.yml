@@ -64,6 +64,7 @@ jobs:
           set -euo pipefail
           (cd published/lib/fastboot && node --test test_fastboot.mjs)
           (cd published/lib/adb && node --test test_adb.mjs)
+          (cd published && node --test js/test_*.mjs)
 
       - name: Commit when the installer changed
         run: |

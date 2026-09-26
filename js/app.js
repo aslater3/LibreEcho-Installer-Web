@@ -14,12 +14,13 @@ import {
   pickLatestStable,
   pickLatestDevelopment,
   verifyBundleFiles,
+  sha256OfBlob,
   parseSums,
   releasePageUrl,
   assetPrefix,
 } from "./release.js";
-import { STAGES, StageError, verifyReleaseInventory, readFastbootIdentity, assessIdentity, submitUnlockPayload, waitForRecovery, pushBundle, verifyStagedBundle, runRecoveryPhase, rebootAndWait } from "./stages.js";
-import { payloadNameCandidates } from "./profiles.js";
+import { STAGES, StageError, readFastbootIdentity, assessIdentity, submitUnlockPayload, waitForRecovery, readKaeruHeader, pushBundle, verifyStagedBundle, runRecoveryPhase, rebootAndWait } from "./stages.js";
+import { payloadNameCandidates, requiredBundleMembers } from "./profiles.js";
 
 const config = installerConfig();
 
@@ -45,13 +46,14 @@ const dom = {
     run: document.getElementById("btn-run"),
     abort: document.getElementById("btn-abort"),
     recovery: document.getElementById("btn-recovery"),
+    grantRecovery: document.getElementById("btn-grant-recovery"),
     connectAny: document.getElementById("btn-connect-any"),
   },
 };
 
-const terminal = new Terminal(dom.terminal);
+export const terminal = new Terminal(dom.terminal);
 
-const state = {
+export const state = {
   releases: [],
   release: null,
   sums: null,
@@ -61,6 +63,12 @@ const state = {
   fastboot: null,
   identity: null,
   adb: null,
+  recoverySerial: null,
+  kaeruHeader: null,
+  receipts: [],
+  bundleReady: false,
+  bundleBoard: null,
+  markerSafe: false,
   running: false,
   abort: false,
 };
@@ -123,7 +131,15 @@ async function reportCapabilities() {
 
 // --- releases --------------------------------------------------------------
 
-async function loadReleases() {
+export async function loadReleases() {
+  if (state.running) throw new Error("cannot refresh releases during an active run");
+  state.sums = null;
+  state.files = new Map();
+  state.bundleReady = false;
+  state.bundleBoard = null;
+  state.markerSafe = false;
+  setRunning(false);
+  setStatus(dom.statusBundle, "nothing verified for this release", "pending");
   setStatus(dom.statusRelease, "loading", "pending");
   terminal.info(`reading the release index for ${config.repository} (api.github.com is CORS-readable)`);
   try {
@@ -194,54 +210,78 @@ function describeSelectedRelease() {
 
 // --- bundle ----------------------------------------------------------------
 
-async function verifyBundle(fileList) {
+export async function verifyBundle(fileList) {
+  if (state.running) throw new Error("cannot change bundle during an active run");
   const release = state.release;
+  state.bundleReady = false;
+  state.markerSafe = false;
+  state.bundleBoard = null;
+  state.files = new Map();
+  state.sums = null;
   if (!release) {
     terminal.error("select a release first");
     return;
   }
-  const files = [...fileList].filter((file) => file.size > 0 || file.name.endsWith(".sha256"));
-  if (files.length === 0) {
-    terminal.warn("no files selected");
-    return;
-  }
-  terminal.info(`hashing ${files.length} file(s) locally; nothing is written to the device in this step`);
-  if (!state.sums) {
-    const sumsFile = files.find((file) => file.name.endsWith("SHA256SUMS"));
-    if (!sumsFile) {
-      terminal.error("the release SHA256SUMS file is not in the selection; download it from the release page and include it");
-      setStatus(dom.statusBundle, "missing SHA256SUMS", "bad");
+  const files = [...fileList];
+  const byName = new Map();
+  for (const file of files) {
+    if (byName.has(file.name)) {
+      terminal.error(`duplicate selected asset: ${file.name}`);
       return;
     }
-    state.sums = parseSums(await sumsFile.text());
-    terminal.ok(`parsed ${state.sums.size} digests from ${sumsFile.name}`);
+    byName.set(file.name, file);
   }
-  const result = await verifyBundleFiles(files, {
-    sums: state.sums,
-    onProgress: (fraction, name) =>
-      terminal.progress("hashing bundle", fraction, name),
-  });
-  terminal.endProgress();
-  for (const item of result.checked) {
-    terminal.ok(`${item.name} — ${(item.size / 1048576).toFixed(1)} MiB matches the release digest`);
-  }
-  for (const item of result.missing) {
-    terminal.warn(`${item} is not in the selection (it is required before flashing)`);
-  }
-  for (const item of result.failed) {
-    terminal.error(`${item.name}: local ${item.actual} != release ${item.expected}`);
-  }
-  state.files = result.byName;
-  const okCount = result.checked.length;
-  setStatus(
-    dom.statusBundle,
-    `${okCount} verified${result.failed.length ? `, ${result.failed.length} mismatch` : ""}${result.missing.length ? `, ${result.missing.length} missing` : ""}`,
-    result.failed.length ? "bad" : okCount ? "ok" : "pending",
-  );
-  if (result.failed.length) {
-    terminal.error("refusing to continue: the local bundle does not match the published release");
-  } else if (result.missing.length) {
-    terminal.warn("some release files are missing from the selection; the installer will push only what it verified");
+  const prefix = assetPrefix(release.tag);
+  const normalName = `${prefix}-SHA256SUMS`;
+  const twrpName = `${prefix}-TWRPINSTALL-SHA256SUMS`;
+  try {
+    const readPinnedInventory = async (name) => {
+      const file = byName.get(name);
+      const asset = release.assets.find((entry) => entry.name === name);
+      if (!file || !asset || !/^sha256:[0-9a-f]{64}$/.test(asset.digest ?? "") || file.size !== asset.size) {
+        throw new Error(`${name}: missing API-digest-anchored checksum inventory`);
+      }
+      const actual = await sha256OfBlob(file);
+      if (actual !== asset.digest.slice(7)) throw new Error(`${name}: checksum digest mismatch against GitHub release API`);
+      return parseSums(await file.text());
+    };
+    const normal = await readPinnedInventory(normalName);
+    const twrp = await readPinnedInventory(twrpName);
+    const required = requiredBundleMembers(release.tag);
+    for (const name of required) {
+      if (name === normalName || name === twrpName) continue;
+      const inventory = name === "libreecho-install.zip" || name === "bundle.manifest" ? twrp : normal;
+      if (!inventory.has(name)) throw new Error(`${name}: missing from the correct release checksum inventory`);
+      const asset = release.assets.find((entry) => entry.name === name);
+      if (!asset || asset.digest !== `sha256:${inventory.get(name)}`) {
+        throw new Error(`${name}: published asset digest differs from the checksum inventory`);
+      }
+    }
+    const sums = new Map([...normal, ...twrp]);
+    const result = await verifyBundleFiles(files, {
+      sums,
+      onProgress: (fraction, name) => terminal.progress("hashing bundle", fraction, name),
+    });
+    terminal.endProgress();
+    if (result.failed.length || result.missing.length) {
+      throw new Error(`bundle not complete: ${result.failed.length} digest mismatch, ${result.missing.length} missing`);
+    }
+    const build = JSON.parse(await result.byName.get(`${prefix}-build.json`).text());
+    if (!build.board || build.hardware_accepted !== true) {
+      throw new Error("build metadata has no hardware-accepted board; refusing device writes");
+    }
+    if (state.release !== release) throw new Error("release selection changed during verification");
+    state.sums = sums;
+    state.files = result.byName;
+    state.bundleBoard = build.board;
+    state.bundleReady = true;
+    setRunning(false);
+    setStatus(dom.statusBundle, `${result.checked.length} verified (including recovery ZIP)`, "ok");
+    terminal.ok(`complete bundle verified against GitHub release API (${build.board})`);
+  } catch (error) {
+    terminal.endProgress();
+    setStatus(dom.statusBundle, "verification failed", "bad");
+    terminal.error(error.message);
   }
 }
 
@@ -257,6 +297,9 @@ async function connectFastboot({ any = false } = {}) {
     currentStage("identity");
     const identity = await readFastbootIdentity(session.client, terminal);
     state.identity = identity;
+    state.adb = null;
+    state.recoverySerial = null;
+    state.kaeruHeader = null;
     const assessment = assessIdentity(identity, terminal);
     renderDevicePanel(identity, assessment);
     setStatus(
@@ -295,27 +338,32 @@ function renderDevicePanel(identity, assessment) {
 
 async function findRecovery() {
   currentStage("recovery");
-  // Re-attach silently when permission already exists; only prompt when the
-  // origin has never been granted access to an ADB device.
-  let session = null;
-  try {
-    const { reattachAdb } = await import("./transports.js");
-    session = await reattachAdb({ timeoutMs: 6000, onLog: (line) => terminal.line(line) });
-  } catch {
-    session = null;
-  }
-  if (!session) {
-    terminal.info("no ADB device is authorised for this origin yet: asking the browser for access");
-    session = await waitForRecovery({ timeoutMs: 30000, terminal });
-  }
+  if (!state.identity?.serialRaw) throw new StageError("recovery", "select and identify the fastboot device first");
+  const session = await waitForRecovery({ timeoutMs: 30000, expectedSerial: state.identity.serialRaw, terminal });
   state.adb = session.client;
-  const probe = await session.client.shell("getprop ro.twrp.version; cat /proc/mounts | grep -c cache");
-  terminal.ok(`recovery session ready (${String(probe.stdout ?? "").trim().replace(/\s+/g, " ")})`);
+  state.kaeruHeader = await readKaeruHeader(session.client);
+  state.recoverySerial = state.identity.serialRaw;
+  terminal.ok("the selected TWRP device has an intact Kaeru expdb header");
   const receipt = await session.client.shell("cat /cache/libreecho-install-receipt 2>/dev/null || true");
   if (String(receipt.stdout ?? "").trim()) {
     terminal.info("an existing install receipt is present on the device:");
     for (const line of String(receipt.stdout).trim().split(/\r?\n/)) terminal.line(line);
   }
+  return session;
+}
+
+export async function grantRecovery({ request = requestDevice, openSession = null } = {}) {
+  if (!state.identity?.serialRaw) throw new StageError("recovery", "select and identify the fastboot device first");
+  // requestDevice must run directly from the button event's user activation.
+  const pendingDevice = request("adb");
+  const device = await pendingDevice;
+  const session = await waitForRecovery({ adbDevice: device, openSession, expectedSerial: state.identity.serialRaw,
+    timeoutMs: 30000, terminal });
+  const header = await readKaeruHeader(session.client);
+  state.adb = session.client;
+  state.kaeruHeader = header;
+  state.recoverySerial = state.identity.serialRaw;
+  terminal.ok("ADB permission granted to the selected TWRP device; Kaeru header intact");
   return session;
 }
 
@@ -344,9 +392,15 @@ async function loadPayload(file) {
 
 function setRunning(running) {
   state.running = running;
-  dom.buttons.run.disabled = running;
+  dom.buttons.run.disabled = running || !state.bundleReady || !state.markerSafe;
   dom.buttons.dryRun.disabled = running;
+  dom.buttons.verifyBundle.disabled = running;
+  dom.bundleInput.disabled = running;
+  dom.bundleFolderInput.disabled = running;
+  dom.payloadInput.disabled = running;
+  dom.releaseSelect.disabled = running;
   dom.buttons.connect.disabled = running;
+  dom.buttons.grantRecovery.disabled = running;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
 }
@@ -355,10 +409,11 @@ function assertNotAborted(stage) {
   if (state.abort) throw new StageError(stage, "aborted by the operator");
 }
 
-async function runInstall({ dryRun = false } = {}) {
+export async function runInstall({ dryRun = false } = {}) {
   if (state.running) return;
   state.abort = false;
   state.stageProgress = {};
+  state.receipts = [];
   setRunning(true);
   terminal.phase(1, STAGES.length, dryRun ? "rehearsal: no writes" : "browser one-shot install");
   terminal.info(`release ${state.release?.tag ?? "(none)"} · repository ${config.repository}`);
@@ -370,19 +425,21 @@ async function runInstall({ dryRun = false } = {}) {
     if (!release) throw new StageError("release", "no release selected");
 
     if (!state.sums) {
-      currentStage("release");
-      const inventory = await verifyReleaseInventory({
-        tag: release.tag,
-        repository: config.repository,
-        mirrorBase: config.mirrorBase,
-        terminal,
-      });
-      state.sums = inventory.sums;
-    } else {
-      terminal.ok(`using the ${state.sums.size}-entry inventory parsed from the supplied SHA256SUMS`);
+      if (dryRun) {
+        terminal.warn("select and verify the local bundle, including both checksum files, before release compatibility can be assessed");
+        terminal.ok("host-only rehearsal complete; zero USB write commands were sent");
+        return;
+      }
+      throw new StageError("release", "select and verify the complete local bundle before unlock");
     }
+    terminal.ok(`using the ${state.sums.size}-entry API-digest-anchored bundle inventory`);
     state.stageProgress.release = "done";
     assertNotAborted("release");
+    if (dryRun && !state.identity) {
+      terminal.info("no device is connected; identity and release compatibility cannot be checked in this rehearsal");
+      terminal.ok("host-only rehearsal complete; zero USB write commands were sent");
+      return;
+    }
 
     if (!state.identity) {
       currentStage("device");
@@ -393,32 +450,58 @@ async function runInstall({ dryRun = false } = {}) {
 
     const assessment = assessIdentity(state.identity, terminal);
     state.stageProgress.identity = "done";
-
-    if (!assessment.unlocked) {
-      currentStage("unlock");
-      const outcome = await submitUnlockPayload({
-        client: state.fastboot.client,
-        profile: state.identity.profile,
-        lkBuild: state.identity.lkBuild,
-        payloadBytes: state.payloadBytes,
-        terminal,
-      });
-      state.stageProgress.unlock = "done";
-      if (outcome.outcome === "unknown") {
-        terminal.warn("stopping here on purpose: an unknown unlock outcome must not be retried automatically");
-        terminal.info("watch the device. If it lands in recovery, press 'Find recovery over ADB' and continue from there.");
-        setRunning(false);
-        return;
-      }
-    } else {
-      terminal.ok("device is already unlocked; skipping the unlock stage");
-      state.stageProgress.unlock = "skipped";
+    const profile = state.identity.profile;
+    const boardMismatch = !profile || (release.tag.startsWith("radar-puffin-") && profile.board !== "radar_puffin");
+    const blockReason = boardMismatch
+      ? `release board mismatch: ${release.tag} is not a qualified ${profile?.board ?? "unknown"} image`
+      : profile.id === "biscuit"
+        ? "no qualified Biscuit image has been published; refusing unlock and install"
+        : assessment.findings[0] ?? null;
+    if (dryRun) {
+      if (blockReason) terminal.warn(blockReason);
+      terminal.ok("host-only rehearsal complete; zero USB write commands were sent");
+      return;
     }
-    assertNotAborted("unlock");
+    if (blockReason) throw new StageError("identity", blockReason);
+    if (!state.bundleReady) throw new StageError("release", "the complete release bundle and recovery ZIP must be verified before unlock");
+    if (state.bundleBoard !== profile.board) throw new StageError("release", "release board mismatch in verified build metadata");
+    if (state.markerSafe !== true) throw new StageError("release", "marker-safe image qualification is missing; FASTBOOT_PLEASE risk blocks unlock and install");
 
-    currentStage("recovery");
-    const recovery = await waitForRecovery({ terminal });
-    state.adb = recovery.client;
+    const resumedRecovery = state.adb && state.recoverySerial === state.identity.serialRaw && state.kaeruHeader;
+    if (resumedRecovery) {
+      terminal.ok("continuing from verified recovery without re-submitting the unlock payload");
+      state.stageProgress.unlock = "done";
+    } else {
+      if (!assessment.unlocked) {
+        currentStage("unlock");
+        const outcome = await submitUnlockPayload({
+          client: state.fastboot.client,
+          profile: state.identity.profile,
+          lkBuild: state.identity.lkBuild,
+          payloadBytes: state.payloadBytes,
+          payloadName: state.payloadName,
+          serialRaw: state.identity.serialRaw,
+          terminal,
+        });
+        state.stageProgress.unlock = "done";
+        if (outcome.outcome === "unknown") {
+          terminal.warn("unlock outcome unknown; checking only for same-serial TWRP, never re-submitting brick");
+        }
+      } else {
+        terminal.ok("device is already unlocked; skipping the unlock stage");
+        state.stageProgress.unlock = "skipped";
+      }
+      assertNotAborted("unlock");
+      currentStage("recovery");
+      const recovery = await waitForRecovery({ terminal, expectedSerial: state.identity.serialRaw });
+      state.adb = recovery.client;
+      state.recoverySerial = state.identity.serialRaw;
+    }
+    const kaeruBefore = await readKaeruHeader(state.adb);
+    if (resumedRecovery && kaeruBefore !== state.kaeruHeader) {
+      throw new StageError("recovery", "Kaeru header changed since recovery was verified; do not install");
+    }
+    state.kaeruHeader = kaeruBefore;
     state.stageProgress.recovery = "done";
     assertNotAborted("recovery");
 
@@ -431,24 +514,29 @@ async function runInstall({ dryRun = false } = {}) {
     state.stageProgress.stage = "done";
     assertNotAborted("stage");
 
-    currentStage(dryRun ? "prepare" : "prepare");
-    const first = await runRecoveryPhase({ adb: state.adb, tag: release.tag, dryRun, terminal });
+    currentStage("prepare");
+    const first = await runRecoveryPhase({ adb: state.adb, tag: release.tag,
+      serialRaw: state.identity.serialRaw, phase: "prepare" }, { terminal });
     state.receipts.push(first);
-    if (dryRun) {
-      terminal.ok("rehearsal complete; nothing was written to the device");
-      state.stageProgress.prepare = "done";
-      setRunning(false);
-      return;
+    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+      throw new StageError("install", "expdb Kaeru header changed during the recovery installer; do not reboot");
     }
     if (first.reboot_required === "1") {
       terminal.info("the installer reshaped userdata and needs a reboot before it can install");
       state.stageProgress.prepare = "done";
       currentStage("install");
       await rebootAndWait({ adb: state.adb, target: "recovery", terminal });
-      const next = await waitForRecovery({ terminal });
+      const next = await waitForRecovery({ terminal, expectedSerial: state.identity.serialRaw });
       state.adb = next.client;
-      const second = await runRecoveryPhase({ adb: state.adb, tag: release.tag, terminal });
+      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+        throw new StageError("install", "expdb Kaeru header changed after recovery reboot; do not install");
+      }
+      const second = await runRecoveryPhase({ adb: state.adb, tag: release.tag,
+        serialRaw: state.identity.serialRaw, phase: "install" }, { terminal });
       state.receipts.push(second);
+      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+        throw new StageError("install", "expdb Kaeru header changed during install; do not reboot");
+      }
       if (second.result !== "installed") {
         throw new StageError("install", `the install phase returned result=${second.result ?? "unknown"}`);
       }
@@ -460,14 +548,14 @@ async function runInstall({ dryRun = false } = {}) {
     currentStage("verify");
     terminal.phase(STAGES.length, STAGES.length, "verify and reboot");
     await rebootAndWait({ adb: state.adb, target: "", terminal });
-    terminal.ok("install complete: reboot requested. LibreEcho should come up and serve its control centre.");
-    terminal.info("if the device does not come back, hold the documented recovery route rather than re-running the installer");
+    terminal.warn("reboot requested; installed OS boot, userdata preservation and service readiness are NOT verified by this page");
+    terminal.info("confirm the same device and its marker-free running image before calling the installation complete");
     state.stageProgress.verify = "done";
   } catch (error) {
     const stage = error instanceof StageError ? error.stage : "unknown";
     terminal.error(`${stage} stage failed: ${error.message}`);
     if (error.detail) terminal.line(String(error.detail));
-    terminal.info("nothing further was attempted. Fix the reported condition and re-run; each stage re-checks what it needs.");
+    terminal.info("nothing further was attempted. Preserve the current device state; do not re-run a submitted unlock or installer ZIP without classifying its result first.");
   } finally {
     setRunning(false);
     renderStepList(null);
@@ -479,7 +567,12 @@ async function runInstall({ dryRun = false } = {}) {
 dom.buttons.refresh?.addEventListener("click", () => loadReleases().catch((error) => terminal.error(error.message)));
 dom.releaseSelect?.addEventListener("change", () => {
   state.sums = null;
+  state.files = new Map();
+  state.bundleReady = false;
+  state.bundleBoard = null;
+  state.markerSafe = false;
   state.release = state.releases.find((release) => release.tag === dom.releaseSelect.value) ?? state.release;
+  setStatus(dom.statusBundle, "nothing verified for this release", "pending");
   describeSelectedRelease();
 });
 dom.buttons.verifyBundle?.addEventListener("click", () => dom.bundleInput.click());
@@ -503,6 +596,9 @@ dom.buttons.connectAny?.addEventListener("click", () => {
 dom.buttons.recovery?.addEventListener("click", () => {
   findRecovery().catch((error) => terminal.error(`recovery connection failed: ${error.message}`));
 });
+dom.buttons.grantRecovery?.addEventListener("click", () => {
+  grantRecovery().catch((error) => terminal.error(`recovery USB permission failed: ${error.message}`));
+});
 dom.buttons.dryRun?.addEventListener("click", () => runInstall({ dryRun: true }));
 dom.buttons.run?.addEventListener("click", () => runInstall({ dryRun: false }));
 dom.buttons.abort?.addEventListener("click", () => {
@@ -520,6 +616,7 @@ document.getElementById("download-log")?.addEventListener("click", () => {
 
 terminal.info("LibreEcho browser installer — preview");
 terminal.info(`repository: ${config.repository}${config.mirrorBase ? ` · mirror: ${config.mirrorBase}` : ""}`);
+setRunning(false);
 renderStepList(null);
 reportCapabilities()
   .then(({ support }) => {

@@ -135,28 +135,41 @@ export async function openAdb({ device = null, onLog, any = false } = {}) {
  * Re-attaches to a device the origin already has permission for, without a
  * chooser. Used after a reboot, when the device re-enumerates in another mode.
  */
-export async function reattachAdb({ timeoutMs = 120000, onLog } = {}) {
-  const support = await protocolSupport();
-  if (!support.adbTransport.ok) throw new Error(support.adbTransport.reason);
-  const TransportClass = support.adbTransport.value;
+export async function reattachAdb({ timeoutMs = 120000, onLog, expectedSerial = "",
+  TransportClass = null, ClientClass = null } = {}) {
+  if (!expectedSerial) throw new Error("ADB reattachment requires the selected fastboot serial");
+  if (!TransportClass || !ClientClass) {
+    const support = await protocolSupport();
+    if (!support.adbTransport.ok) throw new Error(support.adbTransport.reason);
+    if (!support.adb.ok) throw new Error(support.adb.reason);
+    TransportClass = support.adbTransport.value;
+    ClientClass = support.adb.value;
+  }
   const filters = adbFilters();
   const deadline = Date.now() + timeoutMs;
   let attempt = 0;
   while (Date.now() < deadline) {
     attempt += 1;
-    try {
-      const granted = await TransportClass.getDevices({ filters });
-      if (granted.length > 0) {
-        const transport = await new TransportClass(granted[0], {}).open();
-        const client = new support.adb.value(transport);
+    const granted = await TransportClass.getDevices({ filters });
+    for (const device of granted) {
+      let transport;
+      let client;
+      try {
+        transport = await new TransportClass(device, {}).open();
+        client = new ClientClass(transport);
         await client.connect({ banner: "host::libreecho-browser-installer" });
-        if (onLog) onLog(`re-attached to adb device ${granted[0].vendorId}:${granted[0].productId}`);
-        return { device: granted[0], transport, client };
+        const observed = (await client.shell("getprop ro.serialno")).stdout?.trim() ?? "";
+        if (observed === expectedSerial) {
+          if (onLog) onLog(`re-attached to the selected ADB device ${device.vendorId}:${device.productId}`);
+          return { device, transport, client };
+        }
+        if (onLog) onLog("ignoring a granted ADB device with a different serial");
+      } catch (error) {
+        if (onLog) onLog(`ADB candidate ${attempt} not ready: ${error.message}`);
       }
-    } catch (error) {
-      if (onLog) onLog(`re-attach attempt ${attempt}: ${error.message}`);
+      try { await (client?.close() ?? transport?.close()); } catch { /* disconnect during mode change */ }
     }
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(4000, Math.max(0, deadline - Date.now()))));
   }
-  throw new Error("the device did not re-appear in ADB mode with its existing permission");
+  throw new Error("the selected device did not re-appear in ADB mode with its existing permission");
 }
