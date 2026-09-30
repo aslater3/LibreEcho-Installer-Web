@@ -22,6 +22,8 @@ import {
 } from "./release.js";
 import { STAGES, StageError, readFastbootIdentity, assessIdentity, submitUnlockPayload, waitForRecovery, readKaeruHeader, pushBundle, verifyStagedBundle, runRecoveryPhase, rebootAndWait } from "./stages.js";
 import { payloadForProfile, requiredBundleMembers } from "./profiles.js";
+import { discoverMirror, fetchReleaseBundle } from "./auto-fetch.js";
+import { extractRecoveryMetadata } from "./recovery-metadata.js";
 
 const config = installerConfig();
 
@@ -43,6 +45,7 @@ const dom = {
   buttons: {
     refresh: document.getElementById("btn-refresh"),
     verifyBundle: document.getElementById("btn-bundle"),
+    fetchBundle: document.getElementById("btn-fetch-bundle"),
     connect: document.getElementById("btn-connect"),
     selectArchive: document.getElementById("btn-amonet-archive"),
     fetchArchive: document.getElementById("btn-fetch-amonet"),
@@ -75,6 +78,9 @@ export const state = {
   markerSafe: false,
   running: false,
   abort: false,
+  fetchingBundle: false,
+  downloadController: null,
+  downloadedBundle: null,
 };
 
 function setStatus(node, text, kind = "pending") {
@@ -135,8 +141,82 @@ async function reportCapabilities() {
 
 // --- releases --------------------------------------------------------------
 
+function clearBundleReadiness() {
+  state.bundleReady = false;
+  state.markerSafe = false;
+  state.bundleBoard = null;
+  state.files = new Map();
+  state.sums = null;
+}
+
+function discardAutomaticBundle() {
+  state.downloadController?.abort();
+  state.downloadController = null;
+  state.fetchingBundle = false;
+  const old = state.downloadedBundle;
+  state.downloadedBundle = null;
+  if (old) old.dispose().catch(error => terminal.warn(`download cache cleanup: ${error.message}`));
+}
+
+async function resolveSources() {
+  const source = await discoverMirror({ mirrorBase: config.mirrorBase, origin: window.location.origin });
+  const local = config.mirrorBase && !config.amonetMirrorBase
+    ? await discoverMirror({ origin: window.location.origin }) : source;
+  if (local?.amonetMirrorBase && !config.amonetMirrorBase) config.amonetMirrorBase = local.amonetMirrorBase;
+  return source?.mirrorBase || config.bootstrapBase;
+}
+
+export async function fetchBundleAutomatically({ mirrorBase = null, reuse = false } = {}) {
+  if (state.running) throw new Error("cannot fetch bundle during an active run");
+  const release = state.release;
+  if (!release) return false;
+  if (!reuse || state.downloadedBundle?.release !== release) discardAutomaticBundle();
+  state.downloadController?.abort();
+  const controller = new AbortController();
+  state.downloadController = controller;
+  state.fetchingBundle = true;
+  clearBundleReadiness();
+  setRunning(false);
+  setStatus(dom.statusBundle, "downloading and verifying release", "pending");
+  let bundle;
+  try {
+    mirrorBase ||= await resolveSources();
+    controller.signal.throwIfAborted();
+    if (!mirrorBase) throw new Error("no readable source configured; select the bundle manually");
+    const options = { mirrorBase, signal: controller.signal,
+      onProgress: (name, received, total, hashing) => terminal.progress(hashing === undefined ? "downloading bundle" : "hashing download", hashing ?? (total ? received / total : 0), name) };
+    bundle = state.downloadedBundle ?? await fetchReleaseBundle(release, options);
+    if (state.release !== release || state.downloadController !== controller) throw new Error("release changed during download");
+    bundle.release = release;
+    state.downloadedBundle = bundle;
+    const byName = new Map(bundle.files.map(f => [f.name, f]));
+    controller.signal.throwIfAborted();
+    if (state.release !== release || state.downloadController !== controller) throw new Error("release changed during download");
+    await verifyBundle([...byName.values()], { automatic: true });
+    return state.bundleReady;
+  } catch (error) {
+    if (state.downloadController === controller) {
+      clearBundleReadiness();
+      state.downloadedBundle = null;
+      setStatus(dom.statusBundle, "automatic fetch unavailable — select files or retry", "bad");
+      terminal.error(error.message);
+    }
+    if (bundle) await bundle.dispose();
+    return false;
+  } finally {
+    if (state.downloadController === controller) {
+      state.downloadController = null;
+      state.fetchingBundle = false;
+      terminal.endProgress();
+      setRunning(false);
+    }
+  }
+}
+
+
 export async function loadReleases() {
   if (state.running) throw new Error("cannot refresh releases during an active run");
+  discardAutomaticBundle();
   state.sums = null;
   state.files = new Map();
   state.bundleReady = false;
@@ -171,13 +251,15 @@ export async function loadReleases() {
     if (release !== stable && release !== dev) add(release, release.kind === "stable" ? "Stable" : "Development");
     }
   state.release = stable ?? dev ?? state.releases[0];
-  if (config.releaseTag) {
-    const preferred = state.releases.find((release) => release.tag === config.releaseTag);
+  const preferredTag = config.releaseTag;
+  if (preferredTag) {
+    const preferred = state.releases.find((release) => release.tag === preferredTag);
     if (preferred) state.release = preferred;
   }
   dom.releaseSelect.value = state.release?.tag ?? "";
   describeSelectedRelease();
   setStatus(dom.statusRelease, state.release ? "selected" : "none", state.release ? "ok" : "bad");
+  await fetchBundleAutomatically();
 }
 
 function describeSelectedRelease() {
@@ -208,15 +290,17 @@ function describeSelectedRelease() {
   link.href = releasePageUrl(release.tag, config.repository);
   link.target = "_blank";
   link.rel = "noopener";
-  link.textContent = "Open the release page to download the bundle (browser downloads work; in-page fetches do not)";
+  link.textContent = "Open the release page (manual download fallback)";
   dom.releaseMeta.appendChild(link);
 }
 
 // --- bundle ----------------------------------------------------------------
 
-export async function verifyBundle(fileList) {
+export async function verifyBundle(fileList, { automatic = false } = {}) {
   if (state.running) throw new Error("cannot change bundle during an active run");
+  if (!automatic) discardAutomaticBundle();
   const release = state.release;
+  const downloadController = automatic ? state.downloadController : null;
   state.bundleReady = false;
   state.markerSafe = false;
   state.bundleBoard = null;
@@ -261,7 +345,17 @@ export async function verifyBundle(fileList) {
         throw new Error(`${name}: published asset digest differs from the checksum inventory`);
       }
     }
-    const sums = new Map([...normal, ...twrp]);
+    const sums = new Map(normal);
+    for (const [name, expected] of twrp) {
+      if (sums.has(name) && sums.get(name) !== expected) throw new Error(`${name}: conflicting checksum inventories`);
+      sums.set(name, expected);
+    }
+    for (const [name, expected] of sums) {
+      const asset = release.assets.find(a => a.name === name);
+      if (!asset || asset.digest !== `sha256:${expected}` || byName.get(name)?.size !== asset.size) {
+        throw new Error(`${name}: missing asset or API digest/size differs from checksum inventory`);
+      }
+    }
     const result = await verifyBundleFiles(files, {
       sums,
       onProgress: (fraction, name) => terminal.progress("hashing bundle", fraction, name),
@@ -271,18 +365,27 @@ export async function verifyBundle(fileList) {
       throw new Error(`bundle not complete: ${result.failed.length} digest mismatch, ${result.missing.length} missing`);
     }
     const build = JSON.parse(await result.byName.get(`${prefix}-build.json`).text());
+    const metadata = await extractRecoveryMetadata(result.byName, release.tag);
+    for (const [name, digest] of metadata.sums) {
+      if (sums.has(name)) throw new Error(`${name}: derived metadata collides with inventory`);
+      sums.set(name, digest);
+      result.byName.set(name, metadata.files.get(name));
+      result.checked.push({ name, sha256: digest, size: metadata.files.get(name).size });
+    }
     if (!build.board || build.hardware_accepted !== true) {
       throw new Error("build metadata has no hardware-accepted board; refusing device writes");
     }
-    if (state.release !== release) throw new Error("release selection changed during verification");
+    if (state.release !== release || (automatic && (downloadController?.signal.aborted || state.downloadController !== downloadController))) throw new Error("release selection changed during verification");
     state.sums = sums;
     state.files = result.byName;
     state.bundleBoard = build.board;
+    state.markerSafe = false;
     state.bundleReady = true;
     setRunning(false);
     setStatus(dom.statusBundle, `${result.checked.length} verified (including recovery ZIP)`, "ok");
     terminal.ok(`complete bundle verified against GitHub release API (${build.board})`);
   } catch (error) {
+    if (automatic && state.downloadController !== downloadController) return;
     terminal.endProgress();
     setStatus(dom.statusBundle, "verification failed", "bad");
     terminal.error(error.message);
@@ -314,6 +417,10 @@ export async function queryDevice({ any = false, open = openFastboot } = {}) {
       `${identity.product || "unknown"} · ${assessment.unlocked ? "unlocked" : "locked"} · ${identity.serialMasked}`,
       identity.profile ? (assessment.unlocked ? "ok" : "warn") : "bad",
     );
+    if (state.downloadedBundle && !state.fetchingBundle) await fetchBundleAutomatically({ reuse: true });
+    if (config.amonetMirrorBase && state.identity?.profile?.archive && !state.payloadBytes) {
+      await fetchPinnedAmonetArchive().catch(error => terminal.warn(`select pinned Amonet ZIP manually: ${error.message}`));
+    }
     return identity;
   } catch (error) {
     setStatus(dom.statusDevice, "not connected", "bad");
@@ -444,7 +551,8 @@ export async function loadPayload(file) {
 
 function setRunning(running) {
   state.running = running;
-  dom.buttons.run.disabled = running || !state.bundleReady || !state.markerSafe;
+  dom.buttons.run.disabled = running || state.fetchingBundle || !state.bundleReady || !state.markerSafe;
+  if (dom.buttons.fetchBundle) dom.buttons.fetchBundle.disabled = running || state.fetchingBundle;
   dom.buttons.dryRun.disabled = running;
   dom.buttons.verifyBundle.disabled = running;
   dom.bundleInput.disabled = running;
@@ -465,7 +573,7 @@ function assertNotAborted(stage) {
 }
 
 export async function runInstall({ dryRun = false } = {}) {
-  if (state.running) return;
+  if (state.running || state.fetchingBundle) return;
   state.abort = false;
   state.stageProgress = {};
   state.receipts = [];
@@ -473,7 +581,7 @@ export async function runInstall({ dryRun = false } = {}) {
   terminal.phase(1, STAGES.length, dryRun ? "rehearsal: no writes" : "browser one-shot install");
   terminal.info(`release ${state.release?.tag ?? "(none)"} · repository ${config.repository}`);
   if (config.mirrorBase) terminal.info(`asset mirror: ${config.mirrorBase}`);
-  else terminal.warn("no CORS-capable asset mirror configured: payload bytes must come from your own download");
+  else terminal.info("bundle source: same-origin Pages release directory or loopback development helper; manual files remain available");
 
   try {
     const release = state.release;
@@ -621,6 +729,7 @@ export async function runInstall({ dryRun = false } = {}) {
 
 dom.buttons.refresh?.addEventListener("click", () => loadReleases().catch((error) => terminal.error(error.message)));
 dom.releaseSelect?.addEventListener("change", () => {
+  discardAutomaticBundle();
   state.sums = null;
   state.files = new Map();
   state.bundleReady = false;
@@ -629,7 +738,9 @@ dom.releaseSelect?.addEventListener("change", () => {
   state.release = state.releases.find((release) => release.tag === dom.releaseSelect.value) ?? state.release;
   setStatus(dom.statusBundle, "nothing verified for this release", "pending");
   describeSelectedRelease();
+  fetchBundleAutomatically().catch(error => terminal.error(error.message));
 });
+dom.buttons.fetchBundle?.addEventListener("click", () => fetchBundleAutomatically().catch(error => terminal.error(error.message)));
 dom.buttons.verifyBundle?.addEventListener("click", () => dom.bundleInput.click());
 dom.bundleInput?.addEventListener("change", (event) => {
   verifyBundle(event.target.files).catch((error) => terminal.error(`bundle verification failed: ${error.message}`));

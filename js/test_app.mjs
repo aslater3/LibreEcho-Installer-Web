@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { requiredBundleMembers } from './profiles.js';
+import { completeFixture } from './bundle-fixture.mjs';
 
 class Element {
   constructor() {
@@ -297,22 +298,13 @@ const makeFile = (name, content) => {
 };
 const sha = (content) => createHash('sha256').update(content).digest('hex');
 function makeCompleteBundle(tag, { wrongChecksum = false } = {}) {
-  const prefix = `libreecho-${tag}`;
-  const members = requiredBundleMembers(tag);
-  const normalNames = members.filter((name) => !name.endsWith('SHA256SUMS') && name !== 'libreecho-install.zip' && name !== 'bundle.manifest');
-  const body = (name) => name.endsWith('-build.json') ? JSON.stringify({ board: 'radar_puffin', hardware_accepted: true }) : `test bytes for ${name}`;
-  const files = normalNames.map((name) => makeFile(name, body(name)));
-  const normal = normalNames.map((name) => `${sha(body(name))}  ${name}`).join('\n') + '\n';
-  const twrp = ['libreecho-install.zip', 'bundle.manifest'].map((name) => `${sha(body(name))}  ${name}`).join('\n') + '\n';
-  files.push(makeFile('libreecho-install.zip', body('libreecho-install.zip')));
-  files.push(makeFile('bundle.manifest', body('bundle.manifest')));
-  files.push(makeFile(`${prefix}-SHA256SUMS`, normal));
-  files.push(makeFile(`${prefix}-TWRPINSTALL-SHA256SUMS`, twrp));
-  const assets = files.map((file) => ({ name: file.name, size: file.size,
-    digest: `sha256:${wrongChecksum && file.name === `${prefix}-TWRPINSTALL-SHA256SUMS` ? '0'.repeat(64) : sha(file.name.endsWith('SHA256SUMS') ? (file.name.includes('TWRPINSTALL') ? twrp : normal) : body(file.name))}` }));
-  return { files, assets };
+  if (wrongChecksum) {
+    const f = completeFixture(tag);
+    f.assets.find(a => a.name.endsWith('-TWRPINSTALL-SHA256SUMS')).digest = `sha256:${'0'.repeat(64)}`;
+    return f;
+  }
+  return completeFixture(tag);
 }
-
 test('a complete API-digest-anchored bundle earns readiness', async () => {
   const tag = 'radar-puffin-v0.14.0';
   const { files, assets } = makeCompleteBundle(tag);
@@ -324,6 +316,54 @@ test('a complete API-digest-anchored bundle earns readiness', async () => {
   assert.equal(app.state.bundleReady, true, app.terminal.plainText());
   assert.ok(app.state.files.has('libreecho-install.zip'));
   assert.ok(app.state.files.has('bundle.manifest'));
+});
+
+test('auto-fetch commits the same verified state as manual including archive metadata', async () => {
+  assert.equal(typeof app.fetchBundleAutomatically, 'function');
+  const f = completeFixture(); const previous = globalThis.fetch;
+  app.state.release = { tag: f.tag, assets: f.assets };
+  globalThis.fetch = async url => {
+    const name = decodeURIComponent(String(url).split('/').pop());
+    return f.bytes.has(name) ? new Response(f.bytes.get(name)) : new Response('', { status: 404 });
+  };
+  try {
+    await app.fetchBundleAutomatically({ mirrorBase: 'https://approved/mirror' });
+    assert.equal(app.state.bundleReady, true, app.terminal.plainText());
+    const automatic = new Map(app.state.sums);
+    for (const name of f.metadata.keys()) assert.ok(app.state.files.has(name));
+    await app.verifyBundle(f.files);
+    assert.deepEqual(app.state.sums, automatic);
+  } finally { globalThis.fetch = previous; }
+});
+
+test('manual selection supersedes an in-flight automatic fetch without stale state', async () => {
+  const f=completeFixture();const previous=globalThis.fetch;
+  app.state.release={tag:f.tag,assets:f.assets};
+  let unblock; let requested;
+  const started=new Promise(resolve=>{requested=resolve;});
+  globalThis.fetch=async () => {requested(); return new Promise(resolve=>{unblock=resolve;});};
+  try {
+    const downloading=app.fetchBundleAutomatically({mirrorBase:'https://approved/mirror'});
+    await started;
+    await app.verifyBundle(f.files);
+    assert.equal(app.state.bundleReady,true);
+    unblock(new Response(f.bytes.get(`libreecho-${f.tag}-SHA256SUMS`)));
+    await downloading;
+    assert.equal(app.state.bundleReady,true);
+    assert.equal(app.state.fetchingBundle,false);
+  } finally {globalThis.fetch=previous;}
+});
+
+test('auto-fetch without a helper or Pages assets keeps manual selection enabled', async () => {
+  const previous = globalThis.fetch;
+  app.state.release = completeFixture();
+  globalThis.fetch = async () => new Response('', { status: 404 });
+  try {
+    await app.fetchBundleAutomatically({ mirrorBase: 'http://127.0.0.1:8767/releases' });
+    assert.equal(app.state.bundleReady, false);
+    assert.equal(app.state.files.size, 0);
+    assert.equal(elements.get('btn-bundle').disabled, false);
+  } finally { globalThis.fetch = previous; }
 });
 
 test('a substituted TWRP checksum inventory cannot earn readiness', async () => {
