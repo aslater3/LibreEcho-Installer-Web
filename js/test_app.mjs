@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { requiredBundleMembers } from './profiles.js';
 import { completeFixture } from './bundle-fixture.mjs';
+import { combinedFixture } from './combined-fixture.mjs';
 
 class Element {
   constructor() {
@@ -215,6 +216,7 @@ test('verified same-device recovery resumes without resubmitting brick', async (
   app.state.identity.product = 'RADAR';
   app.state.bundleReady = true;
   app.state.bundleBoard = 'radar_puffin';
+  app.state.bundleHardwareAccepted = true;
   app.state.markerSafe = true;
   app.state.recoverySerial = app.state.identity.serialRaw;
   app.state.kaeruHeader = '8816885870b203004c4b000000000000';
@@ -376,4 +378,144 @@ test('a substituted TWRP checksum inventory cannot earn readiness', async () => 
   await app.verifyBundle(files);
   assert.equal(app.state.bundleReady, false, 'untrusted recovery checksum inventory was accepted');
   assert.match(app.terminal.plainText(), /TWRP.*checksum.*mismatch|TWRP.*digest.*mismatch/i);
+});
+
+test('loading the build list never downloads release assets', async () => {
+  const urls = [];
+  const previousFetch = globalThis.fetch;
+  const previousLocation = globalThis.window.location;
+  globalThis.window.location = { search: '', href: 'http://127.0.0.1:8799/', origin: 'http://127.0.0.1:8799' };
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    urls.push(value);
+    if (value.includes('/mirror/health')) return Response.json({ repository: 'aslater3/LibreEcho', mirror: true });
+    if (value.includes('api.github.com')) return { ok: true, json: async () => [{
+      tag_name: 'radar-puffin-build-8de9f9d-fa9c63a7c9141865-34617fcfdeda992d', published_at: '2026-10-01T00:00:00Z',
+      assets: [
+        { name: 'libreecho-radar-puffin-build-8de9f9d-fa9c63a7c9141865-34617fcfdeda992d-boot.img', size: 10, digest: `sha256:${'a'.repeat(64)}` },
+        { name: 'libreecho-radar-puffin-build-8de9f9d-fa9c63a7c9141865-34617fcfdeda992d-targets.json', size: 10, digest: `sha256:${'b'.repeat(64)}` },
+      ],
+      prerelease: true, draft: false,
+    }] };
+    return new Response('', { status: 404 });
+  };
+  try {
+    await app.loadReleases();
+    assert.ok(urls.length > 0, 'the build list was not read');
+    assert.ok(urls.every((value) => value.includes('api.github.com')),
+      `loading the build list downloaded release data: ${urls.join(', ')}`);
+  } finally {
+    globalThis.fetch = previousFetch;
+    globalThis.window.location = previousLocation;
+  }
+});
+
+test('a combined release downloads and verifies only the chosen target (Echo Dot)', async () => {
+  const f = combinedFixture();
+  const previous = globalThis.fetch;
+  const urls = [];
+  app.state.release = { tag: f.tag, assets: f.assets, kind: 'development', publishedAt: '2026-10-01T00:00:00Z', prerelease: true };
+  app.state.board = 'biscuit';
+  app.state.target = null;
+  app.state.targetsJson = null;
+  globalThis.fetch = async (url) => {
+    const value = String(url);
+    urls.push(value);
+    const name = decodeURIComponent(value.split('/').pop());
+    return f.bytes.has(name) ? new Response(f.bytes.get(name)) : new Response('', { status: 404 });
+  };
+  try {
+    await app.fetchBundleAutomatically({ mirrorBase: 'https://approved/mirror', board: 'biscuit' });
+    assert.equal(app.state.bundleReady, true, app.terminal.plainText());
+    assert.equal(app.state.bundleBoard, 'biscuit');
+    assert.equal(app.state.target.board, 'biscuit');
+    assert.equal(app.state.bundleHardwareAccepted, true);
+    assert.ok(app.state.files.has('libreecho-biscuit-bundle.manifest'));
+    assert.ok(app.state.files.has('libreecho-biscuit-install.zip'));
+    assert.ok(![...app.state.files.keys()].some((name) => name.startsWith('libreecho-radar-puffin-base')),
+      'a Radar asset was fetched for a Dot build');
+    const radarAssets = new Set([...f.normalNames.radar_puffin, ...f.recoveryNames.radar_puffin]);
+    assert.ok(!urls.some((value) => radarAssets.has(decodeURIComponent(value.split('/').pop()))),
+      `a Radar asset was requested: ${urls.join(', ')}`);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+test('a build that is not hardware-accepted verifies but cannot be installed', async () => {
+  const f = combinedFixture({ biscuitAccepted: false });
+  const previous = globalThis.fetch;
+  app.state.release = { tag: f.tag, assets: f.assets, kind: 'development', publishedAt: '2026-10-01T00:00:00Z', prerelease: true };
+  app.state.board = 'biscuit';
+  app.state.target = null;
+  app.state.targetsJson = null;
+  globalThis.fetch = async (url) => {
+    const name = decodeURIComponent(String(url).split('/').pop());
+    return f.bytes.has(name) ? new Response(f.bytes.get(name)) : new Response('', { status: 404 });
+  };
+  try {
+    await app.fetchBundleAutomatically({ mirrorBase: 'https://approved/mirror', board: 'biscuit' });
+    assert.equal(app.state.bundleReady, true, app.terminal.plainText());
+    assert.equal(app.state.bundleHardwareAccepted, false);
+    assert.equal(elements.get('btn-run').disabled, true, 'an unqualified build enabled Run');
+    assert.match(app.terminal.plainText(), /not marked hardware-accepted/i);
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
+// --- manual selection of a combined release --------------------------------
+
+test('a combined release selected by hand resolves the chosen board from the verified descriptor', async () => {
+  const f = combinedFixture();
+  app.state.release = { tag: f.tag, assets: f.assets };
+  app.state.board = 'biscuit';
+  app.state.target = null;
+  app.state.targetsJson = null;
+  app.state.sums = null;
+  app.state.files = new Map();
+  app.state.bundleReady = false;
+  await app.verifyBundle(f.files);
+  assert.equal(app.state.bundleReady, true, app.terminal.plainText());
+  assert.equal(app.state.target.board, 'biscuit');
+  assert.ok(app.state.files.has('libreecho-biscuit-install.zip'));
+  assert.ok(![...app.state.files.keys()].some((name) => name.startsWith('libreecho-radar-puffin-base')),
+    'a Radar asset was accepted for a Dot manual selection');
+});
+
+test('a combined release selected by hand without its descriptor is refused, not treated as legacy Radar', async () => {
+  const f = combinedFixture();
+  app.state.release = { tag: f.tag, assets: f.assets };
+  app.state.board = 'biscuit';
+  app.state.target = null;
+  app.state.targetsJson = null;
+  app.state.sums = null;
+  app.state.files = new Map();
+  app.state.bundleReady = false;
+  const selected = f.files.filter((file) => !file.name.endsWith('-targets.json'));
+  await app.verifyBundle(selected);
+  assert.equal(app.state.bundleReady, false, 'a combined release fell back to a board without its descriptor');
+  assert.match(app.terminal.plainText(), /targets\.json|combined/i);
+});
+
+test('a combined release selected by hand with a tampered descriptor is refused', async () => {
+  const f = combinedFixture();
+  const descriptorName = [...f.bytes.keys()].find((name) => name.endsWith('-targets.json'));
+  const tampered = 'x'.repeat(Buffer.byteLength(f.bytes.get(descriptorName)));
+  const files = f.files.map((file) => {
+    if (file.name !== descriptorName) return file;
+    const blob = new Blob([tampered]);
+    blob.name = descriptorName;
+    return blob;
+  });
+  app.state.release = { tag: f.tag, assets: f.assets };
+  app.state.board = 'biscuit';
+  app.state.target = null;
+  app.state.targetsJson = null;
+  app.state.sums = null;
+  app.state.files = new Map();
+  app.state.bundleReady = false;
+  await app.verifyBundle(files);
+  assert.equal(app.state.bundleReady, false);
+  assert.match(app.terminal.plainText(), /checksum|digest|record/i);
 });

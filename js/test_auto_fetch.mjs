@@ -25,6 +25,30 @@ test('automatic bundle downloads checksum union and verifies every asset against
   assert.ok(bundle.files.every(f => f instanceof Blob));
   assert.ok(progress.length); await bundle.dispose();
 });
+test('download progress uses the complete fixed plan before the first payload', async () => {
+  const f = fixture(); const events = [];
+  const bundle = await auto.fetchReleaseBundle(f.release, { mirrorBase: 'https://m', fetcher: f.fetcher, onEvent: e => events.push(e) });
+  const transfer = events.filter(e => e.phase === 'downloading');
+  const total = f.release.assets.reduce((n, a) => n + a.size, 0);
+  assert.ok(transfer.length > 0);
+  for (const e of transfer) {
+    assert.equal(e.total, total, 'denominator must not grow as each file starts');
+    assert.equal(e.count, f.release.assets.length);
+  }
+  assert.ok(events.some(e => e.phase === 'preparing'));
+  assert.equal(events.at(-1).phase, 'complete');
+  assert.equal(events.at(-1).done, total);
+  await bundle.dispose();
+});
+test('invalid late payload size is rejected before any payload is downloaded', async () => {
+  const f = fixture(); f.release.assets.find(a => a.name === 'extra.bin').size = -1;
+  await assert.rejects(auto.fetchReleaseBundle(f.release, { mirrorBase: 'https://m', fetcher: f.fetcher }), /size/);
+  assert.ok(f.calls.every(url => url.endsWith('SHA256SUMS')));
+});
+test('duplicate API asset names are rejected rather than choosing the first', async () => {
+  const f = fixture(); f.release.assets.push({ ...f.release.assets[0] });
+  await assert.rejects(auto.fetchReleaseBundle(f.release, { mirrorBase: 'https://m', fetcher: f.fetcher }), /duplicate/i);
+});
 test('SUMS mismatch fails closed', async () => {
   const f = fixture(); const n = `${prefix}-boot.img`; f.bytes.set(n, 'corrupt');
   await assert.rejects(auto.fetchReleaseBundle(f.release, { mirrorBase: 'https://m', fetcher: f.fetcher }), /size|digest|checksum/);

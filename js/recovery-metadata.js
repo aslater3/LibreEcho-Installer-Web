@@ -35,13 +35,22 @@ async function recoveryTarMembers(archive, wanted) {
   return result;
 }
 
-/** The ZIP needs these alongside it; they are inside API-verified archives, not
+/**
+ * The ZIP needs these alongside it; they are inside API-verified archives, not
  * standalone release assets. Bind each extracted byte to verified bundle.manifest.
  * This extraction never confers device/image qualification.
+ *
+ * `target` is either the legacy release tag (string) or
+ * `{ prefix, manifestName }` for a combined release, where the normal asset
+ * prefix and the recovery manifest name both differ from the legacy names.
  */
-export async function extractRecoveryMetadata(verifiedFiles, releaseTag) {
-  const bundle = verifiedFiles.get('bundle.manifest');
-  if (!bundle) throw new Error('missing verified bundle.manifest');
+export async function extractRecoveryMetadata(verifiedFiles, target) {
+  const options = typeof target === "string"
+    ? { prefix: `libreecho-${target}`, manifestName: "bundle.manifest" }
+    : { prefix: target?.prefix, manifestName: target?.manifestName ?? "bundle.manifest" };
+  if (!options.prefix || !options.manifestName) throw new Error("missing target prefix or manifest name");
+  const bundle = verifiedFiles.get(options.manifestName);
+  if (!bundle) throw new Error(`missing verified ${options.manifestName}`);
   const text = await bundle.text();
   const expected = new Map();
   for (const line of text.split(/\r?\n/)) {
@@ -51,10 +60,9 @@ export async function extractRecoveryMetadata(verifiedFiles, releaseTag) {
       expected.set(match[1], match[2]);
     }
   }
-  const prefix = `libreecho-${releaseTag}`;
   const files = new Map([
-    ...await recoveryTarMembers(verifiedFiles.get(`${prefix}-initial-install.tar`), ['manifest.json']),
-    ...await recoveryTarMembers(verifiedFiles.get(`${prefix}.ota.tar`), ['manifest', 'manifest.sig']),
+    ...await recoveryTarMembers(verifiedFiles.get(`${options.prefix}-initial-install.tar`), ['manifest.json']),
+    ...await recoveryTarMembers(verifiedFiles.get(`${options.prefix}.ota.tar`), ['manifest', 'manifest.sig']),
   ]);
   for (const [name, blob] of files) {
     if (!expected.has(name)) throw new Error(`${name}: recovery digest pin missing`);
