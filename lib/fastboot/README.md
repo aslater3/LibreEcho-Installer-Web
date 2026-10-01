@@ -159,16 +159,15 @@ transport.close() / releaseInterface() / reset() / describe()
 ## Protocol notes (what the code guarantees)
 
 - Command → 4 ASCII status bytes (`OKAY`, `FAIL`, `DATA`, `INFO`, `TEXT`).
-- `INFO`/`TEXT` contain text in the remainder of their USB transfer, with no
-  length field. Text stops at NUL; progress is collected until `OKAY`/`FAIL`.
+- `INFO`/`TEXT` carry 8 ASCII hex length digits + payload; they are collected
+  until a terminal `OKAY`/`FAIL`.
 - `DATA` carries only the 8 hex digit maximum-accepted-chunk window; the payload
   then travels host → device and is acknowledged with `OKAY`/`FAIL`.
 - `OKAY`/`FAIL` may be followed by result/reason text in the same transfer;
   text arriving in the *next* transfer is picked up with a short bounded grace
   read (a FAIL is still bounded by the command timeout).
-- USB reply boundaries are transfer boundaries: each read supplies one complete
-  message. `ResponseStream` queues transfers, never concatenating text replies.
-  Short status words and DATA transfers other than status + 8 hex digits fail closed.
+- Parsing is incremental: one read may hold several messages, one message may
+  span many reads. `ResponseStream` buffers and never assumes read == message.
 - Download chunking follows the real host: `download:<size>` → `DATA <window>`
   → that many raw bytes → `OKAY`, repeating until the image is sent; a smaller
   window shrinks the subsequent chunk sizes.
@@ -185,8 +184,8 @@ node --test test_fastboot.mjs     # or: node test_fastboot.mjs
 ```
 
 Tests require no hardware and run against a scripted fake transport and a
-fake bootloader that speaks the protocol: standard text framing, separate reply
-transfers, FAIL reasons (including late text across transfers), chunked downloads,
+fake bootloader that speaks the protocol: framing, split and multi-message
+reads, FAIL reasons (including split across transfers), chunked downloads,
 whole-image brick download and fail-closed short-window handling, flash/erase/
 reboot/oem, the timeout path, and the WebUSB transport's write splitting,
 buffering and interface selection against an in-memory `USBDevice`.

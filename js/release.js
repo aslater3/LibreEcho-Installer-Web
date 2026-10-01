@@ -45,8 +45,6 @@ export function installerConfig() {
     mirrorBase: (query.mirror ?? global.mirrorBase ?? "").replace(/\/+$/, ""),
     amonetMirrorBase: (query.amonetMirror ?? global.amonetMirrorBase ?? "").replace(/\/+$/, ""),
     releaseTag: query.release ?? global.releaseTag ?? "",
-    bootstrapBase: typeof window !== 'undefined' && window.location.href
-      ? new URL('./releases', window.location.href).href.replace(/\/+$/, '') : '',
   };
 }
 

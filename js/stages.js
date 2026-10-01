@@ -51,37 +51,6 @@ export class StageError extends Error {
   }
 }
 
-/** Raised when the operator stops while a device wait is in progress. */
-export class RecoveryStopped extends StageError {
-  constructor(message = "the operator stopped while waiting for recovery") {
-    super("recovery", message);
-    this.name = "RecoveryStopped";
-    this.stopped = true;
-  }
-}
-
-/**
- * Serialises recovery claims. A background poll and a user-granted permission
- * chooser must never open the same USB interface at the same time, so both run
- * their open/validate step through one lock.
- */
-export function createMutex() {
-  let tail = Promise.resolve();
-  return {
-    async run(fn) {
-      const previous = tail;
-      let release;
-      tail = new Promise((resolve) => { release = resolve; });
-      await previous;
-      try {
-        return await fn();
-      } finally {
-        release();
-      }
-    },
-  };
-}
-
 /** Reads the receipt the recovery installer appends to, as key=value lines. */
 export function parseReceipt(text) {
   const fields = {};
@@ -285,83 +254,39 @@ export async function readKaeruHeader(adb) {
 }
 
 /**
- * Probes an opened ADB session and refuses it unless it is the selected TWRP
- * device: TWRP must be running, the serial must match the frozen fastboot
- * serial, and (when a board is known) the reported board must match. Only then
- * is the existing Kaeru expdb check run, and its header is returned for the
- * caller's before/after comparison.
- */
-export async function validateRecoverySession({ client, expectedSerial, expectedBoard = "", terminal } = {}) {
-  const probe = await client.shell("getprop ro.twrp.version; getprop ro.product.device; getprop ro.serialno");
-  const lines = String(probe?.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
-  const [twrpVersion = "", device = "", serial = ""] = lines;
-  terminal?.line(`adb probe: twrp=${twrpVersion || "(none)"} device=${device || "(none)"} serial=${maskSerial(serial)}`);
-  if (!/^\d/.test(twrpVersion)) {
-    throw new StageError("recovery", "ADB answered but TWRP is not running on the selected device");
-  }
-  if (!expectedSerial || serial !== expectedSerial) {
-    throw new StageError("recovery", `recovery serial ${maskSerial(serial)} does not match the selected fastboot device`);
-  }
-  if (expectedBoard && !boardMatches(device, expectedBoard)) {
-    throw new StageError("recovery", `recovery board ${device || "(none)"} does not match the selected ${expectedBoard}`);
-  }
-  const header = await readKaeruHeader(client);
-  return { twrpVersion, device, serial, header };
-}
-
-function normaliseBoard(value) {
-  return String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-}
-
-/**
- * Explicit board identity aliases for the recovery environment: the boot chain's
- * product string and TWRP's `ro.product.device` are not spelled identically for
- * every build, so an empty or clearly different board is refused while a
- * documented alias (radar_puffin vs radar) is accepted, never a substring.
- */
-export function boardMatches(observed, expected) {
-  const a = normaliseBoard(observed);
-  const b = normaliseBoard(expected);
-  if (!a || !b) return false;
-  return a === b || (["radar", "radar_puffin"].includes(a) && ["radar", "radar_puffin"].includes(b));
-}
-
-/**
- * Waits for a previously authorised TWRP device over ADB. A changed USB
- * identity may require a separate user-gesture permission grant. This helper
- * never opens a chooser from its polling loop. The wait
- * is cancellable: `signal` (an AbortSignal) or `isCancelled()` stops it promptly.
+ * Waits for TWRP to appear over ADB. The browser keeps the USB permission it
+ * was granted, so re-attachment after a USB mode change needs no new prompt;
+ * the device chooser is only used when nothing has been granted yet.
  */
 export async function waitForRecovery({ timeoutMs = 180000, intervalMs = 4000, terminal,
-  adbDevice = null, expectedSerial = "", expectedBoard = "", openSession = null,
-  signal = null, isCancelled = null } = {}) {
+  adbDevice = null, expectedSerial = "", openSession = null } = {}) {
   const { reattachAdb } = await import("./transports.js");
   const deadline = Date.now() + timeoutMs;
   let attempt = 0;
-  for (;;) {
-    if (isCancelled?.() || signal?.aborted) throw new RecoveryStopped();
-    if (Date.now() >= deadline) break;
+  while (Date.now() < deadline) {
     attempt += 1;
-    let session = null;
     try {
-      session = openSession
+      const session = openSession
         ? await openSession()
         : adbDevice
           ? await openAdb({ device: adbDevice, onLog: (line) => terminal?.line(line) })
           : await reattachAdb({ timeoutMs: Math.min(intervalMs * 3, 12000), expectedSerial, onLog: null });
-      if (!session) { await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now()))); continue; }
-      const validated = await validateRecoverySession({ client: session.client, expectedSerial, expectedBoard, terminal });
-      terminal?.ok(`TWRP ${validated.twrpVersion} is reachable over ADB on the selected device`);
-      session.validated = validated;
-      return session;
-    } catch (error) {
-      if (error instanceof RecoveryStopped) throw error;
-      if (attempt === 1 || attempt % 5 === 0) {
-        terminal?.line(`waiting for the selected recovery (${Math.round(Math.max(0, deadline - Date.now()) / 1000)}s left): ${error.message}`);
+      const probe = await session.client.shell("getprop ro.twrp.version; getprop ro.product.device; getprop ro.serialno");
+      const lines = String(probe.stdout ?? "").split(/\r?\n/).map((line) => line.trim());
+      const [twrpVersion = "", device = "", serial = ""] = lines;
+      terminal?.line(`adb probe ${attempt}: twrp=${twrpVersion || "(none)"} device=${device || "(none)"} serial=${maskSerial(serial)}`);
+      if (/^\d/.test(twrpVersion) && expectedSerial && serial === expectedSerial) {
+        terminal?.ok(`TWRP ${twrpVersion} is reachable over ADB on the selected device`);
+        return session;
       }
-      try { await (session?.client?.close?.() ?? session?.close?.()); } catch { /* disconnect during mode change */ }
+      terminal?.warn("ADB answered but TWRP or serial did not match the selected fastboot device");
+      await session.client.close();
+    } catch (error) {
+      if (attempt === 1 || attempt % 5 === 0) {
+        terminal?.line(`waiting for the selected recovery (${Math.round((deadline - Date.now()) / 1000)}s left): ${error.message}`);
+      }
     }
-    await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
+    await sleep(intervalMs);
   }
   throw new StageError("recovery", "timed out waiting for TWRP on the selected serial");
 }
@@ -369,87 +294,6 @@ export async function waitForRecovery({ timeoutMs = 180000, intervalMs = 4000, t
 // ---------------------------------------------------------------------------
 // Stage 6 — stage the bundle
 // ---------------------------------------------------------------------------
-
-/**
- * Conservative reserve added to the exact push set before comparing against the
- * device's free /cache space. Documented, not measured per device: it covers
- * ext4 block rounding for every pushed file, the staging directory entry, and
- * the recovery installer's own scratch and receipt writes in /cache. It is
- * deliberately generous rather than tight.
- */
-export const CACHE_STAGING_OVERHEAD_BYTES = 4 * 1024 * 1024;
-
-/** Exact bytes to push, plus the documented staging reserve, for the selected files. */
-export function cachePreflightBytes({ files, sums } = {}) {
-  const names = [...(sums?.keys() ?? [])].filter((name) => files?.has(name));
-  if (names.length === 0) throw new StageError("stage", "no verified bundle files were provided");
-  let pushBytes = 0;
-  for (const name of names) {
-    const size = Number(files.get(name)?.size);
-    if (!Number.isSafeInteger(size) || size < 0) {
-      throw new StageError("stage", `${name}: file size is unknown; cannot size the /cache preflight`);
-    }
-    pushBytes += size;
-  }
-  if (!Number.isSafeInteger(pushBytes + CACHE_STAGING_OVERHEAD_BYTES)) throw new StageError("stage", "bundle exceeds safe cache size accounting");
-  return { pushBytes, fileCount: names.length, neededBytes: pushBytes + CACHE_STAGING_OVERHEAD_BYTES };
-}
-
-/**
- * Parses `df -Pk <path>` output and returns free bytes. It fails closed: an
- * unreadable or malformed row throws rather than being treated as free space.
- */
-export function parseCacheFreeBytes(text, path = "/cache") {
-  const lines = String(text ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const rows = lines.filter(line => !/^filesystem\b/i.test(line));
-  if (rows.length !== 1) throw new StageError("stage", `df ${path} returned an ambiguous filesystem result`);
-  for (const line of rows) {
-    if (/^filesystem\b/i.test(line)) continue;
-    const columns = line.split(/\s+/);
-    if (columns.length !== 6 || columns[5] !== path || !/^\d+%$/.test(columns[4])) continue;
-    // POSIX `df -P`: Filesystem, 1024-blocks, Used, Available, Capacity, Mounted on.
-    if (!/^\d+$/.test(columns[1]) || !/^\d+$/.test(columns[2]) || !/^\d+$/.test(columns[3])) continue;
-    const [total, used, free] = columns.slice(1, 4).map(Number);
-    if (![total, used, free, free * 1024].every(Number.isSafeInteger) || used > total || free > total || Number(columns[4].slice(0, -1)) > 100) continue;
-    return free * 1024;
-  }
-  throw new StageError("stage", `df ${path} returned no readable filesystem row`);
-}
-
-/**
- * Reads `df -Pk /cache` from the recovery ADB session and refuses to stage
- * anything unless the free space covers the exact push set plus the documented
- * overhead. It never deletes device files and never falls back to /data or
- * /sdcard (which recovery shares with /data).
- */
-export async function preflightCache({ adb, files, sums, terminal, path = "/cache" } = {}) {
-  if (path !== "/cache") throw new StageError("stage", "only /cache staging is permitted");
-  if (!adb) throw new StageError("stage", "the /cache preflight needs a recovery ADB session");
-  const sizing = cachePreflightBytes({ files, sums });
-  let output;
-  try {
-    output = await adb.shell(`df -Pk ${path} 2>&1 || true`);
-  } catch (error) {
-    throw new StageError("stage", `${path} free space could not be read (${error.message}); nothing was pushed`);
-  }
-  let freeBytes;
-  try {
-    freeBytes = parseCacheFreeBytes(output?.stdout, path);
-  } catch {
-    terminal?.error(`cannot measure free space on ${path}; refusing to create or push the bundle`);
-    throw new StageError("stage", `${path} free space could not be read; refusing to create or push the bundle`);
-  }
-  if (freeBytes < sizing.neededBytes) {
-    terminal?.error(`${path} has ${freeBytes} bytes free but the bundle needs ${sizing.neededBytes}`);
-    throw new StageError("stage",
-      `${path} has ${freeBytes} bytes free but the bundle needs ${sizing.neededBytes} `
-      + `(${sizing.pushBytes} bytes of files + ${CACHE_STAGING_OVERHEAD_BYTES} bytes staging overhead); `
-      + "no files were pushed and nothing on the device was deleted");
-  }
-  terminal?.info(`${path}: ${freeBytes} bytes free, ${sizing.neededBytes} needed `
-    + `(${sizing.fileCount} files, ${sizing.pushBytes} bytes + ${CACHE_STAGING_OVERHEAD_BYTES} overhead)`);
-  return { freeBytes, ...sizing };
-}
 
 export async function pushBundle({ adb, files, sums, terminal, onProgress }) {
   const names = [...sums.keys()].filter((name) => files.has(name));
@@ -461,8 +305,6 @@ export async function pushBundle({ adb, files, sums, terminal, onProgress }) {
       throw new StageError("stage", `${name}: digest mismatch before ADB push`);
     }
   }
-  // Measure free /cache from the exact push set before creating or writing anything.
-  await preflightCache({ adb, files, sums, terminal });
   await adb.shell(`mkdir -p ${BUNDLE_DIR}`);
   let pushed = 0;
   let totalBytes = 0;
@@ -521,28 +363,14 @@ export async function verifyStagedBundle({ adb, sums, files, terminal }) {
  * whether it is reshaping userdata (prepare) or installing: it measures the
  * partition against the image contract. The host's job is only to run it, read
  * the receipt, and reboot between the two runs when asked.
- *
- * The ZIP basename comes from the verified target (the legacy alias or the
- * combined release's `libreecho-<slug>-install.zip`) and is whitelisted here, so
- * a name that was not one of the target's verified recovery members can never be
- * handed to `twrp install`.
  */
-export async function runRecoveryPhase({ adb, tag, serialRaw, phase = "prepare",
-  zipName = null, allowZipNames = null }, { dryRun = false, terminal } = {}) {
+export async function runRecoveryPhase({ adb, tag, serialRaw, phase = "prepare" }, { dryRun = false, terminal } = {}) {
   if (dryRun) {
     terminal?.info("rehearsal is host-only; no recovery command was issued");
     return { result: "rehearsal", writes_performed: [] };
   }
   if (!serialRaw || !tag || !["prepare", "install"].includes(phase) || typeof localStorage === "undefined") {
     throw new StageError("install", "persistent device-bound recovery attempt storage is unavailable");
-  }
-  const chosen = zipName ?? "libreecho-install.zip";
-  const allowed = Array.isArray(allowZipNames) || allowZipNames instanceof Set ? new Set(allowZipNames) : null;
-  if (typeof chosen !== "string" || !/^libreecho-(?:(?:radar-puffin|biscuit)-)?install\.zip$/.test(chosen)) {
-    throw new StageError("install", `refusing to run an unsafe recovery ZIP name: ${chosen}`);
-  }
-  if (allowed && !allowed.has(chosen)) {
-    throw new StageError("install", `refusing a recovery ZIP that is not a verified member of the selected target: ${chosen}`);
   }
   const key = `libreecho.recovery.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${tag}:${phase}`))}`;
   try {
@@ -552,7 +380,7 @@ export async function runRecoveryPhase({ adb, tag, serialRaw, phase = "prepare",
     if (error instanceof StageError) throw error;
     throw new StageError("install", "cannot persist the recovery attempt guard");
   }
-  const zip = `${BUNDLE_DIR}/${chosen}`;
+  const zip = `${BUNDLE_DIR}/libreecho-install.zip`;
   await adb.shell(`rm -f ${DRY_RUN_FLAG} ${RECEIPT_PATH}`);
   terminal?.command(`twrp install ${zip}`);
   const result = await adb.shell(

@@ -70,7 +70,7 @@ test('a valid push reports its file count after writing, without throwing', asyn
   const name = 'libreecho-test-boot.img';
   const expected = await (await import('./sha256.js')).sha256Blob(file);
   const commands = [];
-  const adb = { shell: async (command) => { commands.push(command); return { stdout: command.startsWith('df ') ? '/dev/block/mmcblk0p15 1048576 0 1048576 0% /cache\n' : '' }; },
+  const adb = { shell: async (command) => { commands.push(command); return { stdout: '' }; },
     push: async (path) => { commands.push(`push ${path}`); } };
   const result = await pushBundle({ adb, files: new Map([[name, file]]), sums: new Map([[name, expected]]), terminal: quiet });
   assert.equal(result.fileCount, 1);

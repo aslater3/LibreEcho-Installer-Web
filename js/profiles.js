@@ -20,7 +20,6 @@ export const PROFILES = [
     product: "RADAR",
     marketing: "Amazon Echo 2nd Generation (2017)",
     board: "radar_puffin",
-    slug: "radar-puffin",
     soc: "MediaTek MT8163V",
     libreEcho: "reference platform",
     archive: { name: "amonet-radar-v1.0.0.zip", size: 58531162,
@@ -39,7 +38,6 @@ export const PROFILES = [
     product: "BISCUIT",
     marketing: "Amazon Echo Dot 2nd Generation (2016)",
     board: "biscuit",
-    slug: "biscuit",
     soc: "MediaTek MT8163V",
     libreEcho: "Radar image runs experimentally; no qualified Biscuit one-shot image",
     archive: { name: "amonet-biscuit-v2.0.0.zip", size: 55989416,
@@ -70,51 +68,24 @@ export function payloadNameCandidates(profile) {
   return [...new Set(Object.values(profile.lkBuildMap).map((entry) => entry.payload))];
 }
 
-export const FEATURES = ["airplay2", "assistant", "stt", "tts", "wakeword"];
-
 /**
- * The normal (non-recovery) files a release build publishes under `prefix`.
- * Shared by the legacy compatibility list and the combined-release target
- * resolution so the two can never drift apart.
- */
-export function normalBundleMembers(prefix) {
-  const members = [
-    `${prefix}-boot.img`,
-    `${prefix}-build.json`,
-    `${prefix}-feature-assets.json`,
-    `${prefix}-feature-plan.json`,
-    `${prefix}-initial-install.tar`,
-    `${prefix}-installer.py`,
-    `${prefix}-ota-public-key.hex`,
-    `${prefix}-release-notes.md`,
-    `${prefix}-run-one-shot.sh`,
-    `${prefix}-verification.txt`,
-    `${prefix}.ota.tar`,
-  ];
-  for (const feature of FEATURES) {
-    members.push(`${prefix}-${feature}.squashfs`, `${prefix}-${feature}.manifest.json`);
-  }
-  return members;
-}
-
-/** The recovery ZIP and manifest names for a target (legacy aliases vs slug names). */
-export function recoveryBundleMembers({ legacy = false, slug = "radar-puffin" } = {}) {
-  return legacy
-    ? ["libreecho-install.zip", "bundle.manifest"]
-    : [`libreecho-${slug}-install.zip`, `libreecho-${slug}-bundle.manifest`];
-}
-
-/**
- * The bundle files a legacy (Radar-only) recovery install needs. Names come
- * from the release inventory; a bundle directory the operator downloaded
- * satisfies this list. Kept for the legacy layout and its compatibility tests.
+ * The bundle files a recovery install needs. Names come from the release
+ * inventory; a bundle directory the operator downloaded satisfies this list.
  */
 export function requiredBundleMembers(tag) {
   const prefix = `libreecho-${tag}`;
-  return [
-    ...normalBundleMembers(prefix),
+  const features = ["airplay2", "assistant", "stt", "tts", "wakeword"];
+  const members = [
     `${prefix}-SHA256SUMS`,
+    `${prefix}-boot.img`,
+    `${prefix}-ota-public-key.hex`,
+    `${prefix}-build.json`,
     `${prefix}-TWRPINSTALL-SHA256SUMS`,
-    ...recoveryBundleMembers({ legacy: true }),
+    'libreecho-install.zip',
+    'bundle.manifest',
   ];
+  for (const feature of features) {
+    members.push(`${prefix}-${feature}.squashfs`, `${prefix}-${feature}.manifest.json`);
+  }
+  return members;
 }
