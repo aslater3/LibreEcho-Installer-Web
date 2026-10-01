@@ -13,6 +13,50 @@ export function tar(entries) {
   }
   return Buffer.concat([...parts,Buffer.alloc(1024)]);
 }
+/**
+ * A minimal stored-only (method 0) ZIP writer for fixtures. The browser reader
+ * (`amonet.js`) intentionally supports stored and deflate-raw members; fixtures
+ * use stored bytes so the archive is deterministic and byte-exact.
+ */
+export function zipBuffer(entries) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const { name, data } of entries) {
+    const body = Buffer.from(data);
+    const nameBytes = Buffer.from(name);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt32LE(0, 14); // CRC-32 is not validated by the reader.
+    local.writeUInt32LE(body.length, 18);
+    local.writeUInt32LE(body.length, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    locals.push(local, nameBytes, body);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt32LE(body.length, 20);
+    central.writeUInt32LE(body.length, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt32LE(offset, 42);
+    centrals.push(central, nameBytes);
+    offset += local.length + nameBytes.length + body.length;
+  }
+  const directory = Buffer.concat(centrals);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(directory.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, directory, eocd]);
+}
+
 export function completeFixture(tag = 'radar-puffin-v0.14.0') {
   const prefix = `libreecho-${tag}`;
   const metadata = new Map([['manifest.json', '{}'],['manifest','signed bytes'],['manifest.sig','signature bytes']]);

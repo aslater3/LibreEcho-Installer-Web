@@ -9,7 +9,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sha256Blob } from './sha256.js';
+import { phaseReply, readbackReply } from './direct-test-protocol.mjs';
+import { sha256Blob, sha256Bytes } from './sha256.js';
 
 // --- minimal DOM so the real page module imports under node ---------------
 class Element {
@@ -91,7 +92,6 @@ function setup() {
   app.state.files = new Map();
   app.state.sums = null;
   app.state.bundleReady = false;
-  app.state.markerSafe = false;
   app.state.bundleBoard = null;
   app.state.bundleHardwareAccepted = false;
 }
@@ -302,49 +302,55 @@ test('the permission chooser is requested synchronously on the click, before any
 const DF_OK = ['Filesystem     1K-blocks      Used Available Use% Mounted on',
   '/dev/block/mmcblk0p11  1048576 100000 948576  10% /cache', ''].join('\n');
 
-function recoveryClient({ header = HEADER, bootSum = '' } = {}) {
-  let installs = 0;
+function recoveryClient({ header = HEADER, rebootFirst = false } = {}) {
+  const landed = new Map();
+  let prepares = 0;
   let closed = 0;
   return {
     closedCount: () => closed,
-    installCount: () => installs,
+    prepareCount: () => prepares,
     client: {
       async shell(command) {
         if (command.includes('getprop')) return { stdout: '3.7.0_9-0\nbiscuit\nTEST-DOT\n' };
         if (command.includes('uevent')) return { stdout: 'PARTNAME=expdb\n' };
-        if (command.includes('/size')) return { stdout: '20480\n' };
+        if (command.includes('mmcblk0p7/size')) return { stdout: '20480\n' };
         if (command.startsWith('df ')) return { stdout: DF_OK };
-        if (command.startsWith('sha256sum')) return { stdout: `${bootSum}  libreecho-biscuit-boot.img\n` };
-        if (command.startsWith('twrp install')) {
-          installs += 1;
-          return { stdout: installs === 1
-            ? '__RECEIPT__result=installed\nreboot_required=1\n'
-            : '__RECEIPT__result=installed\nreboot_required=0\n' };
+        const readback = await readbackReply(command, landed);
+        if (readback) return readback;
+        if (command.includes('libreecho-direct-install.sh') && command.includes('--phase prepare')) {
+          prepares += 1;
+          return phaseReply(command, `result=prepare-ok\nreboot_required=${rebootFirst ? 1 : 0}\n`);
         }
         if (command.includes('od -An')) return { stdout: `${header}\n` };
         return { stdout: '' };
       },
-      async push() {},
+      async push(path, blob) { landed.set(path, blob); },
       async close() { closed += 1; },
     },
   };
 }
 
-test('runInstall re-waits for a fresh recovery session after a recovery reboot', async () => {
+test('runInstall re-waits for a fresh recovery session after a v2 prepare reboot', async () => {
   setup();
   const file = new Blob(['bundle']);
   const bootSum = await sha256Blob(file);
+  const manifestText = 'protocol=2\nrelease=biscuit-build-test\ntarget=biscuit\ndevice=biscuit\nfastboot_products=BISCUIT\n';
   app.state.files = new Map([['libreecho-biscuit-boot.img', file]]);
   app.state.sums = new Map([['libreecho-biscuit-boot.img', bootSum]]);
   app.state.identity = { ...app.state.identity, unlockStatus: 'true' };
   app.state.bundleReady = true;
   app.state.bundleBoard = 'biscuit';
   app.state.bundleHardwareAccepted = true;
-  app.state.markerSafe = true;
-  app.state.target = { board: 'biscuit', slug: 'biscuit', prefix: 'libreecho-biscuit-v0.14.0', legacy: false };
+  app.state.target = { board: 'biscuit', slug: 'biscuit', prefix: 'libreecho-biscuit', legacy: false };
   app.state.release = { tag: 'biscuit-v0.14.0', assets: [], board: 'biscuit' };
-  const first = recoveryClient({ header: HEADER, bootSum });
-  const second = recoveryClient({ header: OTHER_HEADER, bootSum });
+  app.state.installProtocol = 2;
+  app.state.directRelease = 'biscuit-build-test';
+  app.state.directManifestText = manifestText;
+  app.state.directManifestSha = await sha256Bytes(new TextEncoder().encode(manifestText));
+  app.state.directHelper = new TextEncoder().encode('#!/sbin/sh\n');
+  app.state.directRoles = [{ role: 'transfer:boot', name: 'libreecho-biscuit-boot.img', sha256: bootSum, size: file.size }];
+  const first = recoveryClient({ header: HEADER, rebootFirst: true });
+  const second = recoveryClient({ header: OTHER_HEADER });
   const opened = [];
   await app.runInstall({ dryRun: false, recovery: {
     timeoutMs: 2000, intervalMs: 5,
@@ -353,7 +359,7 @@ test('runInstall re-waits for a fresh recovery session after a recovery reboot',
   } });
   assert.equal(opened.length, 2,
     'the post-reboot wait reused the pre-reboot session instead of opening a fresh one');
-  assert.equal(first.installCount(), 1, 'the prepare phase did not run on the first session');
+  assert.equal(first.prepareCount(), 1, 'the prepare phase did not run on the first session');
   assert.match(app.terminal.plainText(), /Kaeru header changed after recovery reboot|do not install/i);
 });
 

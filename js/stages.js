@@ -7,15 +7,17 @@
 //   identity  read product / unlock_status / LK build description
 //   unlock    submit the per-LK fastbrick payload to `brick` (no case opening)
 //   recovery  wait for TWRP and connect over ADB
-//   stage     push the verified bundle to /cache/libreecho-bundle
-//   prepare   run the recovery installer; it reshapes userdata and reboots
-//   install   run it again after the reboot: format, boot slots, features
+//   stage     hand the verified helper + anchor manifest to /cache/libreecho-direct
+//   prepare   reshape userdata; the browser reboots recovery when asked
+//   initialize format userdata exactly once and create the tree
+//   transfer  create the landing zone and free-space gate
+//   finalize  write boot slots + features (NO format reachable)
 //   verify    reboot and confirm the device is reachable
 //
 // The page's recovery stages are narrower than the fastbrick unlock: the
 // build-selected fastbrick payload itself writes preloader/LK/TEE/RPMB/Kaeru.
-// No install write is enabled until the board, exact ZIP and marker-safe boot
-// image are positively qualified. Never write FASTBOOT_PLEASE to expdb.
+// Install writes require the verified published target, exact helper and
+// compatible recovery boot chain. Never write FASTBOOT_PLEASE to expdb.
 
 import { Sha256, sha256Blob, sha256Bytes } from "./sha256.js";
 import { parseSums, fetchSums, releaseAssetUrl, releasePageUrl, assetPrefix } from "./release.js";
@@ -29,9 +31,11 @@ export const STAGES = [
   { id: "identity", title: "Read the device identity" },
   { id: "unlock", title: "Unlock the boot chain (no case opening)" },
   { id: "recovery", title: "Reach TWRP over ADB" },
-  { id: "stage", title: "Push the verified bundle to /cache" },
-  { id: "prepare", title: "Run the prepare phase" },
-  { id: "install", title: "Run the install phase" },
+  { id: "stage", title: "Hand the verified installer to recovery" },
+  { id: "prepare", title: "Prepare the userdata layout" },
+  { id: "initialize", title: "Initialize userdata (format once)" },
+  { id: "transfer", title: "Transfer payloads to userdata" },
+  { id: "finalize", title: "Finalize boot slots and features" },
   { id: "verify", title: "Verify and reboot" },
 ];
 
@@ -190,7 +194,7 @@ export function assessIdentity(identity, terminal) {
     terminal?.ok(`recognised target: ${identity.profile.marketing} (${identity.profile.board})`);
     if (identity.profile.id === "biscuit") {
       terminal?.warn(
-        "Radar LibreEcho images can run experimentally on Biscuit, but no marker-safe Biscuit-qualified one-shot image is published.",
+        "Biscuit requires a Biscuit-targeted published build; a Radar image is experimental, not an install target.",
       );
     }
   }

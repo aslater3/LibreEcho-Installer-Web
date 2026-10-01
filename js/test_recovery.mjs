@@ -6,7 +6,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sha256Blob } from './sha256.js';
+import { phaseReply, readbackReply } from './direct-test-protocol.mjs';
+import { sha256Blob, sha256Bytes } from './sha256.js';
 import { createHash } from 'node:crypto';
 import * as stages from './stages.js';
 
@@ -95,9 +96,15 @@ function setup() {
   app.state.files = new Map();
   app.state.sums = null;
   app.state.bundleReady = false;
-  app.state.markerSafe = false;
   app.state.bundleBoard = null;
   app.state.bundleHardwareAccepted = false;
+  app.state.installProtocol = 2;
+  app.state.directRelease = null;
+  app.state.directHelper = null;
+  app.state.directManifestText = null;
+  app.state.directManifestSha = null;
+  app.state.directRoles = null;
+  app.state.directTransferTotal = null;
 }
 
 const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -280,7 +287,6 @@ test('the recovery wait never re-submits the unlock or starts a device write', a
     app.state.bundleReady = true;
     app.state.bundleBoard = 'radar_puffin';
     app.state.bundleHardwareAccepted = true;
-    app.state.markerSafe = true;
     app.state.payloadBytes = new Uint8Array([1, 2, 3]);
     app.state.payloadName = 'test.img';
     app.state.sums = new Map([['libreecho-radar-puffin-v0.14.0-boot.img', 'b'.repeat(64)]]);
@@ -336,7 +342,7 @@ test('runRecoveryPhase refuses any ZIP that is not a verified target member', as
   } finally { globalThis.localStorage = previous; }
 });
 
-test('the combined recovery ZIP flows from the verified target through runInstall', async () => {
+test('a verified protocol-2 bundle drives the direct helper for its target, never a legacy twrp install', async () => {
   const previous = globalThis.localStorage;
   const entries = new Map();
   globalThis.localStorage = { getItem: (key) => entries.get(key) ?? null,
@@ -344,37 +350,66 @@ test('the combined recovery ZIP flows from the verified target through runInstal
   try {
     setup();
     app.state.identity = { ...app.state.identity, unlockStatus: 'true' };
-    const file = new Blob(['bundle']);
-    const name = 'libreecho-biscuit-boot.img';
-    const sum = await sha256Blob(file);
-    app.state.files = new Map([[name, file]]);
-    app.state.sums = new Map([[name, sum]]);
+    const roles = [
+      { role: 'transfer:boot', name: 'libreecho-biscuit-boot.img', content: 'boot' },
+      { role: 'transfer:ota-manifest', name: 'manifest', content: 'signed' },
+      { role: 'transfer:ota-signature', name: 'manifest.sig', content: 'sig' },
+      { role: 'transfer:local-package', name: 'libreecho-biscuit.ota.tar', content: 'ota' },
+      { role: 'staging:airplay2:payload', name: 'libreecho-biscuit-airplay2.squashfs', content: 'payload' },
+      { role: 'staging:airplay2:manifest', name: 'libreecho-biscuit-airplay2.manifest.json', content: 'fm' },
+    ];
+    const files = new Map(); const sums = new Map();
+    for (const role of roles) {
+      const blob = new Blob([role.content]); blob.name = role.name;
+      files.set(role.name, blob); sums.set(role.name, await sha256Blob(blob));
+    }
+    const manifestText = 'protocol=2\nrelease=biscuit-build-test\ntarget=biscuit\ndevice=biscuit\nfastboot_products=BISCUIT\n';
+    app.state.installProtocol = 2;
+    app.state.directRelease = 'biscuit-build-test';
+    app.state.directManifestText = manifestText;
+    app.state.directManifestSha = await sha256Bytes(new TextEncoder().encode(manifestText));
+    app.state.directHelper = new TextEncoder().encode('#!/sbin/sh\n');
+    app.state.directRoles = roles.map((role) => ({ role: role.role, name: role.name, sha256: sums.get(role.name), size: files.get(role.name).size }));
+    app.state.files = files;
+    app.state.sums = sums;
     app.state.bundleReady = true;
     app.state.bundleBoard = 'biscuit';
     app.state.bundleHardwareAccepted = true;
-    app.state.markerSafe = true;
-    app.state.target = { board: 'biscuit', slug: 'biscuit', prefix: 'libreecho-biscuit-v0.14.0', legacy: false };
+    app.state.target = { board: 'biscuit', slug: 'biscuit', prefix: 'libreecho-biscuit', legacy: false };
     app.state.recoverySerial = 'TEST-DOT';
     app.state.kaeruHeader = '8816885870b203004c4b000000000000';
     const commands = [];
+    const pushes = [];
+    const landed = new Map();
     app.state.adb = {
       shell: async (command) => {
         commands.push(command);
         if (command.includes('uevent')) return { stdout: 'PARTNAME=expdb\n' };
-        if (command.includes('/size')) return { stdout: '20480\n' };
-        if (command.includes('df ')) return { stdout: DF_OK };
-        if (command.startsWith('sha256sum')) return { stdout: `${sum}  ${name}\n` };
-        if (command.startsWith('twrp install')) return { stdout: '__RECEIPT__result=installed\nreboot_required=0\n' };
+        if (command.includes('mmcblk0p7/size')) return { stdout: '20480\n' };
+        if (command.startsWith('df ')) return { stdout: DF_OK };
+        const readback = await readbackReply(command, landed);
+        if (readback) return readback;
+        if (command.includes('--phase ')) {
+          const phase = /--phase (\w+)/.exec(command)[1];
+          if (phase === 'prepare') return phaseReply(command, 'result=prepare-noop\nreboot_required=0\n');
+          if (phase === 'initialize') return phaseReply(command, 'result=initialized\n');
+          if (phase === 'transfer') return phaseReply(command, 'result=transferred\n');
+          if (phase === 'finalize' && command.includes('--dry-run')) return phaseReply(command, 'result=dry-run-ok\n');
+          if (phase === 'finalize') return phaseReply(command, 'result=installed\n');
+        }
         if (command.includes('od -An')) return { stdout: '88 16 88 58 70 b2 03 00 4c 4b 00 00 00 00 00 00\n' };
         return { stdout: '' };
       },
-      push: async () => {},
+      push: async (path, blob) => { pushes.push(path); landed.set(path, blob); },
     };
     await app.runInstall({ dryRun: false });
-    const install = commands.find((command) => command.startsWith('twrp install'));
-    assert.ok(install, `the recovery ZIP was never run: ${commands.join(' | ')}`);
-    assert.match(install, /libreecho-biscuit-install\.zip/);
-    assert.doesNotMatch(install, /libreecho-install\.zip/);
+    const helperRuns = commands.filter((command) => command.includes('--phase '));
+    assert.ok(helperRuns.length >= 5, `the direct helper never ran: ${commands.join(' | ')}`);
+    assert.ok(helperRuns.every((command) => /--target biscuit/.test(command)), 'the helper ran without the verified biscuit target');
+    assert.ok(!commands.some((command) => /twrp install/.test(command)), 'a legacy twrp install ran');
+    assert.ok(pushes.some((path) => path.startsWith('/data/libreecho/incoming/')), 'no payload reached the userdata landing zone');
+    assert.ok(!pushes.some((path) => path.startsWith('/cache/libreecho-bundle')), 'a payload was staged in the legacy /cache path');
+    assert.match(app.terminal.plainText(), /pushed .*payload/);
   } finally { globalThis.localStorage = previous; }
 });
 

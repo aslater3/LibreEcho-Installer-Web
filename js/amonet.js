@@ -211,3 +211,23 @@ export async function acquireAmonetPayload({
     throw new Error('Payload SHA-256 mismatch');
   return { bytes, source };
 }
+
+/**
+ * Extract exactly one named member from an already-trusted local archive,
+ * bounded by `maxBytes`, with no payload pin. The caller owns the trust
+ * anchor (the archive itself is digest-verified against a published
+ * inventory); this reader only guarantees the member exists once, is a regular
+ * entry with a safe path, and does not exceed the bound.
+ */
+export async function readZipMember({ archiveBlob, memberPath, maxBytes = MAX_MEMBER_SIZE } = {}) {
+  if (!(archiveBlob instanceof Blob)) throw new Error('Archive source must be a Blob or File');
+  if (archiveBlob.size > MAX_ARCHIVE_SIZE) throw new Error('Archive size exceeds the supported bound');
+  requirePath(memberPath);
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_MEMBER_SIZE) throw new Error('Invalid ZIP member size bound');
+  const entry = await findMember(archiveBlob, memberPath);
+  if (entry.uncompressedSize > maxBytes) throw new Error('ZIP member exceeds the requested bound');
+  const compressed = await compressedMember(archiveBlob, entry);
+  const bytes = await expand(compressed, entry.method, entry.uncompressedSize);
+  if (bytes.length !== entry.uncompressedSize) throw new Error('ZIP payload size mismatch');
+  return bytes;
+}

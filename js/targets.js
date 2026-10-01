@@ -16,6 +16,26 @@ import { PROFILES, normalBundleMembers, recoveryBundleMembers } from "./profiles
 
 export const COMBINED_SCHEMA = "libreecho-combined-release-v1";
 
+/**
+ * The only recovery install protocol this browser speaks. A bundle that carries
+ * no `protocol` line is a legacy `/cache`-staging bundle: it is parsed (so a
+ * caller can still inspect it) but its `protocol` is `null` and the browser
+ * refuses to install it.
+ */
+export const PROTOCOL_DIRECT = 2;
+
+/** Fixed v2 roles; each is located in `incoming/` on the device by digest. */
+export const TRANSFER_ROLES = ["boot", "ota-manifest", "ota-signature", "local-package"];
+
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+/** A bare filename: no separators, no traversal, no hidden/control names. */
+function safeMemberName(name) {
+  return typeof name === "string" && name.length > 0 && name.length <= 200
+    && !name.includes("/") && !name.includes("\\") && !name.includes("..")
+    && !name.startsWith(".") && !/[\u0000-\u001f\u007f]/.test(name);
+}
+
+
 const PROFILE_BY_BOARD = new Map(PROFILES.map((profile) => [profile.board, profile]));
 
 /** The two boards the browser installer can fetch. */
@@ -200,30 +220,68 @@ export function nameBelongsToTarget(name, target) {
  * Reads the target/device/fastboot_products lines from a bundle manifest and
  * asserts they describe the selected target. A Dot manifest is never accepted
  * for a Radar device, and vice versa.
+ *
+ * When a `protocol` line is present the v2 shape is validated and the transfer
+ * plan is returned: `protocol`, `transfers` (fixed roles), `staging` and
+ * `transferBytesTotal`. A protocol other than 2 fails closed; an absent protocol
+ * is a legacy bundle (`protocol: null`, no v2 plan).
  */
 export function parseBundleManifest(text, target) {
   const fields = {};
   const staging = [];
+  const transfers = [];
+  const transferRoles = new Set();
   for (const raw of String(text ?? "").split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
     const match = /^(?<key>[a-z_]+)=(?<value>.*)$/.exec(line);
     if (!match) continue;
-    if (match.groups.key === "staging") staging.push(match.groups.value);
-    else {
-      if (['target', 'device', 'fastboot_products'].includes(match.groups.key) && Object.hasOwn(fields, match.groups.key)) throw new Error(`duplicate bundle manifest field: ${match.groups.key}`);
-      fields[match.groups.key] = match.groups.value;
+    const key = match.groups.key;
+    if (key === "staging") { staging.push(match.groups.value); continue; }
+    if (key === "transfer") {
+      const parts = match.groups.value.split(":");
+      if (parts.length !== 3) throw new Error(`malformed bundle manifest transfer line: ${match.groups.value}`);
+      const [role, name, sha256] = parts;
+      if (!TRANSFER_ROLES.includes(role)) throw new Error(`unknown bundle manifest transfer role: ${role}`);
+      if (!safeMemberName(name)) throw new Error(`unsafe bundle manifest transfer name: ${name}`);
+      if (!SHA256_HEX.test(sha256)) throw new Error(`bundle manifest transfer ${role} is not sha256-pinned`);
+      if (transferRoles.has(role)) throw new Error(`duplicate bundle manifest transfer role: ${role}`);
+      transferRoles.add(role);
+      transfers.push({ role, name, sha256 });
+      continue;
     }
+    if (["target", "device", "fastboot_products", "protocol", "transfer_bytes_total"].includes(key) && Object.hasOwn(fields, key)) {
+      throw new Error(`duplicate bundle manifest field: ${key}`);
+    }
+    fields[key] = match.groups.value;
   }
+
+  let protocol = null;
+  if (Object.hasOwn(fields, "protocol")) {
+    if (!/^[0-9]+$/.test(fields.protocol)) throw new Error(`bundle manifest protocol is not a number: ${fields.protocol}`);
+    protocol = Number(fields.protocol);
+    if (protocol !== PROTOCOL_DIRECT) throw new Error(`unsupported bundle manifest protocol: ${fields.protocol}`);
+  }
+  let transferBytesTotal = null;
+  if (Object.hasOwn(fields, "transfer_bytes_total")) {
+    if (!/^[0-9]+$/.test(fields.transfer_bytes_total) || !Number.isSafeInteger(Number(fields.transfer_bytes_total))) {
+      throw new Error(`bundle manifest transfer_bytes_total is not a byte count: ${fields.transfer_bytes_total}`);
+    }
+    transferBytesTotal = Number(fields.transfer_bytes_total);
+    if (protocol !== PROTOCOL_DIRECT) throw new Error("bundle manifest declares transfer_bytes_total without protocol 2");
+  }
+
   const board = String(fields.target ?? "").trim().toLowerCase();
   const device = String(fields.device ?? "").trim().toLowerCase();
   const products = String(fields.fastboot_products ?? "").split(",").map((value) => value.trim().toUpperCase()).filter(Boolean);
-  if (target.legacy && !board && !device && products.length === 0) return { fields, staging, legacy: true, matches: true };
+  if (target.legacy && !board && !device && products.length === 0) {
+    return { fields, staging, transfers, protocol, transferBytesTotal, legacy: true, matches: true };
+  }
   if (board !== target.board || device !== target.board) {
     throw new Error(`the bundle manifest describes ${board || device || "an unknown target"}, not ${target.board}`);
   }
   if ((!target.legacy && (products.length !== 1 || products[0] !== target.product)) || (products.length && !products.includes(target.product))) {
     throw new Error(`the bundle manifest is for ${products.join("/")}, not a ${target.product} device`);
   }
-  return { fields, staging, legacy: false, matches: true };
+  return { fields, staging, transfers, protocol, transferBytesTotal, legacy: false, matches: true };
 }

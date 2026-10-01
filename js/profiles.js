@@ -41,7 +41,7 @@ export const PROFILES = [
     board: "biscuit",
     slug: "biscuit",
     soc: "MediaTek MT8163V",
-    libreEcho: "Radar image runs experimentally; no qualified Biscuit one-shot image",
+    libreEcho: "requires a Biscuit-targeted published build",
     archive: { name: "amonet-biscuit-v2.0.0.zip", size: 55989416,
       sha256: "98297293701082bc7272efe077f941c56fc7b6e1f27ef6f2e93b6e4c6fc7b62d" },
     lkBuildMap: {

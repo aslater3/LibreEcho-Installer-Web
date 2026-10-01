@@ -17,7 +17,8 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, pushBundle, verifyStagedBundle, runRecoveryPhase, rebootAndWait } from "./stages.js";
+import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait } from "./stages.js";
+import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
 import { payloadForProfile } from "./profiles.js";
 import {
   installableBoards,
@@ -58,6 +59,8 @@ const dom = {
   bundleFolderInput: document.getElementById("bundle-folder-input"),
   payloadInput: document.getElementById("payload-input"),
   archiveInput: document.getElementById("amonet-archive-input"),
+  amonetPanel: document.getElementById("amonet-panel"),
+  amonetRoute: document.getElementById("amonet-route"),
   statusRelease: document.getElementById("status-release"),
   statusBundle: document.getElementById("status-bundle"),
   statusDevice: document.getElementById("status-device"),
@@ -96,6 +99,7 @@ export const state = {
   payloadName: "",
   fastboot: null,
   identity: null,
+  deviceQueryEpoch: 0,
   adb: null,
   recoverySerial: null,
   kaeruHeader: null,
@@ -103,7 +107,13 @@ export const state = {
   bundleReady: false,
   bundleBoard: null,
   bundleHardwareAccepted: false,
-  markerSafe: false,
+  installProtocol: null,
+  directRelease: null,
+  directHelper: null,
+  directManifestText: null,
+  directManifestSha: null,
+  directRoles: null,
+  directTransferTotal: null,
   running: false,
   abort: false,
   fetchingBundle: false,
@@ -184,7 +194,6 @@ function boardLabel(board) {
 
 function clearBundleReadiness() {
   state.bundleReady = false;
-  state.markerSafe = false;
   state.bundleBoard = null;
   state.bundleHardwareAccepted = false;
   state.target = null;
@@ -484,7 +493,6 @@ export async function loadReleases() {
   state.bundleHardwareAccepted = false;
   state.target = null;
   state.targetsJson = null;
-  state.markerSafe = false;
   setRunning(false);
   hideDownloadError();
   ensureDownloadPanel(false);
@@ -600,11 +608,18 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
   const release = state.release;
   const downloadController = automatic ? state.downloadController : null;
   state.bundleReady = false;
-  state.markerSafe = false;
   state.bundleBoard = null;
   state.bundleHardwareAccepted = false;
   state.files = new Map();
   state.sums = null;
+  state.installProtocol = null;
+  state.directRelease = null;
+  state.directHelper = null;
+  state.directManifestText = null;
+  state.directManifestSha = null;
+  state.directRoles = null;
+  state.directTransferTotal = null;
+  refreshControls();
   if (!release) {
     terminal.error("select a build first");
     return;
@@ -680,7 +695,7 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
     const manifestName = recoveryManifestNameForTarget(resolved);
     const manifest = result.byName.get(manifestName);
     if (!manifest) throw new Error(`the recovery bundle manifest (${manifestName}) is missing`);
-    parseBundleManifest(await manifest.text(), resolved);
+    const parsedManifest = parseBundleManifest(await manifest.text(), resolved);
     const build = JSON.parse(await result.byName.get(`${resolved.prefix}-build.json`).text());
     if (!build.board || String(build.board).toLowerCase() !== resolved.board) {
       throw new Error(`the build metadata names ${build.board ?? "no board"}, not ${resolved.board}`);
@@ -692,6 +707,22 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
       result.byName.set(name, metadata.files.get(name));
       result.checked.push({ name, sha256: digest, size: metadata.files.get(name).size });
     }
+    // A protocol-2 release is fully verified on the computer here: every exact
+    // transfer role resolves to a verified blob, the byte total matches, the
+    // signed manifest verifies against the published key, and the bounded helper
+    // extracts from the verified ZIP. A protocol-less bundle is left as legacy
+    // for runInstall to refuse before unlock; a present-but-wrong protocol was
+    // already rejected by parseBundleManifest.
+    if (parsedManifest.protocol === DIRECT_PROTOCOL) {
+      const prepared = await prepareDirectInstall({ parsed: parsedManifest, files: result.byName, sums, target: resolved, manifestName });
+      state.installProtocol = DIRECT_PROTOCOL;
+      state.directRoles = prepared.roles;
+      state.directTransferTotal = prepared.transferBytesTotal;
+      state.directHelper = prepared.helper;
+      state.directManifestText = prepared.manifestText;
+      state.directManifestSha = prepared.manifestSha256;
+      state.directRelease = String(parsedManifest.fields.release ?? "");
+    }
     if (state.release !== release || (automatic && (downloadController?.signal.aborted || state.downloadController !== downloadController))) throw new Error("build selection changed during checking");
     state.target = resolved;
     if (selectedTargetsJson) state.targetsJson = selectedTargetsJson;
@@ -699,7 +730,6 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
     state.files = result.byName;
     state.bundleBoard = build.board;
     state.bundleHardwareAccepted = build.hardware_accepted === true;
-    state.markerSafe = false;
     state.bundleReady = true;
     setRunning(false);
     setStatus(dom.statusBundle, `${result.checked.length} files verified`, "ok");
@@ -719,14 +749,34 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
 // --- device ----------------------------------------------------------------
 
 export async function queryDevice({ any = false, open = openFastboot } = {}) {
+  // Never carry a previous unlock decision into a failed or superseded query.
+  // This function also serves the run-owned query when no device is selected.
+  const epoch = ++state.deviceQueryEpoch;
+  state.fastboot = null;
+  state.identity = null;
+  state.payloadBytes = null;
+  state.payloadName = "";
+  dom.archiveInput.value = "";
+  dom.payloadInput.value = "";
+  invalidateRecovery({ close: true });
+  dom.devicePanel.innerHTML = "";
+  refreshControls();
   currentStage("device");
   try {
     if (any) terminal.info("unfiltered chooser: the browser will list every USB device on this machine");
     const session = await open({ onLog: (line) => terminal.line(line), any });
+    if (state.deviceQueryEpoch !== epoch) {
+      await closeRecoverySession(session);
+      throw new StageError("device", "device query superseded by another selection");
+    }
     state.fastboot = session;
     terminal.ok(`fastboot device ready: ${describeUsbDevice(session.device)}`);
     currentStage("identity");
     const identity = await readFastbootIdentity(session.client, terminal);
+    if (state.deviceQueryEpoch !== epoch) {
+      await closeRecoverySession(session);
+      throw new StageError("device", "device query superseded by another selection");
+    }
     state.identity = identity;
     state.payloadBytes = null;
     state.payloadName = "";
@@ -741,19 +791,35 @@ export async function queryDevice({ any = false, open = openFastboot } = {}) {
       `${identity.product || "unknown"} · ${assessment.unlocked ? "unlocked" : "locked"} · ${identity.serialMasked}`,
       identity.profile ? (assessment.unlocked ? "ok" : "warn") : "bad",
     );
+    refreshControls();
     if (state.downloadedBundle && !state.fetchingBundle) await fetchBundleAutomatically({ reuse: true });
-    if (config.amonetMirrorBase && state.identity?.profile?.archive && !state.payloadBytes) {
-      await fetchPinnedAmonetArchive().catch(error => terminal.warn(`select pinned Amonet ZIP manually: ${error.message}`));
+    if (state.deviceQueryEpoch === epoch && config.amonetMirrorBase
+      && amonetRequirement().mode === "required" && !state.payloadBytes) {
+      await fetchPinnedAmonetArchive().catch(error => {
+        if (state.deviceQueryEpoch !== epoch) return;
+        setStatus(dom.statusPayload, "select the pinned archive for this device", "pending");
+        terminal.warn(`select pinned Amonet ZIP manually: ${error.message}`);
+      });
     }
     return identity;
   } catch (error) {
-    setStatus(dom.statusDevice, "not connected", "bad");
+    if (state.deviceQueryEpoch === epoch) {
+      state.identity = null;
+      state.fastboot = null;
+      state.payloadBytes = null;
+      state.payloadName = "";
+      invalidateRecovery({ close: true });
+      dom.devicePanel.innerHTML = "";
+      setStatus(dom.statusDevice, "not connected", "bad");
+      refreshControls();
+    }
     throw error;
   }
 }
 
 function renderDevicePanel(identity, assessment) {
   dom.devicePanel.innerHTML = "";
+  const blocked = installReadinessReason();
   const rows = [
     ["model", identity.profile ? `${identity.profile.marketing} (inferred from LK product)` : "unrecognised LK product"],
     ["fastboot product", identity.product || "(not reported)"],
@@ -766,8 +832,8 @@ function renderDevicePanel(identity, assessment) {
     ["max-download-size", identity.maxDownload || "(not reported)"],
     ["serial privacy", "shown only in this local panel; masked in the log"],
     ["recognised target", identity.profile ? `${identity.profile.marketing} — ${identity.profile.libreEcho}` : "not a declared LibreEcho target"],
-    ["userdata contract", identity.profile ? `${identity.profile.userdataContractSectors.join(" or ")} sectors` : "—"],
-    ["next step", state.markerSafe ? (assessment.unlocked ? "recovery verification" : "qualified unlock preflight") : "install blocked: no marker-safe board image qualified"],
+    ["userdata contract", identity.profile ? `${(identity.profile.userdataContractSectors ?? []).join(" or ")} sectors` : "—"],
+    ["next step", blocked ? `install blocked: ${blocked}` : (assessment.unlocked ? "recovery verification" : "unlock preflight")],
   ];
   for (const [label, value] of rows) {
     const row = document.createElement("div");
@@ -942,6 +1008,7 @@ async function claimRecoveryDevice(device, { expectedSerial, expectedBoard, iden
       state.recoveryAcceptedEpoch = epoch ?? state.recoveryEpoch;
       state.kaeruHeader = validated.header;
       state.recoverySerial = expectedSerial;
+      refreshControls();
       session.validated = validated;
       return session;
     } catch (error) {
@@ -1110,8 +1177,46 @@ async function findRecovery() {
 
 // --- unlock payload --------------------------------------------------------
 
+// This decides only whether an UNLOCK payload is needed, not whether the
+// recovery/boot chain is compatible. Unlocked fastboot still has to pass the
+// same-serial, target and Kaeru recovery gates; it never earns install readiness.
+function amonetRequirement() {
+  const identity = state.identity;
+  if (!identity) return { mode: "pending", message: "Query the device to determine whether an Amonet unlock ZIP is needed." };
+  const assessment = assessIdentity(identity, { ok() {}, warn() {} });
+  if (assessment.findings.length) return { mode: "blocked", message: `Install blocked: ${assessment.findings[0]}. No unlock archive can resolve this automatically.` };
+  if (acceptedRecoveryFor(identity.serialRaw)) return { mode: "skip", message: "Same-device TWRP and Kaeru header verified — no Amonet unlock ZIP needed." };
+  if (assessment.unlocked) return { mode: "skip", message: "Already unlocked — no Amonet unlock ZIP needed. Same-device TWRP and the Kaeru boot chain must still be verified before installation." };
+  if (!payloadForProfile(identity.profile, identity.lkBuild)) return { mode: "blocked", message: "Install blocked: this locked LK build is not supported by a pinned unlock payload." };
+  return { mode: "required", message: "Locked device — the matching pinned Amonet ZIP is required for the unlock phase." };
+}
+
+function refreshAmonetControls() {
+  const requirement = amonetRequirement();
+  const enabled = requirement.mode === "required" && !state.running;
+  if (dom.amonetPanel) dom.amonetPanel.hidden = requirement.mode !== "required";
+  if (dom.amonetRoute) dom.amonetRoute.textContent = requirement.message;
+  dom.payloadInput.disabled = !enabled;
+  dom.archiveInput.disabled = !enabled;
+  dom.buttons.selectArchive.disabled = !enabled;
+  dom.buttons.fetchArchive.disabled = !enabled || !config.amonetMirrorBase;
+  if (requirement.mode !== "required") {
+    setStatus(dom.statusPayload, requirement.mode === "skip" ? "not needed — unlock skipped"
+      : requirement.mode === "blocked" ? "blocked — device identity unverified" : "query the device first",
+    requirement.mode === "skip" ? "ok" : requirement.mode === "blocked" ? "bad" : "pending");
+  }
+}
+
+function assertAmonetRequired() {
+  const requirement = amonetRequirement();
+  if (requirement.mode !== "required") throw new StageError("unlock", requirement.mode === "skip"
+    ? "Amonet unlock payload not required: already unlocked or verified in recovery"
+    : requirement.message);
+}
+
 export async function loadAmonetArchive({ file = null, url = null, acquire = null } = {}) {
   if (state.running) throw new StageError("unlock", "cannot change the Amonet archive during an active run");
+  assertAmonetRequired();
   const identity = state.identity;
   const profile = identity?.profile;
   const archive = profile?.archive;
@@ -1133,6 +1238,7 @@ export async function loadAmonetArchive({ file = null, url = null, acquire = nul
   if (state.identity !== identity || !(result.bytes instanceof Uint8Array) || result.bytes.length !== selection.size) {
     throw new StageError("unlock", "Amonet payload size or device identity changed during verification");
   }
+  assertAmonetRequired();
   state.payloadBytes = result.bytes;
   state.payloadName = selection.payload;
   terminal.ok(`verified ${archive.name} and extracted pinned ${selection.payload} (${selection.size} bytes)`);
@@ -1141,6 +1247,7 @@ export async function loadAmonetArchive({ file = null, url = null, acquire = nul
 }
 
 export async function fetchPinnedAmonetArchive() {
+  assertAmonetRequired();
   const archive = state.identity?.profile?.archive;
   if (!archive) throw new StageError("unlock", "query the device before fetching its Amonet archive");
   if (!config.amonetMirrorBase) throw new StageError("unlock", "no approved CORS Amonet mirror is configured; select the pinned ZIP instead");
@@ -1148,10 +1255,13 @@ export async function fetchPinnedAmonetArchive() {
 }
 
 export async function loadPayload(file) {
+  if (state.running) throw new StageError("unlock", "cannot change the unlock payload during an active run");
+  if (file) assertAmonetRequired();
+  const identity = state.identity;
   state.payloadBytes = null;
   state.payloadName = "";
   if (!file) return;
-  const selection = payloadForProfile(state.identity?.profile, state.identity?.lkBuild);
+  const selection = payloadForProfile(identity?.profile, identity?.lkBuild);
   if (!selection || file.name !== selection.payload || file.size !== selection.size) {
     setStatus(dom.statusPayload, "raw payload not pinned for this device", "bad");
     throw new StageError("unlock", "raw payload name or size does not match the pinned LK build");
@@ -1163,6 +1273,8 @@ export async function loadPayload(file) {
     setStatus(dom.statusPayload, "raw payload digest mismatch", "bad");
     throw new StageError("unlock", "raw payload digest mismatch against pinned image");
   }
+  if (state.identity !== identity) throw new StageError("unlock", "device identity changed during payload verification");
+  assertAmonetRequired();
   state.payloadBytes = bytes;
   state.payloadName = file.name;
   terminal.ok(`verified pinned raw fastbrick image ${file.name} (${bytes.length} bytes)`);
@@ -1171,25 +1283,46 @@ export async function loadPayload(file) {
 
 // --- run -------------------------------------------------------------------
 
+// Image-safety policy belongs to the publisher. The browser verifies the exact
+// published bytes and target rather than requiring a second, unset safety flag.
+// Protocol, hardware-acceptance and same-device recovery checks remain separate.
+function installReadinessReason() {
+  if (!state.identity) return "query the device in fastboot first";
+  const assessment = assessIdentity(state.identity);
+  if (assessment.findings.length) return assessment.findings[0];
+  if (!state.release || !state.bundleReady) return "download and verify the complete published build first";
+  const board = state.identity.profile.board;
+  if ((state.target?.board ?? state.bundleBoard) !== board || state.bundleBoard !== board) {
+    return "release board mismatch: choose the published build for this device";
+  }
+  if (!state.bundleHardwareAccepted) return "this build is not marked hardware-accepted";
+  if (state.installProtocol !== DIRECT_PROTOCOL) return "this release does not publish direct-userdata protocol v2 metadata";
+  return null;
+}
+
 function refreshControls() {
   const running = state.running;
   const busy = running || state.fetchingBundle;
-  dom.buttons.run.disabled = busy || !state.bundleReady || !state.markerSafe || !state.bundleHardwareAccepted;
+  const blocked = installReadinessReason();
+  dom.buttons.run.disabled = busy || blocked !== null;
+  const readiness = document.getElementById("install-readiness");
+  if (readiness) readiness.textContent = running ? "Install in progress." : state.fetchingBundle
+    ? "Downloading and verifying the selected build." : blocked ? `Install blocked: ${blocked}.`
+      : "Published build verified for this device. Recovery is checked before any install write.";
+  if (state.identity) renderDevicePanel(state.identity, assessIdentity(state.identity));
   if (dom.buttons.download) dom.buttons.download.disabled = busy || !state.release || !state.board;
   dom.buttons.dryRun.disabled = running;
   dom.buttons.verifyBundle.disabled = running;
   dom.bundleInput.disabled = running;
   dom.bundleFolderInput.disabled = running;
-  dom.payloadInput.disabled = running;
-  dom.archiveInput.disabled = running;
-  dom.buttons.selectArchive.disabled = running;
-  dom.buttons.fetchArchive.disabled = running || !config.amonetMirrorBase;
+  refreshAmonetControls();
   dom.releaseSelect.disabled = running;
   if (dom.deviceSelect) dom.deviceSelect.disabled = running;
   // The alternative device query stays closed during a run; the only recovery
   // action that opens is the dedicated permission grant, and only while the run
   // is actually waiting for TWRP.
   dom.buttons.connect.disabled = running;
+  dom.buttons.connectAny.disabled = running;
   dom.buttons.grantRecovery.disabled = busy && !state.recoveryWaiting;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
@@ -1257,7 +1390,7 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     const blockReason = boardMismatch
       ? `release board mismatch: ${release.tag} is not a qualified ${profile?.board ?? "unknown"} image`
       : profile.id === "biscuit" && knownBoard !== "biscuit"
-        ? "Radar image operation on Biscuit is experimental; no marker-safe Biscuit-qualified one-shot image is published"
+        ? "release board mismatch: Biscuit requires a Biscuit-targeted published build"
         : assessment.findings[0] ?? null;
     if (dryRun) {
       if (blockReason) terminal.warn(blockReason);
@@ -1267,8 +1400,12 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     if (blockReason) throw new StageError("identity", blockReason);
     if (!state.bundleReady) throw new StageError("release", "the complete release bundle and recovery ZIP must be verified before unlock");
     if (state.bundleBoard !== profile.board) throw new StageError("release", "release board mismatch in verified build metadata");
-    if (state.markerSafe !== true) throw new StageError("release", "marker-safe image qualification is missing; FASTBOOT_PLEASE risk blocks unlock and install");
     if (state.bundleHardwareAccepted !== true) throw new StageError("release", "build metadata has no hardware-accepted board; refusing device writes");
+    // Refuse an old or protocol-less bundle BEFORE unlock or any device mutation.
+    // There is deliberately no legacy /cache bulk-staging fallback.
+    if (state.installProtocol !== DIRECT_PROTOCOL) {
+      throw new StageError("release", "this release does not publish direct-userdata protocol v2 metadata; refusing the legacy /cache bulk-staging flow before unlock");
+    }
 
     const resumedRecovery = state.adb && state.recoverySerial === state.identity.serialRaw && state.kaeruHeader;
     if (resumedRecovery) {
@@ -1311,56 +1448,99 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     if (state.files.size === 0) {
       throw new StageError("stage", "no verified bundle files: select the release bundle before running");
     }
+    if (!(state.directHelper instanceof Uint8Array) || !state.directManifestText || !Array.isArray(state.directRoles)) {
+      throw new StageError("stage", "the verified protocol-2 plan is incomplete; re-verify the bundle before running");
+    }
+    const targetBoard = state.target?.board ?? state.bundleBoard;
+    const phaseShared = {
+      adb: state.adb,
+      serialRaw: state.identity.serialRaw,
+      tag: release.tag,
+      bundleManifestSha256: state.directManifestSha,
+      target: targetBoard,
+      release: state.directRelease,
+      terminal,
+      isCancelled: () => state.abort,
+    };
+
     currentStage("stage");
-    await pushBundle({ adb: state.adb, files: state.files, sums: state.sums, terminal, requireCacheSpace: true });
-    await verifyStagedBundle({ adb: state.adb, sums: state.sums, files: state.files, terminal });
+    // Only the bounded helper and the anchor manifest reach /cache: no payload is
+    // ever staged there, and the legacy `/cache/libreecho-bundle` path is unused.
+    await pushDirectControl({ adb: state.adb, helperBytes: state.directHelper, manifestText: state.directManifestText, terminal, isCancelled: () => state.abort });
     state.stageProgress.stage = "done";
     assertNotAborted("stage");
 
     currentStage("prepare");
-    // Use the chosen target's own verified recovery ZIP name: the combined
-    // release ships `libreecho-<slug>-install.zip`, while the legacy alias is
-    // `libreecho-install.zip`. runRecoveryPhase whitelists the name against the
-    // verified recovery members, so nothing else can be run.
-    const recoveryMembers = state.target ? recoveryMembersForTarget(state.target) : null;
-    const recoveryZip = recoveryMembers
-      ? { zipName: recoveryMembers[0], allowZipNames: recoveryMembers }
-      : {};
-    const first = await runRecoveryPhase({ adb: state.adb, tag: release.tag,
-      serialRaw: state.identity.serialRaw, phase: "prepare", ...recoveryZip }, { terminal });
-    state.receipts.push(first);
-    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-      throw new StageError("install", "expdb Kaeru header changed during the recovery installer; do not reboot");
+    const prepared = await runDirectPhase({ ...phaseShared, phase: "prepare" });
+    state.receipts.push(prepared);
+    phaseShared.deviceDigest = prepared.device_digest;
+    if (!["prepare-ok", "prepare-noop"].includes(prepared.result)) {
+      throw new StageError("prepare", `the prepare phase returned result=${prepared.result ?? "unknown"}`);
     }
-    if (first.reboot_required === "1") {
-      terminal.info("the installer reshaped userdata and needs a reboot before it can install");
-      state.stageProgress.prepare = "done";
-      currentStage("install");
+    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+      throw new StageError("install", "expdb Kaeru header changed during the prepare phase; do not reboot");
+    }
+    assertNotAborted("prepare");
+    if (prepared.reboot_required === "1") {
+      terminal.info("userdata was reshaped; rebooting recovery before it can be initialized");
       await rebootAndWait({ adb: state.adb, target: "recovery", terminal });
       // The reboot disconnected the pre-reboot session: drop it so the next wait
       // opens a fresh serial-bound session instead of reusing the stale handle.
       invalidateRecovery({ close: false });
       const next = await awaitRecovery(recovery);
       state.adb = next.client;
+      phaseShared.adb = state.adb;
       if (await readKaeruHeader(state.adb) !== kaeruBefore) {
         throw new StageError("install", "expdb Kaeru header changed after recovery reboot; do not install");
       }
-      const second = await runRecoveryPhase({ adb: state.adb, tag: release.tag,
-        serialRaw: state.identity.serialRaw, phase: "install", ...recoveryZip }, { terminal });
-      state.receipts.push(second);
-      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-        throw new StageError("install", "expdb Kaeru header changed during install; do not reboot");
-      }
-      if (second.result !== "installed") {
-        throw new StageError("install", `the install phase returned result=${second.result ?? "unknown"}`);
-      }
-    } else if (first.result !== "installed") {
-      throw new StageError("install", `the recovery installer returned result=${first.result ?? "unknown"}`);
     }
-    state.stageProgress.install = "done";
+    state.stageProgress.prepare = "done";
+    assertNotAborted("prepare");
+
+    currentStage("initialize");
+    const initialized = await runDirectPhase({ ...phaseShared, phase: "initialize" });
+    state.receipts.push(initialized);
+    if (initialized.result !== "initialized") {
+      throw new StageError("initialize", `the initialize phase returned result=${initialized.result ?? "unknown"}`);
+    }
+    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+      throw new StageError("install", "expdb Kaeru header changed during initialize; do not install");
+    }
+    state.stageProgress.initialize = "done";
+    assertNotAborted("initialize");
+
+    currentStage("transfer");
+    const transferred = await runDirectPhase({ ...phaseShared, phase: "transfer" });
+    state.receipts.push(transferred);
+    if (transferred.result !== "transferred") {
+      throw new StageError("transfer", `the transfer phase returned result=${transferred.result ?? "unknown"}`);
+    }
+    assertNotAborted("transfer");
+    const pushed = await pushDirectPayloads({ adb: state.adb, roles: state.directRoles, files: state.files, sums: state.sums, terminal, isCancelled: () => state.abort });
+    terminal.ok(`pushed ${pushed.fileCount} verified payload(s) into ${DIRECT_INCOMING_DIR}`);
+    state.stageProgress.transfer = "done";
+    assertNotAborted("transfer");
+
+    currentStage("finalize");
+    // The landed-completely gate: finalize --dry-run verifies every upload by
+    // digest and writes nothing. Only then is the real finalize (no format) run.
+    const rehearsal = await runDirectPhase({ ...phaseShared, phase: "finalize", dryRun: true });
+    if (rehearsal.result !== "dry-run-ok") {
+      throw new StageError("finalize", `the landed-completely check returned result=${rehearsal.result ?? "unknown"}`);
+    }
+    const finalized = await runDirectPhase({ ...phaseShared, phase: "finalize" });
+    state.receipts.push(finalized);
+    if (finalized.result !== "installed") {
+      throw new StageError("finalize", `the finalize phase returned result=${finalized.result ?? "unknown"}`);
+    }
+    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+      throw new StageError("install", "expdb Kaeru header changed during finalize; do not reboot");
+    }
+    state.stageProgress.finalize = "done";
 
     currentStage("verify");
     terminal.phase(STAGES.length, STAGES.length, "verify and reboot");
+    assertNotAborted("verify");
     await rebootAndWait({ adb: state.adb, target: "", terminal });
     terminal.warn("reboot requested; installed OS boot, userdata preservation and service readiness are NOT verified by this page");
     terminal.info("confirm the same device and its marker-free running image before calling the installation complete");

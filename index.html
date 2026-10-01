@@ -31,7 +31,7 @@
     <p>This page runs the install from your browser: it verifies a published release, asks the browser for USB access to the device, and drives the same stages the reviewed host installer drives — fastboot identity, the no-short unlock submission, the recovery-side initial install and a readback receipt after every write.</p>
     <p>No Python, no platform tools, no drivers: the browser is the host. Only Chromium-based desktop browsers expose WebUSB.</p>
     <div class="preview-banner">
-      <strong>Preview, not a supported install path.</strong> The read-only device query has been tested on Echo hardware; unlock and install writes have not. Run stays disabled until a marker-safe image is qualified. These operations can make a device unrecoverable; the supported route remains the published release and its installation guide.
+      <strong>Preview, not a supported install path.</strong> The read-only device query has been tested on Echo hardware; unlock and install writes have not. Image safety is the release publisher's responsibility; this page verifies the published files and hardware target before installation. Hardware-acceptance and recovery-protocol checks still apply. These operations can make a device unrecoverable; the supported route remains the published release and its installation guide.
     </div>
   </section>
 
@@ -108,10 +108,11 @@
         </div>
         <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
         <div id="device-panel" aria-live="polite"></div>
+        <p id="amonet-route" role="status" aria-live="polite">Query the device to determine whether an Amonet unlock ZIP is needed.</p>
         <p id="recovery-wait" class="recovery-wait" role="status" style="display:none"></p>
       </section>
 
-      <section class="card">
+      <section class="card" id="amonet-panel" hidden>
         <h2>5 · Pinned Amonet archive (only for a locked device)</h2>
         <p>Query the device first. Select the matching <code>amonet-*.zip</code>; the browser verifies the entire archive, extracts the exact LK-build fastbrick member and verifies that member's size and SHA-256. With an approved CORS mirror configured, the fetch button obtains the same pinned ZIP automatically. XDA's attachment is not fetched directly from this page because it does not provide a reliable CORS-readable source. No archive or payload is sent to USB by these preparation controls.</p>
         <input id="amonet-archive-input" type="file" accept=".zip" aria-label="Pinned Amonet archive">
@@ -131,9 +132,10 @@
         <ol id="step-list" class="step-list"></ol>
         <div class="actions">
           <button id="btn-dry-run" class="ghost" type="button">Rehearse (no writes)</button>
-          <button id="btn-run" class="primary" type="button" disabled>Run the install (blocked pending marker-safe image)</button>
+          <button id="btn-run" class="primary" type="button" disabled aria-describedby="install-readiness">Run the install</button>
           <button id="btn-abort" class="ghost" type="button" disabled>Stop</button>
         </div>
+        <p id="install-readiness" class="fine-print" role="status" aria-live="polite">Query the device and verify its published build before installation.</p>
       </section>
     </div>
 
@@ -170,6 +172,6 @@
   </div>
 </footer>
 
-<script type="module" src="js/app.js"></script>
+<script type="module" src="js/app.js?v=published-target-1"></script>
 </body>
 </html>

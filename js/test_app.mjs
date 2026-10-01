@@ -36,7 +36,7 @@ globalThis.document = {
 };
 globalThis.window = { isSecureContext: false, location: { search: '' } };
 const app = await import('./app.js');
-test('Run is disabled until a marker-safe compatible bundle is qualified', () => {
+test('Run is disabled until a compatible published bundle and device are verified', () => {
   assert.equal(elements.get('btn-run').disabled, true);
 });
 const payload = new Uint8Array([1, 2, 3]);
@@ -60,6 +60,19 @@ const setup = (writes) => {
   app.state.recoverySerial = null;
   app.state.kaeruHeader = null;
   app.state.running = false;
+  app.state.target = null;
+  app.state.targetsJson = null;
+  app.state.bundleReady = false;
+  app.state.bundleBoard = null;
+  app.state.bundleHardwareAccepted = false;
+  // The browser is v2-only: a verified protocol-2 plan is required before unlock.
+  app.state.installProtocol = 2;
+  app.state.directHelper = null;
+  app.state.directManifestText = null;
+  app.state.directManifestSha = null;
+  app.state.directRoles = null;
+  app.state.directTransferTotal = null;
+  app.state.directRelease = null;
 };
 
 test('Query Device uses only targeted getvars and shows local model/full serial without logging it', async () => {
@@ -196,17 +209,17 @@ test('the page refuses a Radar release on BISCUIT before unlock', async () => {
   assert.match(app.terminal.plainText(), /wrong-board|release board mismatch|no qualified Biscuit image/i);
 });
 
-test('a complete bundle without marker-safe boot qualification cannot unlock', async () => {
+test('a complete bundle without hardware-acceptance metadata cannot unlock', async () => {
   const writes = [];
   setup(writes);
   app.state.identity.profile = { ...profile, id: 'radar', board: 'radar_puffin' };
   app.state.identity.product = 'RADAR';
   app.state.bundleReady = true;
   app.state.bundleBoard = 'radar_puffin';
-  app.state.markerSafe = false;
+  app.state.bundleHardwareAccepted = false;
   await app.runInstall({ dryRun: false });
-  assert.deepEqual(writes, [], 'unqualified boot image reached flash:brick');
-  assert.match(app.terminal.plainText(), /marker.safe|FASTBOOT_PLEASE|image qualification/i);
+  assert.deepEqual(writes, [], 'non-hardware-accepted build reached flash:brick');
+  assert.match(app.terminal.plainText(), /no hardware-accepted board/i);
 });
 
 test('verified same-device recovery resumes without resubmitting brick', async () => {
@@ -217,7 +230,6 @@ test('verified same-device recovery resumes without resubmitting brick', async (
   app.state.bundleReady = true;
   app.state.bundleBoard = 'radar_puffin';
   app.state.bundleHardwareAccepted = true;
-  app.state.markerSafe = true;
   app.state.recoverySerial = app.state.identity.serialRaw;
   app.state.kaeruHeader = '8816885870b203004c4b000000000000';
   app.state.adb = { shell: async (command) => ({ stdout: command.includes('uevent') ? 'PARTNAME=expdb\n'
@@ -228,7 +240,7 @@ test('verified same-device recovery resumes without resubmitting brick', async (
   assert.match(app.terminal.plainText(), /verified recovery|continuing.*recovery/i);
 });
 
-test('changing releases invalidates all verified bundle and marker state', () => {
+test('changing releases invalidates all verified bundle state', () => {
   const oldRelease = { tag: 'radar-puffin-v0.14.0', assets: [], publishedAt: '2026-09-25T00:00:00Z', kind: 'stable' };
   const newRelease = { tag: 'radar-puffin-v0.14.1', assets: [], publishedAt: '2026-09-26T00:00:00Z', kind: 'stable' };
   app.state.releases = [oldRelease, newRelease];
@@ -237,13 +249,11 @@ test('changing releases invalidates all verified bundle and marker state', () =>
   app.state.files = new Map([['old', new Blob(['old'])]]);
   app.state.bundleReady = true;
   app.state.bundleBoard = 'radar_puffin';
-  app.state.markerSafe = true;
   const select = elements.get('release-select');
   select.value = newRelease.tag;
   select.listeners.get('change')();
   assert.equal(app.state.release, newRelease);
   assert.equal(app.state.bundleReady, false);
-  assert.equal(app.state.markerSafe, false);
   assert.equal(app.state.files.size, 0);
   assert.equal(app.state.sums, null);
 });
@@ -257,7 +267,6 @@ test('refreshing the release list invalidates assets from the previous selection
   app.state.files = new Map([['old', new Blob(['old'])]]);
   app.state.bundleReady = true;
   app.state.bundleBoard = 'radar_puffin';
-  app.state.markerSafe = true;
   globalThis.fetch = async () => ({ ok: true, json: async () => [{
     tag_name: 'radar-puffin-v0.14.1', published_at: '2026-09-26T00:00:00Z',
     assets: [], prerelease: false, draft: false,
@@ -266,8 +275,7 @@ test('refreshing the release list invalidates assets from the previous selection
     await app.loadReleases();
     assert.equal(app.state.release.tag, 'radar-puffin-v0.14.1');
     assert.equal(app.state.bundleReady, false);
-    assert.equal(app.state.markerSafe, false);
-    assert.equal(app.state.files.size, 0);
+      assert.equal(app.state.files.size, 0);
     assert.equal(app.state.sums, null);
   } finally { globalThis.fetch = previousFetch; }
 });
