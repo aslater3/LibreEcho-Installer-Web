@@ -94,3 +94,17 @@ input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events
 .notes table{width:100%;border-collapse:collapse;font-size:.88rem;margin:.8rem 0}
 .notes th,.notes td{text-align:left;border-bottom:1px solid var(--line);padding:.5rem .6rem;vertical-align:top}
 .installer-footer{border-top:1px solid var(--line);padding:1.5rem 0 3rem;color:var(--muted);font-size:.84rem}
+
+.fine-print{font-size:.82rem;color:var(--muted)}
+.card summary{cursor:pointer;font-size:.86rem;font-weight:750;color:var(--text);padding:.4rem 0}
+.card details[open] summary{color:var(--cyan)}
+.download-panel{margin:.9rem 0;padding:.85rem .95rem;border:1px solid var(--line);border-radius:14px;background:rgba(8,22,34,.5)}
+.download-head{display:flex;justify-content:space-between;align-items:baseline;font-size:.9rem}
+.download-head #download-percent{font-family:var(--mono);font-weight:800;color:var(--cyan)}
+.download-track{display:block;height:.7rem;border-radius:999px;background:var(--line);overflow:hidden;margin:.6rem 0 .5rem}
+.download-bar{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--green),var(--cyan));transition:width .15s linear}
+.download-meta{display:flex;gap:1rem;flex-wrap:wrap;font-family:var(--mono);font-size:.78rem;color:var(--muted)}
+.download-meta #download-files{margin-left:auto}
+.download-error{margin:.6rem 0;padding:.6rem .8rem;border:1px solid rgba(255,122,122,.5);border-radius:12px;color:var(--red);font-size:.9rem}
+.download-panel[data-state=ok] .download-bar{background:var(--green)}
+body.waiting button,body.waiting select{cursor:progress}
