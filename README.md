@@ -59,10 +59,12 @@ CNAME  install.dev  →  aslater3.github.io
 
 * Preview: the page carries `noindex`, and `robots.txt` denies crawling. Both
   should be flipped when the installer is announced publicly.
-* The installer is a fail-closed preview: **Run is disabled** until the exact
-  target board has a hardware-accepted, marker-safe boot image. The Dot can
-  experimentally run a Radar image on its shared MT8163 hardware, but that is
-  not a qualified Biscuit one-shot installation. Rehearse performs no writes.
+* Image safety is delegated to the release publisher, not an additional
+  browser qualification flag. **Run requires** a complete API-digest-anchored
+  published bundle matching the identified device's board, hardware-acceptance
+  metadata and direct-userdata protocol v2. Integrity/signature checks,
+  same-device recovery identity and Kaeru preservation remain mandatory.
+  A Radar image is not a Biscuit install target. Rehearse performs no writes.
 * The sync and Pages jobs run protocol tests **and** the browser stage safety
   tests before publication. These are scripted-device/host checks, not a WebUSB
   hardware install or proof that an oversized fastbrick is accepted by the LK.

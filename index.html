@@ -31,7 +31,7 @@
     <p>This page runs the install from your browser: it verifies a published release, asks the browser for USB access to the device, and drives the same stages the reviewed host installer drives — fastboot identity, the no-short unlock submission, the recovery-side initial install and a readback receipt after every write.</p>
     <p>No Python, no platform tools, no drivers: the browser is the host. Only Chromium-based desktop browsers expose WebUSB.</p>
     <div class="preview-banner">
-      <strong>Preview, not a supported install path.</strong> The read-only device query has been tested on Echo hardware; unlock and install writes have not. Run stays disabled until a marker-safe image is qualified. These operations can make a device unrecoverable; the supported route remains the published release and its installation guide.
+      <strong>Preview, not a supported install path.</strong> The read-only device query has been tested on Echo hardware; unlock and install writes have not. Image safety is the release publisher's responsibility; this page verifies the published files and hardware target before installation. Hardware-acceptance and recovery-protocol checks still apply. These operations can make a device unrecoverable; the supported route remains the published release and its installation guide.
     </div>
   </section>
 
@@ -44,29 +44,57 @@
       </section>
 
       <section class="card">
-        <h2>2 · Release</h2>
+        <h2>2 · Your device and build</h2>
+        <p>Choose your device first, then pick the build you want. Nothing is downloaded until you ask for it.</p>
         <div class="field">
-          <label for="release-select">Release to install</label>
+          <label for="device-select">Which device are you installing?</label>
+          <select id="device-select" aria-describedby="release-meta"></select>
+        </div>
+        <div class="field">
+          <label for="release-select">Build to install</label>
           <select id="release-select" aria-describedby="release-meta"></select>
         </div>
         <div class="actions">
-          <button id="btn-refresh" class="ghost" type="button">Refresh release list</button>
+          <button id="btn-refresh" class="ghost" type="button">Check for newer builds</button>
         </div>
         <div id="release-meta" class="status-line" style="display:block"></div>
-        <p class="status-line">Release state: <span id="status-release" class="pill" data-state="pending">not loaded</span></p>
+        <p class="status-line">Build state: <span id="status-release" class="pill" data-state="pending">not loaded</span></p>
       </section>
 
       <section class="card">
-        <h2>3 · Verified bundle</h2>
-        <p>The release endpoint does not allow in-page cross-origin asset reads. Download the exact release assets, including both checksum inventories, <code>libreecho-install.zip</code> and <code>bundle.manifest</code>, then select them here. The browser compares their hashes with the GitHub release API and refuses a missing or mismatched member before any device write.</p>
-        <input id="bundle-input" type="file" multiple aria-label="Release bundle files">
-        <input id="bundle-folder-input" type="file" multiple webkitdirectory directory aria-label="Release bundle folder">
-        <div class="actions">
-          <button id="btn-bundle" type="button">Select bundle files…</button>
-          <button class="ghost" type="button" onclick="document.getElementById('bundle-folder-input').click()">Select the whole folder…</button>
+        <h2>3 · Download and verify</h2>
+        <p>LibreEcho is downloaded and checked in your browser before anything can be staged. Every file is checked against the release's published checksums and GitHub's own record of it; if anything does not match, the download stops.</p>
+        <p class="fine-print">You need to be on a page that can reach the download mirror. If you already downloaded the files yourself, you can use them instead — see the advanced option below.</p>
+        <div id="download-panel" class="download-panel" style="display:none" aria-live="polite">
+          <div class="download-head">
+            <strong id="download-phase">Preparing</strong>
+            <span id="download-percent">0%</span>
+          </div>
+          <div class="download-track"><span id="download-bar" class="download-bar"></span></div>
+          <div class="download-meta">
+            <span id="download-bytes">0 MB of 0 MB</span>
+            <span id="download-files"></span>
+            <span id="download-eta"></span>
+          </div>
         </div>
-        <p class="status-line">Bundle state: <span id="status-bundle" class="pill" data-state="pending">nothing selected</span></p>
+        <div id="download-error" class="download-error" style="display:none" role="alert"></div>
+        <div class="actions">
+          <button id="btn-download" class="primary" type="button" disabled>Download and verify</button>
+          <button id="btn-retry" class="ghost" type="button" style="display:none">Try again</button>
+        </div>
+        <p class="status-line">Download state: <span id="status-bundle" class="pill" data-state="pending">nothing downloaded</span></p>
+        <details id="bundle-advanced">
+          <summary>Advanced: use files I already downloaded</summary>
+          <p class="fine-print">Only needed if this page cannot reach the download mirror (for example you are offline, or a download failed). Download the files for your device from the release page, then select the <code>…-SHA256SUMS</code> files together with the other files. They are checked against the same published checksums — nothing unchecked is ever used.</p>
+          <input id="bundle-input" type="file" multiple aria-label="Release bundle files">
+          <input id="bundle-folder-input" type="file" multiple webkitdirectory directory aria-label="Release bundle folder">
+          <div class="actions">
+            <button id="btn-bundle" class="ghost" type="button">Select files I downloaded…</button>
+            <button class="ghost" type="button" onclick="document.getElementById('bundle-folder-input').click()">Select the folder I downloaded…</button>
+          </div>
+        </details>
       </section>
+
 
       <section class="card">
         <h2>4 · Device</h2>
@@ -80,9 +108,11 @@
         </div>
         <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
         <div id="device-panel" aria-live="polite"></div>
+        <p id="amonet-route" role="status" aria-live="polite">Query the device to determine whether an Amonet unlock ZIP is needed.</p>
+        <p id="recovery-wait" class="recovery-wait" role="status" style="display:none"></p>
       </section>
 
-      <section class="card">
+      <section class="card" id="amonet-panel" hidden>
         <h2>5 · Pinned Amonet archive (only for a locked device)</h2>
         <p>Query the device first. Select the matching <code>amonet-*.zip</code>; the browser verifies the entire archive, extracts the exact LK-build fastbrick member and verifies that member's size and SHA-256. With an approved CORS mirror configured, the fetch button obtains the same pinned ZIP automatically. XDA's attachment is not fetched directly from this page because it does not provide a reliable CORS-readable source. No archive or payload is sent to USB by these preparation controls.</p>
         <input id="amonet-archive-input" type="file" accept=".zip" aria-label="Pinned Amonet archive">
@@ -102,9 +132,10 @@
         <ol id="step-list" class="step-list"></ol>
         <div class="actions">
           <button id="btn-dry-run" class="ghost" type="button">Rehearse (no writes)</button>
-          <button id="btn-run" class="primary" type="button" disabled>Run the install (blocked pending marker-safe image)</button>
+          <button id="btn-run" class="primary" type="button" disabled aria-describedby="install-readiness">Run the install</button>
           <button id="btn-abort" class="ghost" type="button" disabled>Stop</button>
         </div>
+        <p id="install-readiness" class="fine-print" role="status" aria-live="polite">Query the device and verify its published build before installation.</p>
       </section>
     </div>
 
@@ -141,6 +172,6 @@
   </div>
 </footer>
 
-<script type="module" src="js/app.js"></script>
+<script type="module" src="js/app.js?v=published-target-1"></script>
 </body>
 </html>

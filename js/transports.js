@@ -132,6 +132,18 @@ export async function openAdb({ device = null, onLog, any = false } = {}) {
 }
 
 /**
+ * Device objects this origin already has permission for, without opening a
+ * chooser. The recovery poll uses this so a background wait can never trigger a
+ * browser permission prompt.
+ */
+export async function grantedAdbDevices({ filters = null } = {}) {
+  const support = await protocolSupport();
+  if (!support.adbTransport.ok) throw new Error(support.adbTransport.reason);
+  const devices = await support.adbTransport.value.getDevices({ filters: filters ?? adbFilters() });
+  return Array.isArray(devices) ? devices : [];
+}
+
+/**
  * Re-attaches to a device the origin already has permission for, without a
  * chooser. Used after a reboot, when the device re-enumerates in another mode.
  */

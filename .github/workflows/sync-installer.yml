@@ -10,8 +10,10 @@ name: Sync the installer from the development site
 # simultaneous run cancels rather than races.
 
 on:
-  schedule:
-    - cron: '23 4 * * *'
+  # No schedule: this repository is now the installer's source of truth. The
+  # nightly sync from the pinned LibreEcho-Docs-dev commit silently replaced
+  # the reviewed installer (#3) with older source on 2026-10-01. Run manually
+  # only after the development source has caught up.
   workflow_dispatch:
 
 permissions:
