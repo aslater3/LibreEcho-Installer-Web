@@ -32,9 +32,12 @@ export const MODES = {
       // [measured] The identity this platform's fastboot has been observed to
       // present: 0bb4:0c01 (HTC's vendor id, used by several MTK bootloaders).
       { vendorId: 0x0bb4, productId: 0x0c01 },
+      // 18d1:4ee2 is deliberately absent: it is [measured] TWRP's identity
+      // (RECOVERY_USB_IDS), and ADB speaks its own protocol on a vendor bulk
+      // pair, so offering it here is what let a fastboot query claim a device
+      // sitting in recovery. It stays in the adb list below.
       { vendorId: 0x18d1, productId: 0x4ee0 },
       { vendorId: 0x18d1, productId: 0x4ee1 },
-      { vendorId: 0x18d1, productId: 0x4ee2 },
       { vendorId: 0x18d1, productId: 0x4ee3 },
       { vendorId: 0x18d1, productId: 0x4ee4 },
       { vendorId: 0x18d1, productId: 0x4ee5 },

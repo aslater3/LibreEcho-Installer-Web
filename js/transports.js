@@ -81,10 +81,70 @@ export async function protocolSupport() {
   };
 }
 
+// Every vendor bulk pair — fastboot AND adbd — uses class 0xFF, so the class
+// alone cannot tell the two protocols apart. The subclass 0x42 does, together
+// with the alternate's protocol byte: 0x01 is ADB, 0x03 is fastboot. [measured]
+// on this hardware: LibreEcho's own adbd presents 0xff/0x42/0x01, and fastboot
+// presents 0xff/0x42/0x03.
+const VENDOR_SPECIFIC_CLASS = 0xff;
+const ANDROID_USB_SUBCLASS = 0x42;
+const ADB_PROTOCOL = 0x01;
+
+/**
+ * The descriptor alternate the transport actually claimed, read back from the
+ * open device. `alternateSetting` may be missing from a fake or a future
+ * descriptor, so an unmatched alternateSetting falls back to the interface's
+ * first alternate rather than silently concluding "unknown".
+ */
+function claimedAlternate(device, interfaceNumber, alternateSetting) {
+  for (const iface of device?.configuration?.interfaces ?? []) {
+    if (iface.interfaceNumber !== interfaceNumber) continue;
+    const alternates = iface.alternates ?? [];
+    return alternates.find((alternate) => alternate.alternateSetting === alternateSetting)
+      ?? alternates[0] ?? null;
+  }
+  return null;
+}
+
+/** True when the claimed interface speaks ADB rather than fastboot. */
+function isAdbAlternate(alternate) {
+  return alternate?.interfaceClass === VENDOR_SPECIFIC_CLASS
+    && alternate.interfaceSubclass === ANDROID_USB_SUBCLASS
+    && alternate.interfaceProtocol === ADB_PROTOCOL;
+}
+
+/**
+ * A StageError-shaped error raised from the transport layer.
+ *
+ * `stages.js` imports this module, so importing StageError back would be a
+ * cycle. The name/stage pair is all the page actually reads: `runInstall` keys
+ * its failure message off `error.stage`, and `queryDevice`'s catch resets the
+ * same state for any error.
+ */
+function stageError(stage, message) {
+  const error = new Error(message);
+  error.name = "StageError";
+  error.stage = stage;
+  return error;
+}
+
+/** The one message the operator needs when the Echo is in TWRP, not fastboot. */
+export const RECOVERY_NOT_FASTBOOT_MESSAGE =
+  "this Echo is in recovery (ADB), not fastboot — use “My Echo is already in recovery”";
+
 /**
  * Opens a fastboot session. Without a device the transport prompts the operator
  * through the browser's own device chooser; with one it attaches directly.
  * `any: true` uses an unfiltered chooser, for an identity not in the table.
+ *
+ * A device in TWRP answers on an ADB bulk pair, which `findFastbootInterface`
+ * accepts happily because it is a vendor-class interface with two bulk
+ * endpoints — so without this check a fastboot query claims the recovery
+ * interface, every `getvar` times out, and the page looks like a broken
+ * fastboot device rather than a device in the wrong mode. The claimed
+ * interface's alternate is therefore inspected after the transport opens: an
+ * ADB protocol byte releases the interface, closes the device and refuses,
+ * naming the entry that works instead.
  */
 export async function openFastboot({ device = null, onLog, any = false } = {}) {
   const support = await protocolSupport();
@@ -100,11 +160,23 @@ export async function openFastboot({ device = null, onLog, any = false } = {}) {
   } else {
     transport = await TransportClass.open(fastbootFilters("fastboot"));
   }
+  const handle = transport.device ?? device;
+  const claimed = claimedAlternate(handle, transport.interfaceNumber, transport.alternateSetting);
+  if (isAdbAlternate(claimed)) {
+    if (onLog) {
+      onLog(`interface ${transport.interfaceNumber} is ADB (0x42/0x01), not fastboot; releasing it untouched`);
+    }
+    // Release the interface and the raw handle before refusing: leaving the
+    // recovery interface claimed is what would break the recovery entry the
+    // message points the operator at.
+    await releaseUsbInterface(transport, handle);
+    throw stageError("device", RECOVERY_NOT_FASTBOOT_MESSAGE);
+  }
   const client = new support.fastboot.value(transport, {
     onInfo: (line) => onLog && onLog(`fastboot: ${line}`),
   });
-  if (onLog) onLog(`fastboot interface claimed on ${transport.device?.vendorId ?? "?"}:${transport.device?.productId ?? "?"}`);
-  return { device: transport.device ?? device, transport, client };
+  if (onLog) onLog(`fastboot interface claimed on ${handle?.vendorId ?? "?"}:${handle?.productId ?? "?"}`);
+  return { device: handle, transport, client };
 }
 
 /**
