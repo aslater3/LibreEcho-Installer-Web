@@ -275,7 +275,7 @@ test('a grant during an in-flight poll steps aside and never opens a second sess
   // aside, and the accepted poll session is what the run continues on.
   assert.equal(granted, null, 'a grant that could not take the device reported a session');
   assert.equal(app.state.adb, pollSession.client, 'the poll session was not the one bound');
-  assert.match(app.terminal.plainText(), /already has this USB device open|continues on that connection/i);
+  assert.match(app.terminal.plainText(), /already being connected|press the button again/i);
 });
 
 // ---------------------------------------------------------------------------

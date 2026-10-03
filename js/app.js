@@ -1694,7 +1694,12 @@ export async function grantRecovery({ request = null, requestWide = null, open =
     // grant simply steps aside rather than opening a second one.
     if (error instanceof RecoveryDeviceBusy) {
       state.recoveryChooserWide = false;
-      terminal.warn("the recovery poll already has this device open; the install continues on that connection");
+      // The wait is not stuck and no second connection was opened, so say both
+      // plainly: the operator's click did nothing harmful, the existing attempt
+      // is still running, and a second click is the right recovery if the wait
+      // times out — rather than leaving them believing an install is progressing
+      // when the owning poll can still fail its own validation seconds later.
+      terminal.warn("Your Echo is already being connected — wait a few seconds. If nothing happens before the countdown ends, press the button again.");
       refreshControls();
       return null;
     }
