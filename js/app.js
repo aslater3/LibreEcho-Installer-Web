@@ -1015,6 +1015,15 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
 
 // --- device ----------------------------------------------------------------
 
+/**
+ * What the operator is told when a fastboot query read nothing at all.
+ *
+ * The page must not remember an empty identity: it would both block the install
+ * ("fastboot serialno is missing") and refuse the recovery entry ("a device is
+ * already identified"), leaving a reloaded page with no way forward.
+ */
+export const EMPTY_FASTBOOT_IDENTITY_MESSAGE = "the device did not answer fastboot";
+
 export async function queryDevice({ any = false, open = openFastboot } = {}) {
   // The page opens one USB connection at a time. Taken BEFORE any await and
   // before the state reset below, so a refused query cannot invalidate an
@@ -1045,6 +1054,10 @@ async function runDeviceQuery({ any, open }) {
   dom.devicePanel.innerHTML = "";
   refreshControls();
   currentStage("device");
+  // Set when the device answered nothing, so the failure handler below can keep
+  // the refusal as the LAST thing it publishes — a repaint after the message
+  // would overwrite the sticky status bar with the generic stage text.
+  let answeredNothing = false;
   try {
     if (any) terminal.info("unfiltered chooser: the browser will list every USB device on this machine");
     const session = await open({ onLog: (line) => terminal.line(line), any });
@@ -1059,6 +1072,20 @@ async function runDeviceQuery({ any, open }) {
     if (state.deviceQueryEpoch !== epoch) {
       await closeRecoverySession(session);
       throw new StageError("device", "device query superseded by another selection");
+    }
+    // A device that answered NOTHING is not an identity. Storing one — even an
+    // all-empty one — is what wedged the page on 2026-10-03: the status bar then
+    // said "Install is not available yet: fastboot serialno is missing" and the
+    // recovery entry was refused as "a device is already identified", so a
+    // reloaded page could not continue. Product AND serial both empty is exactly
+    // what adbd (or a wedged interface) looks like to a fastboot client: refuse,
+    // close, leave state.identity null so the recovery entry stays available.
+    if (!identity.product && !identity.serialRaw) {
+      await closeRecoverySession(session);
+      state.fastboot = null;
+      dom.devicePanel.innerHTML = "";
+      answeredNothing = true;
+      throw new StageError("device", EMPTY_FASTBOOT_IDENTITY_MESSAGE);
     }
     state.identity = identity;
     state.payloadBytes = null;
@@ -1093,8 +1120,16 @@ async function runDeviceQuery({ any, open }) {
       state.payloadName = "";
       invalidateRecovery({ close: true });
       dom.devicePanel.innerHTML = "";
-      setStatus(dom.statusDevice, "not connected", "bad");
+      // A device that answered nothing is reported as exactly that, not as
+      // "not connected": nothing was ever read from it, so the operator must be
+      // pointed at the recovery entry rather than at a cable they already have
+      // plugged in. Published AFTER the repaint so nothing overwrites it.
+      setStatus(dom.statusDevice, answeredNothing ? "did not answer" : "not connected", "bad");
       refreshControls();
+      if (answeredNothing) {
+        terminal.error("the device did not answer fastboot — nothing was read from it. "
+          + "If your Echo is in recovery, use “My Echo is already in recovery” instead.");
+      }
     }
     throw error;
   }
