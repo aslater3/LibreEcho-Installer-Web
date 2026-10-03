@@ -261,11 +261,27 @@ export async function submitUnlockPayload({ client, profile, lkBuild, payloadByt
   if (!serialRaw || typeof localStorage === "undefined") {
     throw new StageError("unlock", "persistent device-bound unlock attempt storage is unavailable");
   }
-  const key = `libreecho.unlock.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${profile.id}:${digest}`))}`;
+  // Two durable guards, both written and checked in the same fail-closed block.
+  //
+  // The digest key keeps the guard precise: exactly this payload for this device
+  // has already been sent.
+  //
+  // The serial key is the coarse backstop the page-session latch cannot provide:
+  // the latch lives in memory, so a reload loses it, while a partially applied
+  // flash:brick writes lk_b and can bring the device back to fastboot LOCKED
+  // reporting a DIFFERENT lk_build_desc. A different build means a different
+  // digest means a different digest key — which would let flash:brick go out a
+  // second time. The serial key cannot be re-keyed by anything the device does,
+  // and it is scoped to one serial, so a different device is unaffected.
+  const digestKey = `libreecho.unlock.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${profile.id}:${digest}`))}`;
+  const serialKey = `libreecho.unlock.sent.${await sha256Bytes(new TextEncoder().encode(String(serialRaw)))}`;
   try {
-    if (localStorage.getItem(key)) throw new StageError("unlock", "unlock attempt already submitted; do not re-submit");
+    if (localStorage.getItem(digestKey) || localStorage.getItem(serialKey)) {
+      throw new StageError("unlock", "unlock attempt already submitted; do not re-submit");
+    }
     // Persist BEFORE sending, because a disconnect, new tab or reload has an unknown outcome.
-    localStorage.setItem(key, "submitted-or-unknown");
+    localStorage.setItem(digestKey, "submitted-or-unknown");
+    localStorage.setItem(serialKey, "submitted-or-unknown");
   } catch (error) {
     if (error instanceof StageError) throw error;
     throw new StageError("unlock", "cannot persist the single-submission guard");

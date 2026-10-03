@@ -108,6 +108,54 @@ test('unlock attempt persists across tabs without storing the raw serial', async
   } finally { globalThis.localStorage = previousLocal; globalThis.sessionStorage = previousSession; }
 });
 
+test('a different LK build after a reload is still refused for the same serial', async () => {
+  // F4: the page-session latch is in memory, so a reload loses it. The durable
+  // digest key is keyed on serial:profile:digest, and a partially applied
+  // flash:brick writes lk_b — the device can come back to fastboot LOCKED
+  // reporting a DIFFERENT lk_build_desc, which selects a different payload,
+  // hence a different digest, hence a different localStorage key. Without a
+  // serial-scoped key the second submission is allowed through.
+  const previousLocal = globalThis.localStorage;
+  // One storage shared across "reloads": a fresh call with the same Map stands
+  // in for a fresh page session over the same persisted origin storage.
+  const entries = new Map();
+  globalThis.localStorage = { getItem: (key) => entries.get(key) ?? null,
+    setItem: (key, value) => entries.set(key, value) };
+  const writes = [];
+  const serialRaw = 'TEST-DOT';
+  try {
+    const buildA = '63cb91b-20221007_072309';
+    const bytesA = new Uint8Array([1, 2, 3]);
+    const profileA = { ...biscuit, lkBuildMap: { [buildA]: {
+      payload: 'brick-a.img', size: bytesA.length,
+      sha256: await (await import('./sha256.js')).sha256Bytes(bytesA) } } };
+    assert.equal((await submitUnlockPayload({ client: { flash: async () => { writes.push('brick-a'); throw new Error('timeout'); } },
+      profile: profileA, lkBuild: buildA, payloadBytes: bytesA, payloadName: 'brick-a.img',
+      serialRaw, terminal: quiet })).outcome, 'unknown');
+
+    // The device comes back reporting a different LK build after the partial
+    // write, so a different (equally pinned) payload is now selected.
+    const buildB = '63cb91b1-20230101_000000';
+    const bytesB = new Uint8Array([4, 5, 6, 7]);
+    const profileB = { ...biscuit, lkBuildMap: { [buildB]: {
+      payload: 'brick-b.img', size: bytesB.length,
+      sha256: await (await import('./sha256.js')).sha256Bytes(bytesB) } } };
+    const argsB = { client: { flash: async () => { writes.push('brick-b'); throw new Error('timeout'); } },
+      profile: profileB, lkBuild: buildB, payloadBytes: bytesB, payloadName: 'brick-b.img',
+      serialRaw, terminal: quiet };
+
+    // Same page session, and then a simulated reload: the digest key is
+    // different in both cases, so only the serial-scoped key can refuse.
+    await assert.rejects(submitUnlockPayload(argsB), /already submitted|do not re-submit/i,
+      'a second submission with a different LK build was allowed after a reload');
+    await assert.rejects(submitUnlockPayload(argsB), /already submitted|do not re-submit/i,
+      'the refusal did not persist across a simulated reload');
+    assert.deepEqual(writes, ['brick-a'], 'flash:brick left the host a second time for one serial');
+    // Serial-scoped, so a genuinely different device is unaffected.
+    assert.ok(!JSON.stringify([...entries]).includes(serialRaw), 'the raw serial was written to storage');
+  } finally { globalThis.localStorage = previousLocal; }
+});
+
 test('a recovery ZIP phase never silently repeats after a receipt or unknown outcome', async () => {
   const prior = globalThis.localStorage;
   const entries = new Map();
