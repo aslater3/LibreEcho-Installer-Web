@@ -70,6 +70,21 @@ const dom = {
   recoveryCountdown: document.getElementById("recovery-countdown"),
   continueFromTwrp: document.getElementById("btn-continue-twrp"),
   stepList: document.getElementById("step-list"),
+  statusBar: document.getElementById("status-bar"),
+  statusBarStage: document.getElementById("status-bar-stage"),
+  statusBarTitle: document.getElementById("status-bar-title"),
+  statusBarMessage: document.getElementById("status-bar-message"),
+  statusBarProgress: document.getElementById("status-bar-progress"),
+  statusBarFill: document.getElementById("status-bar-fill"),
+  statusBarActionRow: document.getElementById("status-bar-action-row"),
+  statusBarAction: document.getElementById("status-bar-action"),
+  statusBarHint: document.getElementById("status-bar-hint"),
+  statusBarSecondary: document.getElementById("status-bar-secondary"),
+  capabilitySummary: document.getElementById("capability-summary"),
+  prereqWrap: document.getElementById("install-prereq-wrap"),
+  prereqList: document.getElementById("install-prereqs"),
+  logCard: document.getElementById("log-card"),
+  logToggle: document.getElementById("btn-log-toggle"),
   buttons: {
     refresh: document.getElementById("btn-refresh"),
     download: document.getElementById("btn-download"),
@@ -87,7 +102,12 @@ const dom = {
   },
 };
 
-export const terminal = new Terminal(dom.terminal);
+export const terminal = new Terminal(dom.terminal, {
+  // Errors and warnings are mirrored into the sticky bar so nothing important
+  // is only in the log — the operator reported exactly that problem (issue 14:
+  // "basically silent unless you scroll back up").
+  onLine: ({ kind, message }) => mirrorToStatusBar({ kind, message }),
+});
 
 export const state = {
   releases: [],
@@ -160,6 +180,221 @@ function renderStepList(activeId = null) {
 
 function currentStage(id) {
   renderStepList(id);
+  // A stage change is the primary driver of the sticky bar: it re-points the
+  // step counter, the title and the progress bar at the card the operator
+  // should be looking at.
+  const step = stepCardForStage(id);
+  if (step) setStatusBar({ step, message: stageMessage(step), kind: "pending" });
+}
+
+/** One plain-English line per wizard step: what is happening / what to do now. */
+function stageMessage(step) {
+  const blocked = installReadinessReason();
+  switch (step) {
+    case "device-build":
+      return state.board
+        ? `Installing for ${boardLabel(state.board)} on build ${state.release?.tag ?? "(choose a build)"}.`
+        : "Choose your device to see the builds made for it.";
+    case "download-verify":
+      if (state.bundleReady) return `Build verified: ${state.files.size} file(s) checked against the published checksums.`;
+      if (state.fetchingBundle) return "Downloading the build and checking every file. Keep this tab open.";
+      if (!state.board) return "Waiting for you to choose your device in step 1 — the build to download depends on it.";
+      return state.release ? "Press Download and verify to fetch and check the published build."
+        : "Choose a build first, then download and verify it.";
+    case "connect-device":
+      if (state.identity) {
+        const blockedHere = installReadinessReason();
+        return blockedHere ? `Device found (${state.identity.product}). Install is blocked: ${blockedHere}.`
+          : `Device found (${state.identity.product}). Everything is checked — press Run the install in step 5.`;
+      }
+      return "Press Query device and choose your Echo in Chrome's list. This only reads; it writes nothing.";
+    case "unlock-payload":
+      return state.payloadBytes ? `Unlock payload ${state.payloadName} is verified and ready.`
+        : "This device is locked: select the pinned Amonet ZIP so the unlock stage has its verified payload.";
+    case "install":
+      if (state.running) return "Install in progress. Watch the progress bar; do not unplug the device.";
+      if (state.stageProgress?.finalize === "done") return "Install finished and a reboot was requested. The running OS is not verified by this page.";
+      return blocked ? `Install is not available yet: ${blocked}.` : "Everything is verified. Press Run the install.";
+    default:
+      return "Working…";
+  }
+}
+
+// --- wizard status bar + step cards ----------------------------------------
+//
+// The whole point of this rewrite: the operator must never have to scroll back
+// up to find out what is happening. Every stage change, operator action,
+// success and failure is republished through ONE function, setStatusBar, so the
+// sticky bar and the step cards can never disagree with each other or with the
+// log. Nothing important lives only in the terminal panel.
+
+// The five wizard steps, in the order the operator does them. `stage` maps a
+// card to the STAGES entry that makes it active, so the run can highlight the
+// right card as it progresses.
+const WIZARD_STEPS = [
+  { id: "device-build", title: "Device & build", summary: () => {
+    const build = state.release?.tag;
+    return build ? `${boardLabel(state.board)} · ${build}` : "No build selected yet.";
+  } },
+  { id: "download-verify", title: "Download & verify", summary: () => {
+    if (state.bundleReady) return `Verified ${state.files.size} file(s) for ${boardLabel(state.board)}.`;
+    if (state.fetchingBundle) return "Downloading and checking the published build…";
+    return "Nothing downloaded yet.";
+  } },
+  { id: "connect-device", title: "Connect the device", summary: () => {
+    if (!state.identity) return "No device queried yet.";
+    return `${state.identity.profile?.marketing ?? state.identity.product ?? "Device"} · ${state.identity.serialMasked ?? ""}`.trim();
+  } },
+  { id: "unlock-payload", title: "Unlock payload", summary: () => state.payloadBytes
+    ? `${state.payloadName} verified and ready.` : "Not needed." },
+  { id: "install", title: "Install", summary: () => {
+    const blocked = installReadinessReason();
+    if (state.running) return "Install in progress.";
+    if (state.stageProgress?.finalize === "done") return "Installed; reboot requested.";
+    return blocked ? `Blocked: ${blocked}` : "Ready to run the install.";
+  } },
+];
+
+const STEP_STAGE_MAP = {
+  "device-build": null,
+  "download-verify": "release",
+  "connect-device": "device",
+  "unlock-payload": "unlock",
+  install: "stage",
+};
+
+/** Which wizard card a run stage belongs to, or null when it spans the run. */
+function stepCardForStage(stageId) {
+  return STEP_STAGE_MAP[stageId] ? stageId : Object.keys(STEP_STAGE_MAP).find((key) => STEP_STAGE_MAP[key] === stageId) ?? null;
+}
+
+const cardNode = (id) => document.getElementById(`card-${id}`) ?? (id === "unlock-payload" ? document.getElementById("amonet-panel") : null);
+const badgeNode = (id) => document.getElementById(`badge-${id}`);
+const summaryNode = (id) => document.getElementById(`summary-${id}`);
+
+/**
+ * Repaints the numbered step cards: badge, one-line summary, and which one is
+ * active. `activeStep` is a wizard step id; the active card is scrolled into
+ * view so a change of step is never silent.
+ */
+export function renderStepCards(activeStep = null) {
+  for (const step of WIZARD_STEPS) {
+    const badge = badgeNode(step.id);
+    const summary = summaryNode(step.id);
+    let status = "waiting";
+    if (step.id === activeStep) status = "active";
+    else if (stepDone(step.id)) status = "done";
+    else if (stepReady(step.id)) status = "ready";
+    const card = cardNode(step.id);
+    if (card) card.dataset.state = status;
+    if (badge) {
+      badge.dataset.state = status === "active" ? "ready" : status;
+      badge.textContent = status === "active" ? "do this now"
+        : status === "done" ? "done" : status === "ready" ? "ready" : "waiting";
+    }
+    if (summary) summary.textContent = step.summary();
+  }
+  // The unlock card only exists for a locked device, exactly as before.
+  const unlockCard = cardNode("unlock-payload");
+  if (unlockCard && amonetRequirement().mode !== "required") unlockCard.dataset.state = "waiting";
+  if (activeStep) scrollCardIntoView(activeStep);
+}
+
+/** A card is done when the work it gates is complete. */
+function stepDone(id) {
+  // A release is pre-selected before any device is chosen, so "a release exists"
+  // alone must not mark step 1 finished — the device choice is part of it.
+  if (id === "device-build") return Boolean(state.board) && Boolean(state.release);
+  if (id === "download-verify") return state.bundleReady === true;
+  if (id === "connect-device") return Boolean(state.identity);
+  if (id === "unlock-payload") return Boolean(state.payloadBytes);
+  return state.stageProgress?.finalize === "done" || installReadinessReason() === null;
+}
+
+function stepReady(id) {
+  if (id === "device-build") return !state.board || (Boolean(state.board) && !state.release);
+  if (id === "download-verify") return Boolean(state.board) && Boolean(state.release) && !state.bundleReady && !state.fetchingBundle;
+  if (id === "connect-device") return Boolean(state.bundleReady) && !state.identity;
+  if (id === "unlock-payload") return amonetRequirement().mode === "required" && !state.payloadBytes;
+  return state.identity ? installReadinessReason() === null : false;
+}
+
+/**
+ * Brings the active card into view. Deliberately tolerant: `scrollIntoView` is
+ * absent from the node test DOM stubs, and a missing scroll hint must never be
+ * able to break a run.
+ */
+function scrollCardIntoView(id) {
+  const card = cardNode(id);
+  try {
+    card?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
+  } catch { /* no scroll support in this environment */ }
+}
+
+let statusBarActionHandler = null;
+// The last published payload, so a mirrored log line can update the message
+// WITHOUT clearing the primary action the operator is being asked to press.
+let lastStatusBar = { step: null, message: "", kind: "pending", action: null, hint: "", secondary: "" };
+
+/**
+ * The single status-bar publisher. `action` is the one primary button the
+ * operator may press now; it is delegated so the same handler can be offered
+ * from the bar, and its label is written into the button rather than baked into
+ * the markup. Passing `null` for action removes the button entirely.
+ */
+export function setStatusBar({ step = null, message = "", kind = "pending", action = null, hint = "", secondary = "", focusAction = false } = {}) {
+  const stepDef = WIZARD_STEPS.find((entry) => entry.id === step) ?? null;
+  const activeStage = stepDef ? STAGES.findIndex((stage) => stage.id === STEP_STAGE_MAP[stepDef.id]) : -1;
+  if (dom.statusBarStage) {
+    dom.statusBarStage.textContent = stepDef
+      ? `Step ${WIZARD_STEPS.indexOf(stepDef) + 1} of ${WIZARD_STEPS.length}`
+      : "LibreEcho installer";
+  }
+  if (dom.statusBarTitle) dom.statusBarTitle.textContent = stepDef ? stepDef.title : "Ready";
+  if (dom.statusBarMessage) dom.statusBarMessage.textContent = message;
+  if (dom.statusBar) dom.statusBar.dataset.kind = kind;
+  const percent = Math.max(0, Math.min(100, Math.round(
+    (activeStage >= 0 ? (activeStage / Math.max(1, STAGES.length - 1)) * 100 : 0))));
+  if (dom.statusBarFill) dom.statusBarFill.style.width = `${percent}%`;
+  // ARIA progress value is set defensively: a host without setAttribute (the node
+  // test DOM stubs) must not be able to break a run.
+  try { dom.statusBarProgress?.setAttribute?.("aria-valuenow", String(percent)); } catch { /* no ARIA support */ }
+  statusBarActionHandler = typeof action === "function" ? action : null;
+  if (dom.statusBarActionRow) dom.statusBarActionRow.hidden = !action;
+  if (dom.statusBarAction && action) {
+    dom.statusBarAction.textContent = action.label ?? "Continue";
+    dom.statusBarAction.dataset.actionLabel = action.label ?? "";
+    dom.statusBarAction.disabled = action.disabled === true;
+  }
+  if (dom.statusBarHint) dom.statusBarHint.textContent = hint;
+  if (dom.statusBarSecondary) dom.statusBarSecondary.textContent = secondary;
+  lastStatusBar = { step, message, kind, action, hint, secondary };
+  renderStepCards(step);
+  if (focusAction && dom.statusBarAction) {
+    try { dom.statusBarAction.focus?.(); } catch { /* no focus support */ }
+    try { dom.statusBarAction.scrollIntoView?.({ block: "nearest" }); } catch { /* no scroll support */ }
+  }
+}
+
+/**
+ * Mirrors a log line into the bar when it matters, so nothing is log-only.
+ *
+ * The pending primary action is deliberately PRESERVED: an operator who is
+ * being told "no USB device was chosen; still waiting" must not also have the
+ * button they need to press removed from under them. A later real state change
+ * (refreshControls) republishes the correct action anyway.
+ */
+export function mirrorToStatusBar({ kind, message } = {}) {
+  if (kind !== "error" && kind !== "warn") return;
+  const action = lastStatusBar.action;
+  setStatusBar({
+    step: lastStatusBar.step,
+    message,
+    kind,
+    action: action ? { label: action.label ?? "Continue" } : null,
+    hint: lastStatusBar.hint,
+    secondary: lastStatusBar.secondary,
+  });
 }
 
 // --- capability ------------------------------------------------------------
@@ -187,8 +422,23 @@ async function reportCapabilities() {
     row.querySelector(".capability-note").textContent = note ?? "";
     dom.capability.appendChild(row);
   }
+  // Everything that matters is one line unless something is actually wrong; the
+  // per-capability table stays available in the <details> above the steps.
+  const failures = rows.filter(([, , kind]) => kind === "bad");
+  if (dom.capabilitySummary) {
+    if (failures.length === 0) {
+      dom.capabilitySummary.textContent = "Browser ready ✓ — WebUSB and the protocol modules are loaded.";
+      dom.capabilitySummary.dataset.state = "ok";
+    } else {
+      dom.capabilitySummary.textContent = `${failures.length} browser requirement(s) not met — open the details below.`;
+      dom.capabilitySummary.dataset.state = "bad";
+    }
+  }
   if (!support.ok) {
     terminal.warn(support.reason);
+    // A browser that cannot do the job is a page-level failure, not a log line.
+    setStatusBar({ step: "device-build", message: support.reason, kind: "bad",
+      action: null, secondary: "Open the capability details to see which check failed." });
   }
   return { support, protocols };
 }
@@ -1040,8 +1290,49 @@ function enterRecoveryWaitingUI(deadline = null) {
       "Waiting for TWRP to appear. When it does, choose the new USB device named “Echo” in Chrome's prompt. "
       + "The install continues automatically once it is connected.";
   }
+  renderRecoveryCallout();
   paintRecoveryCountdown(deadline);
   refreshControls();
+}
+
+/**
+ * The large operator prompt, shown in the active step card as well as the bar.
+ * The countdown lives in this node too, so the number the operator reads is the
+ * number the page is enforcing.
+ */
+function renderRecoveryCallout() {
+  const node = document.getElementById("callout-connect-device");
+  if (!node) return;
+  if (!state.recoveryWaiting) {
+    node.hidden = true;
+    node.textContent = "";
+    return;
+  }
+  node.hidden = false;
+  node.innerHTML = "";
+  const title = document.createElement("strong");
+  title.textContent = "Your Echo needs one click from you";
+  const body = document.createElement("span");
+  const countdown = document.createElement("span");
+  countdown.id = "recovery-callout-countdown";
+  body.textContent = " Press the button below, then choose the USB device named “Echo” in Chrome’s list. "
+    + "It can take about 15 seconds to appear while your Echo restarts, and the list updates by itself. "
+    + "The install then continues automatically.";
+  node.append(title, body);
+  const tail = document.createElement("div");
+  tail.id = "recovery-callout-tail";
+  tail.className = "fine-print";
+  node.appendChild(tail);
+  paintCalloutCountdown();
+}
+
+/** Repaints the countdown in the callout only; the prompt text is not rewritten. */
+function paintCalloutCountdown() {
+  const tail = document.getElementById("recovery-callout-tail");
+  if (!tail || !state.recoveryWaiting) return;
+  tail.textContent = state.recoveryDeadline == null
+    ? "Waiting. This page keeps looking until you stop it."
+    : `${formatCountdown(state.recoveryDeadline - Date.now())} left before this page gives up. You can keep waiting and press the button again.`;
 }
 
 /** Repaints the visible countdown. The surrounding prompt text is not rewritten. */
@@ -1051,6 +1342,7 @@ function paintRecoveryCountdown(deadline) {
     return;
   }
   if (dom.recoveryCountdown) dom.recoveryCountdown.textContent = `${formatCountdown(deadline - Date.now())} left`;
+  paintCalloutCountdown();
 }
 
 function leaveRecoveryWaitingUI() {
@@ -1059,6 +1351,7 @@ function leaveRecoveryWaitingUI() {
   if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Allow USB access to TWRP";
   if (dom.recoveryWait) { dom.recoveryWait.style.display = "none"; dom.recoveryWait.textContent = ""; }
   if (dom.recoveryCountdown) dom.recoveryCountdown.textContent = "";
+  renderRecoveryCallout();
 }
 
 /**
@@ -1362,6 +1655,135 @@ function assertAmonetRequired() {
     : requirement.message);
 }
 
+/**
+ * Every unmet prerequisite for the Install button, as plain bullets.
+ *
+ * The Install button used to sit at the bottom of the page and stay greyed out
+ * with no explanation (issue 7), so the operator could not tell a missing
+ * prerequisite from a broken page. This reuses the SAME fail-closed gates as
+ * installReadinessReason — it never softens one, it only enumerates them, so
+ * every item here is something the gate itself is actually enforcing.
+ */
+export function unmetPrerequisites() {
+  const unmet = [];
+  if (!state.board) unmet.push("Choose which device you are installing.");
+  if (!state.release) unmet.push("Choose a published build for that device.");
+  if (!state.identity) unmet.push("Query the device in fastboot (step 3) so its identity can be read from the device itself.");
+  else {
+    const assessment = assessIdentity(state.identity, undefined,
+      { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
+    if (assessment.findings.length) {
+      for (const finding of assessment.findings) unmet.push(`Device check: ${finding}`);
+    }
+  }
+  if (!state.bundleReady) unmet.push("Download and verify the complete published build, including both checksum inventories.");
+  const board = state.identity?.profile?.board ?? null;
+  if (board && state.release && (state.target?.board ?? state.bundleBoard) !== board) {
+    unmet.push(`Release board mismatch: the selected build is for ${state.target?.board ?? state.bundleBoard}, this device is ${board}.`);
+  }
+  if (state.bundleReady && !state.bundleHardwareAccepted) {
+    unmet.push("This build is not marked hardware-accepted, so no device write is allowed.");
+  }
+  if (state.bundleReady && state.installProtocol !== DIRECT_PROTOCOL) {
+    unmet.push("This release does not publish direct-userdata protocol v2 metadata, which the browser install requires.");
+  }
+  if (amonetRequirement().mode === "required" && !state.payloadBytes) {
+    unmet.push("Select the pinned Amonet unlock ZIP for this device's LK build (step 4).");
+  }
+  if (state.running) unmet.push("Wait for the current run to finish.");
+  if (state.fetchingBundle) unmet.push("Wait for the download to finish.");
+  return unmet;
+}
+
+/** Paints the unmet-prerequisite bullet list next to the Install button. */
+function renderPrerequisites() {
+  if (!dom.prereqList || !dom.prereqWrap) return;
+  const unmet = installReadinessReason() === null && !state.running && !state.fetchingBundle ? [] : unmetPrerequisites();
+  dom.prereqList.innerHTML = "";
+  for (const item of unmet) {
+    const node = document.createElement("li");
+    node.textContent = item;
+    dom.prereqList.appendChild(node);
+  }
+  dom.prereqWrap.dataset.empty = unmet.length === 0 ? "true" : "false";
+}
+
+/**
+ * The single primary action the operator may press right now, or null when the
+ * next step is not a button. Priority order mirrors what actually blocks a
+ * run: a waiting-for-the-human recovery grant outranks everything, then a
+ * missing build, a missing download, an unqueried device, the unlock payload,
+ * and finally the install itself.
+ */
+function primaryAction() {
+  if (state.running) {
+    if (state.recoveryWaiting) {
+      return {
+        step: "connect-device",
+        label: "Connect to your Echo in recovery",
+        message: "Your Echo is restarting. Press this, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
+        hint: "It can take about 15 seconds to appear; the list updates by itself.",
+        secondary: "Chrome asks for permission once per USB device. Recovery here is TWRP.",
+        kind: "action",
+        run: () => grantRecovery().catch((error) => terminal.error(`recovery USB permission failed: ${error.message}`)),
+      };
+    }
+    return null;
+  }
+  if (continueFromTwrpAvailable()) {
+    return {
+      step: "install",
+      label: "Continue from TWRP",
+      message: "The unlock payload was already submitted in this page session, so it will not be sent again. Continue from the recovery step to finish the install.",
+      hint: "Press this if your Echo is sitting in recovery and you closed nothing.",
+      kind: "action",
+      run: () => runInstall({ dryRun: false }),
+    };
+  }
+  if (!state.board) {
+    // No device chosen yet: the next thing is a choice, not a button. Offering
+    // "Download and verify" here would be a lie — the download is per-device.
+    return { step: "device-build", label: "Choose your device", message: stageMessage("device-build"),
+      hint: "Pick the device in step 1; the builds made for it appear straight away.",
+      kind: "action", run: () => dom.deviceSelect?.focus?.() };
+  }
+  if (!state.release) {
+    return { step: "device-build", label: "Choose a build", message: stageMessage("device-build"),
+      hint: "The newest stable build for this device is selected by default.",
+      kind: "action", run: () => dom.releaseSelect?.focus?.() };
+  }
+  if (!state.bundleReady && !state.fetchingBundle) {
+    return { step: "download-verify", label: "Download and verify", message: stageMessage("download-verify"),
+      hint: "Checks every file against the published checksums before anything is written.",
+      kind: "action", run: () => fetchBundleAutomatically().catch((error) => terminal.error(error.message)) };
+  }
+  if (!state.identity) {
+    return { step: "connect-device", label: "Query device", message: stageMessage("connect-device"),
+      hint: "Read-only fastboot query. Choose your Echo in Chrome’s list.", kind: "action",
+      run: () => queryDevice().catch((error) => terminal.error(`device query failed: ${error.message}`)) };
+  }
+  if (installReadinessReason() === null) {
+    return { step: "install", label: "Install", message: stageMessage("install"), kind: "action",
+      run: () => runInstall({ dryRun: false }) };
+  }
+  return null;
+}
+
+/** Republishes the sticky bar from whatever the current primary action is. */
+function refreshStatusBar() {
+  const action = primaryAction();
+  if (!action) {
+    const step = state.recoveryWaiting ? "connect-device"
+      : state.running ? "install"
+        : state.identity ? "install" : state.bundleReady ? "connect-device"
+          : state.release ? "download-verify" : "device-build";
+    setStatusBar({ step, message: stageMessage(step), kind: state.running ? "pending" : "pending" });
+    return;
+  }
+  setStatusBar({ step: action.step, message: action.message, kind: action.kind ?? "pending",
+    action: { label: action.label }, hint: action.hint ?? "", secondary: action.secondary ?? "" });
+}
+
 export async function loadAmonetArchive({ file = null, url = null, acquire = null } = {}) {
   if (state.running) throw new StageError("unlock", "cannot change the Amonet archive during an active run");
   assertAmonetRequired();
@@ -1467,6 +1889,7 @@ export function refreshControls() {
   if (readiness) readiness.textContent = running ? "Install in progress." : state.fetchingBundle
     ? "Downloading and verifying the selected build." : blocked ? `Install blocked: ${blocked}.`
       : "Published build verified for this device. Recovery is checked before any install write.";
+  renderPrerequisites();
   if (state.identity) renderDevicePanel(state.identity, assessIdentity(state.identity, undefined,
     { selectedBoard: state.target?.board ?? state.bundleBoard ?? null }));
   if (dom.buttons.download) dom.buttons.download.disabled = busy || !state.release || !state.board;
@@ -1486,6 +1909,7 @@ export function refreshControls() {
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
   refreshContinueFromTwrp();
+  refreshStatusBar();
 }
 
 /**
@@ -1747,11 +2171,24 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     terminal.warn("reboot requested; installed OS boot, userdata preservation and service readiness are NOT verified by this page");
     terminal.info("confirm the same device and its marker-free running image before calling the installation complete");
     state.stageProgress.verify = "done";
+    // Success is republished to the bar too; the run is over and nothing is
+    // pending, so no primary action is offered.
+    setStatusBar({ step: "install", kind: "ok", action: null,
+      message: "Install finished and a reboot was requested. The running OS is not verified by this page — confirm the device itself before calling it complete.",
+      secondary: "The full log is beside the steps; use Save log to keep it." });
   } catch (error) {
     const stage = error instanceof StageError ? error.stage : "unknown";
     terminal.error(`${stage} stage failed: ${error.message}`);
     if (error.detail) terminal.line(String(error.detail));
     terminal.info("nothing further was attempted. Preserve the current device state; do not re-run a submitted unlock or installer ZIP without classifying its result first.");
+    // The failure must be visible without scrolling back to the log.
+    const failedStep = stepCardForStage(stage) ?? "install";
+    setStatusBar({ step: failedStep, message: `${stage} stage failed: ${error.message}`,
+      kind: "bad", action: null,
+      secondary: "Nothing further was attempted. Preserve the current device state.",
+      hint: state.unlockSubmitted === state.identity?.serialRaw
+        ? "The unlock payload was already submitted in this page session; it will not be sent again."
+        : "" });
   } finally {
     setRunning(false);
     // The run owns no recovery session once it ends; drop the bound handle and
@@ -1831,6 +2268,23 @@ dom.buttons.grantRecovery?.addEventListener("click", () => {
 dom.buttons.dryRun?.addEventListener("click", () => runInstall({ dryRun: true }));
 dom.buttons.run?.addEventListener("click", () => runInstall({ dryRun: false }));
 dom.continueFromTwrp?.addEventListener("click", () => runInstall({ dryRun: false }));
+dom.statusBarAction?.addEventListener("click", () => {
+  // The bar offers exactly one action at a time; the handler is republished by
+  // setStatusBar, so it always matches the label the operator can see.
+  const action = primaryAction();
+  if (!action) return;
+  action.run();
+});
+dom.logToggle?.addEventListener("click", () => {
+  // The log is secondary but never lost: this only hides it.
+  const collapsed = dom.terminal?.hidden === true;
+  if (dom.terminal) dom.terminal.hidden = !collapsed;
+  if (dom.logCard) dom.logCard.dataset.collapsed = collapsed ? "false" : "true";
+  if (dom.logToggle) {
+    dom.logToggle.textContent = collapsed ? "Hide log" : "Show log";
+    dom.logToggle.setAttribute("aria-expanded", collapsed ? "true" : "false");
+  }
+});
 dom.buttons.abort?.addEventListener("click", () => {
   requestStop();
   terminal.warn("stop requested: a device wait is cancelled now; the current USB operation finishes, then the run stops before the next stage");
