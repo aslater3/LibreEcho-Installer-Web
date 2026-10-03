@@ -17,7 +17,7 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait } from "./stages.js";
+import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
 import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
 import { payloadForProfile } from "./profiles.js";
 import {
@@ -67,6 +67,8 @@ const dom = {
   statusPayload: document.getElementById("status-payload"),
   devicePanel: document.getElementById("device-panel"),
   recoveryWait: document.getElementById("recovery-wait"),
+  recoveryCountdown: document.getElementById("recovery-countdown"),
+  continueFromTwrp: document.getElementById("btn-continue-twrp"),
   stepList: document.getElementById("step-list"),
   buttons: {
     refresh: document.getElementById("btn-refresh"),
@@ -121,11 +123,18 @@ export const state = {
   downloadedBundle: null,
   downloadTimer: null,
   recoveryWaiting: false,
+  recoveryDeadline: null,
   recoveryAbort: null,
   recoveryGrantInFlight: false,
   recoverySession: null,
   recoveryAcceptedEpoch: 0,
   recoveryEpoch: 0,
+  // Set the moment this page session submits flash:brick, keyed to the serial.
+  // A second Run click must never re-enter the unlock branch: assessIdentity still
+  // reads the stale locked fastboot identity long after the payload was sent, so
+  // the run would otherwise submit `brick` a second time against a device whose
+  // unlock outcome is unknown. Never cleared by a run's `finally`.
+  unlockSubmitted: null,
 };
 
 function setStatus(node, text, kind = "pending") {
@@ -784,7 +793,7 @@ export async function queryDevice({ any = false, open = openFastboot } = {}) {
     state.adb = null;
     state.recoverySerial = null;
     state.kaeruHeader = null;
-    const assessment = assessIdentity(identity, terminal);
+    const assessment = assessIdentity(identity, terminal, { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
     renderDevicePanel(identity, assessment);
     setStatus(
       dom.statusDevice,
@@ -845,12 +854,73 @@ function renderDevicePanel(identity, assessment) {
   }
 }
 
+/**
+ * How long the page waits for TWRP before giving up, in milliseconds.
+ *
+ * Ten minutes, not three: the operator may have to reboot the device by hand and
+ * then find Chrome's device chooser. A short deadline expired while a perfectly
+ * healthy TWRP was waiting on a human, and the only recovery was reloading the
+ * page — which loses every verified artifact. The wait is still bounded and the
+ * countdown is visible, and a timeout after a submitted unlock is recoverable
+ * in-page via "Continue from TWRP" (see state.unlockSubmitted).
+ *
+ * Re-exported from ./stages.js so the page wait and the standalone
+ * `waitForRecovery` helper share one deadline instead of drifting apart.
+ */
+export { RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
+
+/** "9:58" / "45s" — the countdown shown while waiting for TWRP. */
+export function formatCountdown(ms) {
+  const total = Math.max(0, Math.ceil(Number(ms ?? 0) / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes > 0 ? `${minutes}:${String(seconds).padStart(2, "0")}` : `${seconds}s`;
+}
+
 // --- recovery handoff ------------------------------------------------------
 
 // One lock for the whole page: the background recovery poll and a user-granted
 // chooser must never open the same USB interface at the same time.
 const recoveryLock = createMutex();
 let recoveryWake = null;
+
+// Exactly one owner per USB device at a time.
+//
+// Serialising validation behind a mutex is not enough. While the poller is
+// opening a device and the operator clicks "Allow TWRP access", the second open
+// is queued but still *starts* against the same physical interface, so two
+// USBDevice opens and two CNXN handshakes interleave on one USB interface and
+// both fail ("waiting for CNXN/AUTH", "no more data from the device") even
+// though TWRP is healthy. This registry makes ownership exclusive per device so
+// a contender skips instead of queueing. The mutex stays as the final
+// serialisation point for the case where two owners disagree about a key.
+const recoveryClaims = new Map();
+
+/**
+ * Identity of a granted USBDevice for ownership purposes. The descriptor serial
+ * is the strongest key; otherwise the vendor/product pair. A key is only ever a
+ * *claim* identity — the ADB-reported serial in claimRecoveryDevice stays the
+ * authoritative acceptance gate.
+ */
+function claimKey(device) {
+  const serial = String(device?.serialNumber ?? "").trim();
+  if (serial) return `serial:${serial}`;
+  return `usb:${device?.vendorId ?? "?"}:${device?.productId ?? "?"}`;
+}
+
+/** True when someone else already owns this device, so a contender must skip. */
+function isRecoveryDeviceBusy(device) {
+  return recoveryClaims.has(claimKey(device));
+}
+
+/** Raised when a claim is refused because another owner holds the device. */
+class RecoveryDeviceBusy extends StageError {
+  constructor(device) {
+    super("recovery", `another part of this page already has this USB device open (${device?.vendorId ?? "?"}:${device?.productId ?? "?"})`);
+    this.name = "RecoveryDeviceBusy";
+    this.busy = true;
+  }
+}
 
 // `state.abort` only means "the operator stopped an active run"; a standalone
 // recovery grant or find (no run in progress) must not be blocked by a stale
@@ -957,20 +1027,38 @@ export function requestStop() {
   wakeRecoveryWaiter();
 }
 
-function enterRecoveryWaitingUI() {
+// The wait UI carries a visible countdown, because a human (Chrome's chooser)
+// is inside this deadline. `state.recoveryDeadline` is the absolute time the
+// wait expires; null when not waiting.
+function enterRecoveryWaitingUI(deadline = null) {
   state.recoveryWaiting = true;
-  if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Give this page USB access to TWRP now…";
+  state.recoveryDeadline = deadline;
+  if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Allow USB access to TWRP…";
   if (dom.recoveryWait) {
     dom.recoveryWait.style.display = "";
-    dom.recoveryWait.textContent = "Waiting for TWRP to appear. If the browser has not been given access to the recovery device, use “Give this page USB access to TWRP now” above; the install continues automatically once it is connected.";
+    dom.recoveryWait.textContent =
+      "Waiting for TWRP to appear. When it does, choose the new USB device named “Echo” in Chrome's prompt. "
+      + "The install continues automatically once it is connected.";
   }
+  paintRecoveryCountdown(deadline);
   refreshControls();
+}
+
+/** Repaints the visible countdown. The surrounding prompt text is not rewritten. */
+function paintRecoveryCountdown(deadline) {
+  if (deadline == null) {
+    if (dom.recoveryCountdown) dom.recoveryCountdown.textContent = "";
+    return;
+  }
+  if (dom.recoveryCountdown) dom.recoveryCountdown.textContent = `${formatCountdown(deadline - Date.now())} left`;
 }
 
 function leaveRecoveryWaitingUI() {
   state.recoveryWaiting = false;
-  if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Grant TWRP USB permission…";
+  state.recoveryDeadline = null;
+  if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Allow USB access to TWRP";
   if (dom.recoveryWait) { dom.recoveryWait.style.display = "none"; dom.recoveryWait.textContent = ""; }
+  if (dom.recoveryCountdown) dom.recoveryCountdown.textContent = "";
 }
 
 /**
@@ -980,46 +1068,83 @@ function leaveRecoveryWaitingUI() {
  * every awaited validation, so a stop, a newer wait or a late result is disposed
  * rather than bound, and an already-accepted session is reused instead of
  * opening a second interface.
+ *
+ * Ownership is exclusive per USB device and is taken BEFORE the mutex, so a
+ * poller and a grant click on the same physical device never both start an open.
+ * The registry entry is released in a finally on every path — success, refusal,
+ * timeout or transport error — and the session itself is always closed before the
+ * claim is dropped, so the next attempt opens a clean interface.
  */
 async function claimRecoveryDevice(device, { expectedSerial, expectedBoard, identity = null,
   epoch = null, open = openAdb, openSession = null, signal = null } = {}) {
   const stale = () => signal?.aborted || isStopped() || isEpochStale(epoch)
     || (identity != null && state.identity !== identity);
-  return recoveryLock.run(async () => {
-    if (stale()) throw new RecoveryStopped();
-    if (!expectedBoard) {
-      throw new StageError("recovery", "the selected device has no declared board; refusing an unqualified recovery session");
-    }
-    // A session already accepted for this generation satisfies the claim without
-    // opening a second interface for the same device.
-    if (acceptedRecoveryFor(expectedSerial)) return state.recoverySession ?? { client: state.adb };
-    const session = openSession
-      ? await openSession()
-      : await open({ device, onLog: (line) => terminal.line(line) });
-    if (!session) throw new StageError("recovery", "the browser returned no recovery device");
-    if (stale()) { await closeRecoverySession(session); throw new RecoveryStopped(); }
-    try {
-      const validated = await validateRecoverySession({ client: session.client, expectedSerial, expectedBoard, terminal });
-      // Re-check after the awaited validation: a stop or a newer generation must
-      // never bind a session that arrived late.
+  const key = claimKey(device);
+  // Refuse before any await: a queued open is exactly the interleaved-CNXN race.
+  if (isRecoveryDeviceBusy(device)) throw new RecoveryDeviceBusy(device);
+  recoveryClaims.set(key, { epoch: epoch ?? state.recoveryEpoch, at: Date.now() });
+  try {
+    return await recoveryLock.run(async () => {
       if (stale()) throw new RecoveryStopped();
-      state.adb = session.client;
-      state.recoverySession = session;
-      state.recoveryAcceptedEpoch = epoch ?? state.recoveryEpoch;
-      state.kaeruHeader = validated.header;
-      state.recoverySerial = expectedSerial;
-      refreshControls();
-      session.validated = validated;
-      return session;
-    } catch (error) {
-      await closeRecoverySession(session);
-      throw error;
-    }
-  });
+      if (!expectedBoard) {
+        throw new StageError("recovery", "the selected device has no declared board; refusing an unqualified recovery session");
+      }
+      // A session already accepted for this generation satisfies the claim without
+      // opening a second interface for the same device.
+      if (acceptedRecoveryFor(expectedSerial)) return state.recoverySession ?? { client: state.adb };
+      const session = openSession
+        ? await openSession()
+        : await open({ device, onLog: (line) => terminal.line(line) });
+      if (!session) throw new StageError("recovery", "the browser returned no recovery device");
+      if (stale()) { await closeRecoverySession(session); throw new RecoveryStopped(); }
+      try {
+        const validated = await validateRecoverySession({ client: session.client, expectedSerial, expectedBoard, terminal });
+        // Re-check after the awaited validation: a stop or a newer generation must
+        // never bind a session that arrived late.
+        if (stale()) throw new RecoveryStopped();
+        state.adb = session.client;
+        state.recoverySession = session;
+        state.recoveryAcceptedEpoch = epoch ?? state.recoveryEpoch;
+        state.kaeruHeader = validated.header;
+        state.recoverySerial = expectedSerial;
+        refreshControls();
+        session.validated = validated;
+        return session;
+      } catch (error) {
+        // Release the interface before the claim is dropped, so the next poll or
+        // grant gets a clean retry rather than inheriting a half-open transport.
+        await closeRecoverySession(session);
+        throw error;
+      }
+    });
+  } finally {
+    recoveryClaims.delete(key);
+  }
+}
+
+/**
+ * True when a granted USBDevice is definitely NOT the selected device. The
+ * USB descriptor's `serialNumber` is authoritative when present: a granted
+ * Radar on the same origin must never be opened during a Biscuit's wait, because
+ * two ADB opens on one USB interface is exactly the interleaved-CNXN failure the
+ * serial filter exists to prevent. An empty or absent serialNumber cannot
+ * exclude a candidate, so those still fall back to open-and-probe — the
+ * ADB-reported serial check in claimRecoveryDevice remains the real gate.
+ */
+function isForeignGrantedDevice(device, expectedSerial) {
+  const declared = String(device?.serialNumber ?? "").trim();
+  return declared !== "" && declared !== expectedSerial;
 }
 
 /** Tries every already-granted device without ever opening a chooser. */
 async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch, grantedDevices, open, openSession, signal }) {
+  // While the operator's permission chooser is open, the page owns the device
+  // search. Polling in parallel is what produced two interleaved CNXN handshakes
+  // on one interface; skip the whole round and let the grant resolve.
+  if (state.recoveryGrantInFlight) {
+    terminal.line("recovery poll paused while the USB permission chooser is open");
+    return null;
+  }
   let devices;
   try {
     devices = await grantedDevices();
@@ -1030,10 +1155,22 @@ async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, ep
   if (!Array.isArray(devices) || devices.length === 0) return null;
   for (const device of devices) {
     if (signal?.aborted || isStopped() || isEpochStale(epoch)) throw new RecoveryStopped();
+    if (isForeignGrantedDevice(device, expectedSerial)) {
+      // Descriptor-level mismatch: skip without opening, so an unrelated granted
+      // device is never claimed and never disrupts the selected one's transport.
+      terminal.line(`skipping a granted USB device that is not the selected serial (${device.vendorId}:${device.productId})`);
+      continue;
+    }
     try {
       return await claimRecoveryDevice(device, { expectedSerial, expectedBoard, identity, epoch, open, openSession, signal });
     } catch (error) {
       if (error instanceof RecoveryStopped) throw error;
+      // Another owner has this device right now (a grant click, or a newer wait).
+      // Skip it this round; the next poll retries cleanly once the owner is done.
+      if (error instanceof RecoveryDeviceBusy) {
+        terminal.line(`skipping a recovery candidate another owner is already opening (${device.vendorId}:${device.productId})`);
+        continue;
+      }
       terminal.line(`ignoring a granted recovery candidate: ${error.message}`);
     }
   }
@@ -1048,7 +1185,7 @@ async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, ep
  * mid-open or mid-validation: the wait settles immediately and the in-flight
  * claim disposes its late session instead of binding it.
  */
-export async function awaitRecovery({ timeoutMs = 180000, intervalMs = 4000,
+export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalMs = RECOVERY_POLL_INTERVAL_MS,
   grantedDevices = grantedAdbDevices, open = openAdb, openSession = null } = {}) {
   const identity = state.identity;
   if (!identity?.serialRaw) throw new StageError("recovery", "select and identify the fastboot device first");
@@ -1058,8 +1195,8 @@ export async function awaitRecovery({ timeoutMs = 180000, intervalMs = 4000,
   const epoch = nextRecoveryEpoch(); // a new wait replaces and invalidates any older one
   const controller = new AbortController();
   state.recoveryAbort = controller;
-  enterRecoveryWaitingUI();
   const deadline = Date.now() + timeoutMs;
+  enterRecoveryWaitingUI(deadline);
   // Bound the whole wait, including an unresolved USB open or identity probe.
   // Checking the deadline only between polls leaves a hung probe unbounded.
   let timedOut = false;
@@ -1067,6 +1204,9 @@ export async function awaitRecovery({ timeoutMs = 180000, intervalMs = 4000,
     timedOut = true;
     controller.abort();
   }, Math.max(0, timeoutMs));
+  // A one-second repaint keeps the visible countdown honest without coupling it
+  // to the poll interval.
+  const countdownTimer = setInterval(() => paintRecoveryCountdown(deadline), 1000);
   let accepted = false;
   try {
     for (;;) {
@@ -1093,6 +1233,7 @@ export async function awaitRecovery({ timeoutMs = 180000, intervalMs = 4000,
     throw error;
   } finally {
     clearTimeout(deadlineTimer);
+    clearInterval(countdownTimer);
     // Only the owner of the current generation may clear the shared wait state.
     if (state.recoveryAbort === controller) {
       state.recoveryAbort = null;
@@ -1155,6 +1296,12 @@ export async function grantRecovery({ request = requestDevice, open = openAdb, o
     return claimed;
   } catch (error) {
     if (error instanceof RecoveryStopped) return null;
+    // A poll already owns this device: it will bind the same interface, so the
+    // grant simply steps aside rather than opening a second one.
+    if (error instanceof RecoveryDeviceBusy) {
+      terminal.warn("the recovery poll already has this device open; the install continues on that connection");
+      return null;
+    }
     terminal.warn(`the chosen device was not accepted: ${error.message}`);
     return null;
   } finally {
@@ -1183,7 +1330,8 @@ async function findRecovery() {
 function amonetRequirement() {
   const identity = state.identity;
   if (!identity) return { mode: "pending", message: "Query the device to determine whether an Amonet unlock ZIP is needed." };
-  const assessment = assessIdentity(identity, { ok() {}, warn() {} });
+  const assessment = assessIdentity(identity, { ok() {}, warn() {} },
+    { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
   if (assessment.findings.length) return { mode: "blocked", message: `Install blocked: ${assessment.findings[0]}. No unlock archive can resolve this automatically.` };
   if (acceptedRecoveryFor(identity.serialRaw)) return { mode: "skip", message: "Same-device TWRP and Kaeru header verified — no Amonet unlock ZIP needed." };
   if (assessment.unlocked) return { mode: "skip", message: "Already unlocked — no Amonet unlock ZIP needed. Same-device TWRP and the Kaeru boot chain must still be verified before installation." };
@@ -1288,7 +1436,8 @@ export async function loadPayload(file) {
 // Protocol, hardware-acceptance and same-device recovery checks remain separate.
 function installReadinessReason() {
   if (!state.identity) return "query the device in fastboot first";
-  const assessment = assessIdentity(state.identity);
+  const assessment = assessIdentity(state.identity, undefined,
+    { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
   if (assessment.findings.length) return assessment.findings[0];
   if (!state.release || !state.bundleReady) return "download and verify the complete published build first";
   const board = state.identity.profile.board;
@@ -1300,7 +1449,16 @@ function installReadinessReason() {
   return null;
 }
 
-function refreshControls() {
+/**
+ * Re-evaluates every control's enabled/hidden state from `state`.
+ *
+ * Exported because the availability of "Continue from TWRP" is a function of
+ * page state that changes outside any click handler — most importantly after a
+ * run's `finally` invalidates the recovery session, which is precisely when the
+ * operator needs to be offered the resume. Keeping this callable lets that
+ * transition be observed rather than assumed.
+ */
+export function refreshControls() {
   const running = state.running;
   const busy = running || state.fetchingBundle;
   const blocked = installReadinessReason();
@@ -1309,7 +1467,8 @@ function refreshControls() {
   if (readiness) readiness.textContent = running ? "Install in progress." : state.fetchingBundle
     ? "Downloading and verifying the selected build." : blocked ? `Install blocked: ${blocked}.`
       : "Published build verified for this device. Recovery is checked before any install write.";
-  if (state.identity) renderDevicePanel(state.identity, assessIdentity(state.identity));
+  if (state.identity) renderDevicePanel(state.identity, assessIdentity(state.identity, undefined,
+    { selectedBoard: state.target?.board ?? state.bundleBoard ?? null }));
   if (dom.buttons.download) dom.buttons.download.disabled = busy || !state.release || !state.board;
   dom.buttons.dryRun.disabled = running;
   dom.buttons.verifyBundle.disabled = running;
@@ -1326,6 +1485,32 @@ function refreshControls() {
   dom.buttons.grantRecovery.disabled = busy && !state.recoveryWaiting;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
+  refreshContinueFromTwrp();
+}
+
+/**
+ * "Continue from TWRP" is offered only when this page session has already sent
+ * flash:brick for the selected serial and no accepted recovery session survives.
+ * That is exactly the state a recovery timeout leaves behind: the unlock outcome
+ * is unknown, so the page must not invite a plain second Run (which looks like a
+ * fresh install and could submit brick again) and must not force a reload, which
+ * would discard every verified artifact. The button drives the same `runInstall`,
+ * which now short-circuits the unlock stage.
+ */
+function continueFromTwrpAvailable() {
+  return Boolean(state.identity?.serialRaw && !state.running && !state.fetchingBundle
+    && state.unlockSubmitted === state.identity.serialRaw
+    && !(state.adb && state.recoverySerial === state.identity.serialRaw && state.kaeruHeader)
+    && installReadinessReason() === null);
+}
+
+function refreshContinueFromTwrp() {
+  const node = dom.continueFromTwrp;
+  if (!node) return;
+  node.hidden = !continueFromTwrpAvailable();
+  if (!node.hidden) {
+    node.textContent = "Continue from TWRP — the unlock payload was already submitted and will not be sent again";
+  }
 }
 
 function setRunning(running) {
@@ -1376,7 +1561,8 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     state.stageProgress.device = "done";
     assertNotAborted("device");
 
-    const assessment = assessIdentity(state.identity, terminal);
+    const assessment = assessIdentity(state.identity, terminal,
+      { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
     state.stageProgress.identity = "done";
     const profile = state.identity.profile;
     // The board comes from the resolved target (or the verified build metadata).
@@ -1408,9 +1594,20 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     }
 
     const resumedRecovery = state.adb && state.recoverySerial === state.identity.serialRaw && state.kaeruHeader;
+    // The unlock latch is per page session and keyed to the serial. Once flash:brick
+    // has been sent the outcome is unknown (usually the device stops answering), so
+    // the ONLY correct follow-up is the recovery wait — never a second submission.
+    // This survives the `finally` below, unlike the bound ADB session, and it is what
+    // makes "Continue from TWRP" safe after a recovery timeout.
+    const unlockAlreadySent = state.unlockSubmitted === state.identity.serialRaw;
     if (resumedRecovery) {
       terminal.ok("continuing from verified recovery without re-submitting the unlock payload");
       state.stageProgress.unlock = "done";
+    } else if (unlockAlreadySent) {
+      terminal.ok("the unlock payload was already submitted in this page session; continuing from TWRP without re-submitting it");
+      state.stageProgress.unlock = "unknown";
+      currentStage("recovery");
+      await awaitRecovery(recovery);
     } else {
       if (!assessment.unlocked) {
         currentStage("unlock");
@@ -1422,6 +1619,11 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
           payloadName: state.payloadName,
           serialRaw: state.identity.serialRaw,
           terminal,
+          // Set the latch immediately before flash:brick leaves the host. It is
+          // deliberately not cleared by this run's `finally` (invalidateRecovery
+          // drops the bound ADB session, not this), which is what makes a second
+          // Run click after a recovery timeout safe.
+          onSubmit: (serial) => { state.unlockSubmitted = serial; },
         });
         state.stageProgress.unlock = "done";
         if (outcome.outcome === "unknown") {
@@ -1628,6 +1830,7 @@ dom.buttons.grantRecovery?.addEventListener("click", () => {
 });
 dom.buttons.dryRun?.addEventListener("click", () => runInstall({ dryRun: true }));
 dom.buttons.run?.addEventListener("click", () => runInstall({ dryRun: false }));
+dom.continueFromTwrp?.addEventListener("click", () => runInstall({ dryRun: false }));
 dom.buttons.abort?.addEventListener("click", () => {
   requestStop();
   terminal.warn("stop requested: a device wait is cancelled now; the current USB operation finishes, then the run stops before the next stage");

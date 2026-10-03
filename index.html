@@ -104,12 +104,13 @@
           <button id="btn-connect" class="primary" type="button">Query device (read-only fastboot)</button>
           <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
           <button id="btn-recovery" class="ghost" type="button">Find previously authorised recovery</button>
-          <button id="btn-grant-recovery" class="ghost" type="button">Grant TWRP USB permission…</button>
+          <button id="btn-grant-recovery" class="ghost" type="button">Allow USB access to TWRP</button>
         </div>
         <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
         <div id="device-panel" aria-live="polite"></div>
         <p id="amonet-route" role="status" aria-live="polite">Query the device to determine whether an Amonet unlock ZIP is needed.</p>
-        <p id="recovery-wait" class="recovery-wait" role="status" style="display:none"></p>
+        <p id="recovery-wait" class="recovery-wait" role="status" aria-live="polite" style="display:none"></p>
+        <p id="recovery-countdown" class="recovery-wait" role="status" aria-live="off"></p>
       </section>
 
       <section class="card" id="amonet-panel" hidden>
@@ -133,6 +134,7 @@
         <div class="actions">
           <button id="btn-dry-run" class="ghost" type="button">Rehearse (no writes)</button>
           <button id="btn-run" class="primary" type="button" disabled aria-describedby="install-readiness">Run the install</button>
+          <button id="btn-continue-twrp" class="primary" type="button" hidden aria-describedby="install-readiness">Continue from TWRP</button>
           <button id="btn-abort" class="ghost" type="button" disabled>Stop</button>
         </div>
         <p id="install-readiness" class="fine-print" role="status" aria-live="polite">Query the device and verify its published build before installation.</p>
@@ -172,6 +174,6 @@
   </div>
 </footer>
 
-<script type="module" src="js/app.js?v=published-target-1"></script>
+<script type="module" src="js/app.js?v=published-target-2"></script>
 </body>
 </html>

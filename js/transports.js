@@ -107,6 +107,26 @@ export async function openFastboot({ device = null, onLog, any = false } = {}) {
   return { device: transport.device ?? device, transport, client };
 }
 
+/**
+ * Fully releases a USB interface, whatever stage of the open failed.
+ *
+ * A CNXN/AUTH timeout leaves the USBDevice open and the interface claimed even
+ * though `openAdb` throws and hands back no session. If that is not released,
+ * the next attempt inherits a half-open transport on the same USB interface and
+ * its two handshakes interleave — the observed "waiting for CNXN/AUTH" failure.
+ * Closing by device as well as by transport covers an open() that never got far
+ * enough to produce a transport at all.
+ */
+async function releaseUsbInterface(transport, device) {
+  try {
+    await (transport?.close?.());
+    return;
+  } catch { /* device already gone; still try the raw handle below */ }
+  try {
+    if (device?.opened) await device.close();
+  } catch { /* device already gone */ }
+}
+
 /** Opens an ADB session, prompting for the device when one is not supplied. */
 export async function openAdb({ device = null, onLog, any = false } = {}) {
   const support = await protocolSupport();
@@ -123,7 +143,15 @@ export async function openAdb({ device = null, onLog, any = false } = {}) {
     transport = await TransportClass.requestDevice({ filters: adbFilters() });
   }
   const client = new support.adb.value(transport);
-  const info = await client.connect({ banner: "host::libreecho-browser-installer" });
+  let info;
+  try {
+    info = await client.connect({ banner: "host::libreecho-browser-installer" });
+  } catch (error) {
+    // Never leave the interface claimed behind a failed handshake: a retry on
+    // the same device would otherwise open a second CNXN on one interface.
+    await releaseUsbInterface(transport, transport?.device ?? device);
+    throw error;
+  }
   if (onLog) {
     onLog(`adb interface claimed on ${transport.device?.vendorId ?? "?"}:${transport.device?.productId ?? "?"}`);
     if (info?.deviceBanner) onLog(`device banner: ${info.deviceBanner}`);

@@ -160,11 +160,40 @@ test('each target declares an exact pinned Amonet ZIP and member path', () => {
 });
 
 const biscuit = PROFILES.find((profile) => profile.id === 'biscuit');
-test('Biscuit identity describes the Radar image as experimental, not impossible', () => {
+const radar = PROFILES.find((profile) => profile.id === 'radar');
+const capture = () => {
   const warnings = [];
+  return { warnings, terminal: { ok() {}, warn: (message) => warnings.push(message) } };
+};
+
+// This replaces the old "Biscuit always warns that Radar is experimental"
+// expectation. That warning was unconditional, so it fired even when the selected
+// build was itself Biscuit-targeted — which is the correct pairing — and told the
+// operator something that was not true. The build-vs-device warning is now driven
+// by the selected build's board, and the real block for a mismatched build is
+// unchanged in runInstall.
+test('a Biscuit device with a Biscuit-targeted build gets no experimental warning', () => {
+  const { warnings, terminal } = capture();
   assessIdentity({ product: 'BISCUIT', profile: biscuit, unlockStatus: 'false', serialRaw: 'TEST-DOT' },
-    { ok() {}, warn: (message) => warnings.push(message) });
-  assert.match(warnings.join(' '), /radar.*experimental|experimental.*radar/i);
+    terminal, { selectedBoard: 'biscuit' });
+  assert.deepEqual(warnings, [], 'a correctly matched Biscuit build produced a warning');
+});
+
+test('a Biscuit device warns only when the selected build is for a different board', () => {
+  const { warnings, terminal } = capture();
+  assessIdentity({ product: 'BISCUIT', profile: biscuit, unlockStatus: 'false', serialRaw: 'TEST-DOT' },
+    terminal, { selectedBoard: radar.board });
+  assert.equal(warnings.length, 1, 'a board-mismatched build produced no warning');
+  assert.match(warnings[0], new RegExp(radar.board, 'i'));
+  assert.match(warnings[0], /biscuit/i);
+});
+
+test('no selected build makes no build-vs-device claim at all', () => {
+  const { warnings, terminal } = capture();
+  const assessment = assessIdentity({ product: 'BISCUIT', profile: biscuit, unlockStatus: 'false',
+    serialRaw: 'TEST-DOT' }, terminal);
+  assert.deepEqual(warnings, [], 'a device-only assessment invented a build mismatch');
+  assert.deepEqual(assessment.findings, [], 'a well-identified locked Biscuit device has findings');
 });
 
 const quiet = { line() {}, info() {}, ok() {}, warn() {}, error() {}, command() {}, endProgress() {} };
