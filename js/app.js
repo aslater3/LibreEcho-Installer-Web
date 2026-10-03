@@ -17,9 +17,9 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
+import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
 import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
-import { payloadForProfile } from "./profiles.js";
+import { PROFILES, payloadForProfile } from "./profiles.js";
 import {
   installableBoards,
   profileForBoard,
@@ -98,6 +98,7 @@ const dom = {
     abort: document.getElementById("btn-abort"),
     recovery: document.getElementById("btn-recovery"),
     grantRecovery: document.getElementById("btn-grant-recovery"),
+    recoveryEntry: document.getElementById("btn-recovery-entry"),
     connectAny: document.getElementById("btn-connect-any"),
   },
 };
@@ -214,7 +215,7 @@ function stageMessage(step) {
         return blockedHere ? `Device found (${state.identity.product}). Install is blocked: ${blockedHere}.`
           : `Device found (${state.identity.product}). Everything is checked — press Run the install in step 5.`;
       }
-      return "Press Query device and choose your Echo in Chrome's list. This only reads; it writes nothing.";
+      return "Press Query device and choose your Echo in Chrome's list. This only reads; it writes nothing. Already in TWRP? Press “My Echo is already in recovery” instead.";
     case "unlock-payload":
       return state.payloadBytes ? `Unlock payload ${state.payloadName} is verified and ready.`
         : "This device is locked: select the pinned Amonet ZIP so the unlock stage has its verified payload.";
@@ -1086,7 +1087,22 @@ export async function queryDevice({ any = false, open = openFastboot } = {}) {
 function renderDevicePanel(identity, assessment) {
   dom.devicePanel.innerHTML = "";
   const blocked = installReadinessReason();
-  const rows = [
+  // A recovery-entered identity has no fastboot getvar to report, so the rows it
+  // cannot honestly fill are replaced with what it *can* prove: how the device
+  // was found, and that the unlock was therefore already applied.
+  const fromRecovery = identity.source === "recovery";
+  const rows = fromRecovery ? [
+    ["model", `${identity.profile.marketing} (read from the running TWRP)`],
+    ["recovery board", identity.recoveryBoard || "(not reported)"],
+    ["TWRP version", identity.twrpVersion || "(not reported)"],
+    ["USB serial", identity.serialRaw || "(not reported)"],
+    ["unlock_status", "unlocked (Kaeru LK header intact in expdb)"],
+    ["found by", "reading the device from recovery — no fastboot identity existed on this page"],
+    ["serial privacy", "shown only in this local panel; masked in the log"],
+    ["recognised target", `${identity.profile.marketing} — ${identity.profile.libreEcho}`],
+    ["userdata contract", identity.profile ? `${(identity.profile.userdataContractSectors ?? []).join(" or ")} sectors` : "—"],
+    ["next step", blocked ? `install blocked: ${blocked}` : "recovery verification"],
+  ] : [
     ["model", identity.profile ? `${identity.profile.marketing} (inferred from LK product)` : "unrecognised LK product"],
     ["fastboot product", identity.product || "(not reported)"],
     ["USB serial", identity.serialRaw || "(not reported)"],
@@ -1399,6 +1415,31 @@ function leaveRecoveryWaitingUI() {
 }
 
 /**
+ * Runs `body` as the page's single owner of one recovery USB device.
+ *
+ * Ownership is taken BEFORE the mutex, because serialising behind it is not
+ * enough: a queued open still *starts* against the same physical interface, and
+ * two USBDevice opens interleave two CNXN handshakes on one cable. The registry
+ * entry is released in a finally on every path — success, refusal, timeout or
+ * transport error — so a contender skips rather than waits, and the next attempt
+ * starts from a clean registry.
+ */
+async function withExclusiveRecoveryClaim(device, { epoch = null, stale = null, body } = {}) {
+  const key = claimKey(device);
+  // Refuse before any await: a queued open is exactly the interleaved-CNXN race.
+  if (isRecoveryDeviceBusy(device)) throw new RecoveryDeviceBusy(device);
+  recoveryClaims.set(key, { epoch: epoch ?? state.recoveryEpoch, at: Date.now() });
+  try {
+    return await recoveryLock.run(async () => {
+      if (stale?.()) throw new RecoveryStopped();
+      return await body();
+    });
+  } finally {
+    recoveryClaims.delete(key);
+  }
+}
+
+/**
  * Opens one candidate device, validates it as the selected TWRP device (serial,
  * board, Kaeru) and only then binds it to the run. The frozen identity and the
  * caller's generation/abort token are re-checked inside the lock and again after
@@ -1416,47 +1457,208 @@ async function claimRecoveryDevice(device, { expectedSerial, expectedBoard, iden
   epoch = null, open = openAdb, openSession = null, signal = null } = {}) {
   const stale = () => signal?.aborted || isStopped() || isEpochStale(epoch)
     || (identity != null && state.identity !== identity);
-  const key = claimKey(device);
-  // Refuse before any await: a queued open is exactly the interleaved-CNXN race.
-  if (isRecoveryDeviceBusy(device)) throw new RecoveryDeviceBusy(device);
-  recoveryClaims.set(key, { epoch: epoch ?? state.recoveryEpoch, at: Date.now() });
-  try {
-    return await recoveryLock.run(async () => {
+  return withExclusiveRecoveryClaim(device, { epoch, stale, body: async () => {
+    if (!expectedBoard) {
+      throw new StageError("recovery", "the selected device has no declared board; refusing an unqualified recovery session");
+    }
+    // A session already accepted for this generation satisfies the claim without
+    // opening a second interface for the same device.
+    if (acceptedRecoveryFor(expectedSerial)) return state.recoverySession ?? { client: state.adb };
+    const session = openSession
+      ? await openSession()
+      : await open({ device, onLog: (line) => terminal.line(line) });
+    if (!session) throw new StageError("recovery", "the browser returned no recovery device");
+    if (stale()) { await closeRecoverySession(session); throw new RecoveryStopped(); }
+    try {
+      const validated = await validateRecoverySession({ client: session.client, expectedSerial, expectedBoard, terminal });
+      // Re-check after the awaited validation: a stop or a newer generation must
+      // never bind a session that arrived late.
       if (stale()) throw new RecoveryStopped();
-      if (!expectedBoard) {
-        throw new StageError("recovery", "the selected device has no declared board; refusing an unqualified recovery session");
-      }
-      // A session already accepted for this generation satisfies the claim without
-      // opening a second interface for the same device.
-      if (acceptedRecoveryFor(expectedSerial)) return state.recoverySession ?? { client: state.adb };
-      const session = openSession
-        ? await openSession()
-        : await open({ device, onLog: (line) => terminal.line(line) });
-      if (!session) throw new StageError("recovery", "the browser returned no recovery device");
-      if (stale()) { await closeRecoverySession(session); throw new RecoveryStopped(); }
-      try {
-        const validated = await validateRecoverySession({ client: session.client, expectedSerial, expectedBoard, terminal });
-        // Re-check after the awaited validation: a stop or a newer generation must
-        // never bind a session that arrived late.
-        if (stale()) throw new RecoveryStopped();
-        state.adb = session.client;
-        state.recoverySession = session;
-        state.recoveryAcceptedEpoch = epoch ?? state.recoveryEpoch;
-        state.kaeruHeader = validated.header;
-        state.recoverySerial = expectedSerial;
-        refreshControls();
-        session.validated = validated;
-        return session;
-      } catch (error) {
-        // Release the interface before the claim is dropped, so the next poll or
-        // grant gets a clean retry rather than inheriting a half-open transport.
-        await closeRecoverySession(session);
-        throw error;
-      }
-    });
-  } finally {
-    recoveryClaims.delete(key);
+      state.adb = session.client;
+      state.recoverySession = session;
+      state.recoveryAcceptedEpoch = epoch ?? state.recoveryEpoch;
+      state.kaeruHeader = validated.header;
+      state.recoverySerial = expectedSerial;
+      refreshControls();
+      session.validated = validated;
+      return session;
+    } catch (error) {
+      // Release the interface before the claim is dropped, so the next poll or
+      // grant gets a clean retry rather than inheriting a half-open transport.
+      await closeRecoverySession(session);
+      throw error;
+    }
+  } });
+}
+
+/**
+ * "Start from recovery": the only entry for a page that was reloaded (or opened
+ * for the first time) while the Echo is already unlocked and sitting in TWRP.
+ *
+ * Everything else on this page derives from a fastboot `getvar` identity, so a
+ * fresh page had no way to continue: awaitRecovery/grantRecovery refuse without
+ * one, and re-querying fastboot is impossible because the device is not in
+ * fastboot. This reads the identity from the recovery environment itself and
+ * builds the same shape `readFastbootIdentity` produces, so every downstream
+ * gate is unchanged.
+ *
+ * It never trusts the chooser. Chrome's list is scoped to the measured TWRP
+ * VID:PID and nothing else — there is no serial to narrow it with yet — so the
+ * serial, board, TWRP version and Kaeru expdb header are ALL read back from the
+ * device and every one of them must qualify before any state is bound. A device
+ * that fails any of them is closed, and nothing is remembered: the next attempt
+ * starts clean.
+ */
+export async function startFromRecovery({ request = null, open = openAdb } = {}) {
+  if (state.running || state.fetchingBundle) {
+    throw new StageError("recovery", "starting from recovery is only available while no install is running");
   }
+  if (state.identity) {
+    throw new StageError("recovery", "a device is already identified; query the device in fastboot instead of replacing that identity");
+  }
+  if (state.recoveryGrantInFlight) {
+    terminal.warn("a browser USB permission chooser is already open; finish that one first");
+    return null;
+  }
+  state.recoveryGrantInFlight = true;
+  // requestDevice must be the FIRST device action so the button's user
+  // activation is still valid: no await precedes it.
+  const choose = request ?? ((options) => requestRecoveryDevice(options));
+  let device;
+  try {
+    device = await choose({ serial: null });
+  } catch (error) {
+    if (isChooserCancel(error)) {
+      terminal.warn("no USB device was chosen; your Echo is unchanged");
+      refreshControls();
+      return null;
+    }
+    throw new StageError("recovery", `the browser device chooser failed: ${error.message}`);
+  }
+  // This entry owns a fresh generation: any older in-flight wait or grant is now
+  // stale, so a late result can never bind over this session.
+  const epoch = nextRecoveryEpoch();
+  let session;
+  try {
+    session = await withExclusiveRecoveryClaim(device, {
+      epoch,
+      stale: () => isStopped() || isEpochStale(epoch),
+      body: async () => {
+        const opened = await open({ device, onLog: (line) => terminal.line(line) });
+        if (!opened) throw new StageError("recovery", "the browser returned no recovery device");
+        try {
+          const probe = await probeRecoveryEntry({ client: opened.client, terminal });
+          if (isStopped() || isEpochStale(epoch)) throw new RecoveryStopped();
+          // The same five fields claimRecoveryDevice binds, so every later gate
+          // (acceptedRecoveryFor, the Kaeru before/after comparison, runInstall's
+          // resumedRecovery short-circuit) treats this exactly like a polled
+          // recovery session.
+          state.adb = opened.client;
+          state.recoverySession = opened;
+          state.recoveryAcceptedEpoch = epoch;
+          state.kaeruHeader = probe.header;
+          state.recoverySerial = probe.serial;
+          state.identity = recoveryEntryIdentity(probe);
+          opened.validated = probe;
+          return opened;
+        } catch (error) {
+          // Never leave a half-verified interface open, and never leave a partial
+          // identity behind: a refusal must be exactly as clean as before the click.
+          await closeRecoverySession(opened);
+          state.identity = null;
+          throw error;
+        }
+      },
+    });
+  } catch (error) {
+    if (error instanceof RecoveryDeviceBusy) {
+      terminal.warn("another part of this page already has this USB device open; wait a few seconds and press the button again");
+      refreshControls();
+      return null;
+    }
+    throw error;
+  } finally {
+    state.recoveryGrantInFlight = false;
+  }
+  const identity = state.identity;
+  renderDevicePanel(identity, assessIdentity(identity, undefined,
+    { selectedBoard: state.target?.board ?? state.bundleBoard ?? null }));
+  setStatus(dom.statusDevice, `${identity.product} · unlocked · found in recovery · ${identity.serialMasked}`, "ok");
+  setStatus(dom.statusPayload, "not needed — unlock skipped (device was already unlocked)", "ok");
+  terminal.ok(`${identity.profile.marketing} found in recovery (TWRP ${session.validated.twrpVersion}) with an intact Kaeru expdb header`);
+  terminal.line(`recovery entry identity: board=${identity.profile.board} serial=${identity.serialMasked} (masked); no fastboot identity was available on this page`);
+  if (state.downloadedBundle && !state.fetchingBundle) await fetchBundleAutomatically({ reuse: true });
+  refreshControls();
+  return identity;
+}
+
+/**
+ * The recovery-side equivalent of `readFastbootIdentity`: reads the properties a
+ * TWRP environment can answer, and refuses unless every one of them qualifies.
+ *
+ * The bar is deliberately high. A serial alone does not identify a device, a
+ * recognised board alone does not prove this is the board the operator chose, and
+ * an intact Kaeru expdb header is the one thing that proves the LK unlock this
+ * page would otherwise have performed has already happened. All four must hold,
+ * plus a running TWRP, before any identity exists.
+ */
+export async function probeRecoveryEntry({ client, terminal } = {}) {
+  const probe = await client.shell("getprop ro.twrp.version; getprop ro.product.device; getprop ro.serialno");
+  const [twrpVersion = "", device = "", serial = ""] = String(probe?.stdout ?? "")
+    .split(/\r?\n/).map((line) => line.trim());
+  terminal?.line(`recovery probe: twrp=${twrpVersion || "(none)"} device=${device || "(none)"} serial=${maskSerial(serial)}`);
+  if (!/^\d/.test(twrpVersion)) {
+    throw new StageError("recovery", "ADB answered but TWRP is not running on the device you chose");
+  }
+  if (!serial) {
+    throw new StageError("recovery", "the chosen device reports no serial; refusing to identify it from recovery alone");
+  }
+  const profile = recoveryProfileForBoard(device);
+  if (!profile) {
+    throw new StageError("recovery",
+      `recovery board ${device || "(empty)"} is not a LibreEcho target (only RADAR and BISCUIT are); refusing to continue`);
+  }
+  const header = await readKaeruHeader(client);
+  return { twrpVersion, device, serial, profile, header };
+}
+
+/**
+ * The profile a recovery environment's `ro.product.device` names. Biscuit's
+ * kernel answers with the platform codename (`omni_biscuit`) as well as with the
+ * board name, so a codename match is required there; every other board is only
+ * accepted through the declared `boardMatches` alias set, never a substring.
+ */
+function recoveryProfileForBoard(observed) {
+  const name = String(observed ?? "").trim().toLowerCase();
+  if (!name) return null;
+  if (name.includes("biscuit")) return profileForBoard("biscuit");
+  return PROFILES.find((profile) => boardMatches(name, profile.board)) ?? null;
+}
+
+/**
+ * The identity a recovery entry earns, in the shape every existing gate reads.
+ *
+ * `unlockStatus: "true"` is a conclusion, not a guess: an intact Kaeru LK header
+ * in expdb is written by the unlock this page would otherwise submit, so reaching
+ * TWRP with it intact means the unlock is already applied. It is also the reason
+ * the unlock is never offered from here — `amonetRequirement` returns skip for
+ * `source: "recovery"`, so flash:brick has no path to a device that entered
+ * through this button.
+ */
+function recoveryEntryIdentity(probe) {
+  return {
+    product: probe.profile.product,
+    unlockStatus: "true",
+    lkBuild: "",
+    plBuild: "",
+    maxDownload: "",
+    serialRaw: probe.serial,
+    serialMasked: maskSerial(probe.serial),
+    profile: probe.profile,
+    twrpVersion: probe.twrpVersion,
+    recoveryBoard: probe.device,
+    source: "recovery",
+  };
 }
 
 /**
@@ -1753,6 +1955,11 @@ function amonetRequirement() {
     { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
   if (assessment.findings.length) return { mode: "blocked", message: `Install blocked: ${assessment.findings[0]}. No unlock archive can resolve this automatically.` };
   if (acceptedRecoveryFor(identity.serialRaw)) return { mode: "skip", message: "Same-device TWRP and Kaeru header verified — no Amonet unlock ZIP needed." };
+  // A recovery-entered device is unlocked by construction: it was only accepted
+  // because an intact Kaeru LK header is already in expdb. Offering an unlock ZIP
+  // here would be the one path that could re-send flash:brick to a device this
+  // page never put into recovery, so it is a hard skip, not a preference.
+  if (identity.source === "recovery") return { mode: "skip", message: "Your Echo was found already in recovery, so it is already unlocked — no Amonet unlock ZIP is needed and none will be sent." };
   if (assessment.unlocked) return { mode: "skip", message: "Already unlocked — no Amonet unlock ZIP needed. Same-device TWRP and the Kaeru boot chain must still be verified before installation." };
   if (!payloadForProfile(identity.profile, identity.lkBuild)) return { mode: "blocked", message: "Install blocked: this locked LK build is not supported by a pinned unlock payload." };
   return { mode: "required", message: "Locked device — the matching pinned Amonet ZIP is required for the unlock phase." };
@@ -1794,7 +2001,7 @@ export function unmetPrerequisites() {
   const unmet = [];
   if (!state.board) unmet.push("Choose which device you are installing.");
   if (!state.release) unmet.push("Choose a published build for that device.");
-  if (!state.identity) unmet.push("Query the device in fastboot (step 3) so its identity can be read from the device itself.");
+  if (!state.identity) unmet.push("Query the device in fastboot (step 3) so its identity can be read from the device itself — or, if it is already in TWRP, use “My Echo is already in recovery” there.");
   else {
     const assessment = assessIdentity(state.identity, undefined,
       { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
@@ -1898,9 +2105,17 @@ function primaryAction() {
       kind: "action", run: () => fetchBundleAutomatically().catch((error) => terminal.error(error.message)) };
   }
   if (!state.identity) {
-    return { step: "connect-device", label: "Query device", message: stageMessage("connect-device"),
-      hint: "Read-only fastboot query. Choose your Echo in Chrome’s list.", kind: "action",
-      run: () => queryDevice().catch((error) => terminal.error(`device query failed: ${error.message}`)) };
+    // With no fastboot identity there is only one button that can possibly work:
+    // a device sitting in TWRP cannot answer "Query device", which is exactly
+    // the dead end a reloaded page hits. The recovery entry becomes the primary
+    // action here; step 3 keeps the read-only fastboot query beside it, so the
+    // normal path is still one click away.
+    return { step: "connect-device", label: "My Echo is already in recovery",
+      message: "Your Echo is already in recovery, so it cannot answer a fastboot query. Press this to read its identity from recovery itself.",
+      hint: "Press this once, then choose the USB device named “Echo” in Chrome’s list. Nothing is unlocked again.",
+      secondary: "TWRP and the Kaeru header are checked before anything is written.",
+      kind: "action", focus: true,
+      run: () => startFromRecovery().catch((error) => terminal.error(`starting from recovery failed: ${error.message}`)) };
   }
   if (installReadinessReason() === null) {
     return { step: "install", label: "Install", message: stageMessage("install"), kind: "action",
@@ -2053,6 +2268,10 @@ export function refreshControls() {
   dom.buttons.connect.disabled = running;
   dom.buttons.connectAny.disabled = running;
   dom.buttons.grantRecovery.disabled = busy && !state.recoveryWaiting;
+  // The recovery entry is only ever the answer to "no fastboot identity exists".
+  // Once a device is identified it must be closed, so this can never replace or
+  // race a fastboot query or an in-progress run.
+  dom.buttons.recoveryEntry.disabled = busy || state.identity !== null;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
   refreshContinueFromTwrp();
@@ -2417,6 +2636,9 @@ dom.buttons.recovery?.addEventListener("click", () => {
 });
 dom.buttons.grantRecovery?.addEventListener("click", () => {
   grantRecovery().catch((error) => terminal.error(`recovery USB permission failed: ${error.message}`));
+});
+dom.buttons.recoveryEntry?.addEventListener("click", () => {
+  startFromRecovery().catch((error) => terminal.error(`starting from recovery failed: ${error.message}`));
 });
 dom.buttons.dryRun?.addEventListener("click", () => runInstall({ dryRun: true }));
 dom.buttons.run?.addEventListener("click", () => runInstall({ dryRun: false }));
