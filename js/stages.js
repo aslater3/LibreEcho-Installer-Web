@@ -382,6 +382,16 @@ export function boardMatches(observed, expected) {
 }
 
 /**
+ * @deprecated Not used by the page. The install's recovery wait is
+ * `awaitRecovery` in app.js, which polls already-granted devices through
+ * `pollGrantedRecovery` with the descriptor-serial pre-filter, the single-owner
+ * claim registry and the 10-minute `RECOVERY_TIMEOUT_MS` deadline. This helper
+ * has none of those: it calls `reattachAdb`, which opens EVERY granted device and
+ * shells `getprop ro.serialno` — reintroducing verbatim the defect the page's
+ * poll path removes (a second ADB open on an unrelated granted device, which is
+ * the interleaved-CNXN failure). Kept exported only because
+ * js/test_safety.mjs still imports it; do not add a production caller.
+ *
  * Waits for a previously authorised TWRP device over ADB. A changed USB
  * identity may require a separate user-gesture permission grant. This helper
  * never opens a chooser from its polling loop. The wait

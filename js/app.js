@@ -1263,7 +1263,16 @@ function wakeRecoveryWaiter() {
   if (recoveryWake) { const wake = recoveryWake; wake(); }
 }
 
-/** Rejects as soon as `signal` aborts, without cancelling the underlying work. */
+/**
+ * Rejects as soon as `signal` aborts, without cancelling the underlying work.
+ *
+ * F7: when the deadline fires, this rejects the wait but the in-flight
+ * `claimRecoveryDevice` keeps running — it holds its `recoveryClaims` entry and
+ * the open interface until its own ADB deadlines expire. An immediately
+ * following "Continue from TWRP" wait therefore skips that device as
+ * `RecoveryDeviceBusy` for a few seconds. That is correct and self-healing: the
+ * claim's `finally` releases both. Do NOT "fix" it by removing that `finally`.
+ */
 function abortable(promise, signal) {
   if (signal?.aborted) return Promise.reject(new RecoveryStopped());
   return new Promise((resolve, reject) => {
