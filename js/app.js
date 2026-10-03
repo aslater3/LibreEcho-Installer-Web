@@ -6,7 +6,7 @@
 // it verified, and a failed stage stops the run.
 
 import { Terminal } from "./terminal.js";
-import { webusbSupport, describeUsbDevice, requestDevice, maskSerial } from "./device.js";
+import { webusbSupport, describeUsbDevice, requestRecoveryDevice, recoveryChooserFilters, maskSerial } from "./device.js";
 import { protocolSupport, openFastboot, openAdb, grantedAdbDevices } from "./transports.js";
 import {
   installerConfig,
@@ -146,6 +146,13 @@ export const state = {
   recoveryDeadline: null,
   recoveryAbort: null,
   recoveryGrantInFlight: false,
+  // True only after a narrow chooser produced a device that failed acceptance.
+  // The next press then offers the wider VID:PID-only list — an explicit second
+  // choice, never an automatic fallback, and never the unfiltered chooser.
+  recoveryChooserWide: false,
+  // Set by the silent already-granted probe; suppresses the permission button
+  // entirely when this page already holds access for the selected device.
+  recoveryAlreadyGranted: false,
   recoverySession: null,
   recoveryAcceptedEpoch: 0,
   recoveryEpoch: 0,
@@ -1283,6 +1290,10 @@ export function requestStop() {
 function enterRecoveryWaitingUI(deadline = null) {
   state.recoveryWaiting = true;
   state.recoveryDeadline = deadline;
+  // A new wait must re-earn its prompt: a grant probe from an earlier wait must
+  // not silently suppress a click this run genuinely needs.
+  state.recoveryAlreadyGranted = false;
+  state.recoveryChooserWide = false;
   if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Allow USB access to TWRP…";
   if (dom.recoveryWait) {
     dom.recoveryWait.style.display = "";
@@ -1293,6 +1304,30 @@ function enterRecoveryWaitingUI(deadline = null) {
   renderRecoveryCallout();
   paintRecoveryCountdown(deadline);
   refreshControls();
+  // A permission granted on an earlier run persists in Chrome, so before asking
+  // for a click we look — silently, never opening a chooser — at the devices
+  // this origin already holds. If ours is among them the background poller
+  // binds it and the operator is never prompted at all.
+  checkAlreadyGranted().catch(() => { /* the prompt stays available */ });
+}
+
+/**
+ * True when this page already holds a permission for the selected device's
+ * recovery identity. Read-only: getDevices never opens an interface, so this
+ * cannot race the poller or the single-ownership rule.
+ */
+async function checkAlreadyGranted({ grantedDevices = grantedAdbDevices, serial = null } = {}) {
+  const expected = String(serial ?? state.identity?.serialRaw ?? "").trim();
+  if (!expected) return false;
+  const devices = await grantedDevices();
+  if (!Array.isArray(devices)) return false;
+  const found = devices.some((device) => String(device?.serialNumber ?? "").trim() === expected
+    || device?.vendorId === 0x18d1 && device?.productId === 0x4ee2);
+  if (found) {
+    state.recoveryAlreadyGranted = true;
+    terminal.line("this page already holds USB access for your Echo; no permission click is needed");
+  }
+  return found;
 }
 
 /**
@@ -1542,7 +1577,7 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
   }
 }
 
-export async function grantRecovery({ request = requestDevice, open = openAdb, openSession = null, signal = null } = {}) {
+export async function grantRecovery({ request = null, requestWide = null, open = openAdb, openSession = null, signal = null } = {}) {
   // Freeze the run identity, the generation and the abort token BEFORE any
   // await: the permission chooser must be the first device action so the click's
   // user activation stays valid, and a stop that lands while the chooser is open
@@ -1562,11 +1597,19 @@ export async function grantRecovery({ request = requestDevice, open = openAdb, o
     return null;
   }
   state.recoveryGrantInFlight = true;
+  // The narrow chooser names the exact device: VID:PID plus the serial this run
+  // is about, so the operator's list cannot contain an unrelated granted device.
+  // The wider VID:PID-only list is used ONLY after a narrow attempt was already
+  // made and its device was not accepted — never automatically.
   // requestDevice must be the first device action, so the browser's user
   // activation from the button click is still valid: no await precedes it.
+  const useWide = state.recoveryChooserWide;
+  const narrow = request ?? ((options) => requestRecoveryDevice(options));
+  const wide = requestWide ?? ((options) => requestRecoveryDevice({ ...options, wide: true }));
+  const openChooser = useWide ? wide : narrow;
   let pending;
   try {
-    pending = request("adb");
+    pending = openChooser({ serial: expectedSerial });
   } catch (error) {
     state.recoveryGrantInFlight = false;
     throw new StageError("recovery", `could not open the browser device chooser: ${error.message}`);
@@ -1575,27 +1618,45 @@ export async function grantRecovery({ request = requestDevice, open = openAdb, o
   try {
     device = await pending;
   } catch (error) {
-    state.recoveryGrantInFlight = false;
     if (isChooserCancel(error)) {
+      state.recoveryGrantInFlight = false;
       terminal.warn("no USB device was chosen; still waiting for TWRP — you can try again");
+      state.recoveryChooserWide = false;
+      refreshControls();
       return null;
     }
     throw new StageError("recovery", `the browser device chooser failed: ${error.message}`);
   }
+  // The narrow chooser can legitimately list nothing when the descriptor omits
+  // serialNumber. Offer the VID:PID-only list as an explicit second choice — it
+  // is never taken automatically, and the ADB-reported serial check below
+  // remains the gate that decides which device is accepted.
   try {
-    const claimed = await claimRecoveryDevice(device, { expectedSerial, expectedBoard, identity, epoch,
+    device = await claimRecoveryDevice(device, { expectedSerial, expectedBoard, identity, epoch,
       open, openSession, signal: capturedSignal });
+    state.recoveryChooserWide = false;
     terminal.ok("USB access granted to the selected TWRP device; Kaeru header intact");
-    return claimed;
+    return device;
   } catch (error) {
-    if (error instanceof RecoveryStopped) return null;
+    if (error instanceof RecoveryStopped) { state.recoveryChooserWide = false; return null; }
     // A poll already owns this device: it will bind the same interface, so the
     // grant simply steps aside rather than opening a second one.
     if (error instanceof RecoveryDeviceBusy) {
+      state.recoveryChooserWide = false;
       terminal.warn("the recovery poll already has this device open; the install continues on that connection");
+      refreshControls();
       return null;
     }
+    if (!state.recoveryChooserWide) {
+      // Offer the wider (still VID:PID-scoped) list once, and say plainly why.
+      state.recoveryChooserWide = true;
+      terminal.warn(`the chosen device was not accepted: ${error.message}. If Chrome's list showed a device with no serial number, press the button again to list every Echo in recovery.`);
+      refreshControls();
+      return null;
+    }
+    state.recoveryChooserWide = false;
     terminal.warn(`the chosen device was not accepted: ${error.message}`);
+    refreshControls();
     return null;
   } finally {
     state.recoveryGrantInFlight = false;
@@ -1718,13 +1779,27 @@ function renderPrerequisites() {
 function primaryAction() {
   if (state.running) {
     if (state.recoveryWaiting) {
+      const wide = state.recoveryChooserWide;
+      if (state.recoveryAlreadyGranted) {
+        // This origin already holds permission for the device and the poller is
+        // binding it: no button at all, because there is nothing to press.
+        return { step: "connect-device", label: "Connect to your Echo in recovery",
+          message: "This page already has USB access to your Echo, so it is connecting now — there is nothing for you to press.",
+          hint: "Still nothing after about 15 seconds? Press Stop, then press Connect to choose it in Chrome’s list.",
+          secondary: "Recovery here is TWRP.", kind: "pending", suppressed: true };
+      }
       return {
         step: "connect-device",
-        label: "Connect to your Echo in recovery",
-        message: "Your Echo is restarting. Press this, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
-        hint: "It can take about 15 seconds to appear; the list updates by itself.",
-        secondary: "Chrome asks for permission once per USB device. Recovery here is TWRP.",
+        label: wide ? "Connect to your Echo (showing all)" : "Connect to your Echo in recovery",
+        message: wide
+          ? "Press this, then choose your Echo from the list. Chrome shows every Echo in recovery on this machine."
+          : "Your Echo is restarting. Press this once, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
+        hint: "It can take about 15 seconds to appear while it restarts — the list updates by itself, so wait if it is not there yet.",
+        secondary: wide
+          ? "Chrome asks for permission once per USB device. If this is not your Echo, press Stop."
+          : "Chrome asks for permission once per USB device. Recovery here is TWRP.",
         kind: "action",
+        focus: true,
         run: () => grantRecovery().catch((error) => terminal.error(`recovery USB permission failed: ${error.message}`)),
       };
     }
@@ -1769,7 +1844,9 @@ function primaryAction() {
   return null;
 }
 
-/** Republishes the sticky bar from whatever the current primary action is. */
+/**
+ * Republishes the sticky bar from whatever the current primary action is.
+ */
 function refreshStatusBar() {
   const action = primaryAction();
   if (!action) {
@@ -1781,7 +1858,12 @@ function refreshStatusBar() {
     return;
   }
   setStatusBar({ step: action.step, message: action.message, kind: action.kind ?? "pending",
-    action: { label: action.label }, hint: action.hint ?? "", secondary: action.secondary ?? "" });
+    action: action.suppressed ? null : { label: action.label },
+    hint: action.hint ?? "", secondary: action.secondary ?? "",
+    // The recovery gesture needs a focused button: requestDevice requires a
+    // fresh user activation, so the Run click's activation is long expired by
+    // the time the device is in recovery.
+    focusAction: action.focus === true });
 }
 
 export async function loadAmonetArchive({ file = null, url = null, acquire = null } = {}) {

@@ -134,6 +134,39 @@ export async function requestDevice(mode) {
   return navigator.usb.requestDevice({ filters: table.filters });
 }
 
+/** Recovery's measured USB identity: [measured] TWRP presents 18d1:4ee2. */
+export const RECOVERY_USB_IDS = Object.freeze([{ vendorId: 0x18d1, productId: 0x4ee2 }]);
+
+/**
+ * WebUSB filter list for the recovery permission prompt.
+ *
+ * The operator has to press one button and then pick their Echo out of Chrome's
+ * list, so the list must be as short as possible — but it must not be able to
+ * match a DIFFERENT device, and it must never become unfiltered. `serialNumber`
+ * is a supported WebUSB filter key, so the narrow list names the exact device
+ * this run is about. `wide` drops only the serial (not the VID:PID) and is used
+ * when the narrow chooser is cancelled, because a device whose USB descriptor
+ * omits serialNumber can never match the narrow filter. It is never automatic:
+ * the caller must have seen a cancellation first, and the UI says so.
+ *
+ * Pure: no navigator access, no state. This decides what the operator sees.
+ */
+export function recoveryChooserFilters({ serial = null, wide = false } = {}) {
+  const declared = String(serial ?? "").trim();
+  if (!wide) {
+    return RECOVERY_USB_IDS.map(({ vendorId, productId }) => (
+      declared ? { vendorId, productId, serialNumber: declared } : { vendorId, productId }
+    ));
+  }
+  return RECOVERY_USB_IDS.map(({ vendorId, productId }) => ({ vendorId, productId }));
+}
+
+export async function requestRecoveryDevice({ serial = null, wide = false } = {}) {
+  const support = webusbSupport();
+  if (!support.ok) throw new Error(support.reason);
+  return navigator.usb.requestDevice({ filters: recoveryChooserFilters({ serial, wide }) });
+}
+
 export async function pairedDevices() {
   if (typeof navigator === "undefined" || !navigator.usb) return [];
   return navigator.usb.getDevices();

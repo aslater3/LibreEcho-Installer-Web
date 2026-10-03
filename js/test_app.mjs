@@ -293,10 +293,13 @@ test('first-use recovery permission is explicitly requested and serial-checked',
     close: async () => {} };
   const session = { device: usbDevice, client };
   await app.grantRecovery({
-    request: (mode) => { requested.push(mode); return Promise.resolve(usbDevice); },
+    // The chooser is now asked for narrow filters rather than a mode name, so the
+    // requested argument records the options the page actually passes.
+    request: (options) => { requested.push(options); return Promise.resolve(usbDevice); },
     openSession: async () => session,
   });
-  assert.deepEqual(requested, ['adb']);
+  assert.deepEqual(requested, [{ serial: 'TEST-DOT' }],
+    'the recovery chooser was not asked for the selected device by serial');
   assert.equal(app.state.recoverySerial, 'TEST-DOT');
   assert.equal(app.state.kaeruHeader, '8816885870b203004c4b000000000000');
 });
