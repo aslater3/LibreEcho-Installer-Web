@@ -28,6 +28,36 @@ a{color:var(--text)}
 .layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1.35fr);gap:1.5rem;align-items:start;padding:1.5rem 0 4rem}
 @media(max-width:1050px){.layout{grid-template-columns:1fr}}
 
+/* --- sticky status bar -----------------------------------------------------
+   The one surface that must always be visible: stage, plain-English message,
+   overall progress, and the single primary next action. Nothing important is
+   only in the log. */
+.status-bar-shell{position:sticky;top:0;z-index:40;background:linear-gradient(180deg,rgba(8,22,34,.98),rgba(8,22,34,.94));backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.status-bar{width:min(100% - 2.5rem,1240px);margin-inline:auto;padding:.7rem 0 .8rem;display:grid;gap:.4rem}
+.status-bar-line{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap}
+.status-bar-stage{font-family:var(--mono);font-size:.75rem;font-weight:800;letter-spacing:.08em;color:var(--cyan)}
+.status-bar-title{font-size:1rem;font-weight:800;letter-spacing:-.01em}
+.status-bar-message{margin:0;color:var(--muted);font-size:.9rem;line-height:1.45}
+.status-bar-track{display:block;height:.45rem;border-radius:999px;background:var(--line);overflow:hidden}
+.status-bar-fill{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--green),var(--cyan));transition:width .25s ease}
+.status-bar-action{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;margin-top:.15rem}
+.status-bar-action button{padding:.8rem 1.3rem;font-size:.95rem;box-shadow:0 6px 20px rgba(85,212,122,.18)}
+.status-bar-hint{font-size:.84rem;color:var(--muted)}
+.status-bar-secondary{font-size:.76rem;color:var(--muted);opacity:.85}
+.status-bar[data-kind=ok]{--bar-accent:var(--green)}
+.status-bar[data-kind=warn]{--bar-accent:var(--amber)}
+.status-bar[data-kind=bad]{--bar-accent:var(--red)}
+.status-bar[data-kind=action] .status-bar-message{color:#dff3e4;font-weight:650}
+.status-bar[data-kind=action] .status-bar-action button{animation:status-pulse 1.8s ease-in-out infinite}
+.status-bar[data-kind=bad] .status-bar-message{color:#ffc9c9}
+.status-bar[data-kind=ok] .status-bar-message{color:#cdefd6}
+@keyframes status-pulse{0%,100%{box-shadow:0 6px 20px rgba(85,212,122,.18)}50%{box-shadow:0 6px 26px rgba(91,168,255,.42)}}
+@media(prefers-reduced-motion:reduce){.status-bar[data-kind=action] .status-bar-action button{animation:none}}
+
+.visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.inline-details summary{cursor:pointer;font-size:.8rem;font-weight:750;color:#ffd9ac;padding:.2rem 0}
+.inline-details p{margin:.4rem 0;font-size:.85rem;color:#f0dcc2}
+
 .card{border:1px solid var(--line);border-radius:18px;background:linear-gradient(150deg,rgba(255,255,255,.05),rgba(255,255,255,.015));padding:1.25rem 1.35rem;margin-bottom:1.25rem}
 .card h2{font-size:1.05rem;margin:0 0 .8rem;letter-spacing:-.01em}
 .card p{margin:.35rem 0;color:var(--muted);font-size:.92rem}
@@ -55,6 +85,44 @@ input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events
 .capability-value{font-weight:750}
 .capability-note{color:var(--muted)}
 @media(max-width:700px){.capability-row{grid-template-columns:1fr;gap:.1rem}}
+.capability-summary{margin:.2rem 0;font-size:.92rem;font-weight:700}
+.capability-summary[data-state=ok]{color:var(--green)}
+.capability-summary[data-state=bad]{color:var(--red)}
+
+/* --- wizard step cards ----------------------------------------------------
+   One column, numbered, in run order. The active card is highlighted; a done
+   card collapses to its one-line summary so the column stays short. */
+.step-card{border-radius:16px;padding:1rem 1.15rem;transition:border-color .2s ease,box-shadow .2s ease}
+.step-card-head{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.step-card-head h2{margin:0;font-size:1rem}
+.step-card-number{display:inline-flex;align-items:center;justify-content:center;width:1.7rem;height:1.7rem;border-radius:999px;border:1px solid var(--line);font-family:var(--mono);font-size:.82rem;font-weight:800;color:var(--muted);flex:none}
+.step-card[data-state=active]{border-color:rgba(91,168,255,.75);box-shadow:0 0 0 1px rgba(91,168,255,.3),0 10px 26px rgba(8,22,34,.6)}
+.step-card[data-state=active] .step-card-number{border-color:var(--cyan);color:var(--cyan)}
+.step-card[data-state=done]{opacity:.82}
+.step-card[data-state=done] .step-card-number{border-color:rgba(85,212,122,.6);color:var(--green)}
+.step-card[data-state=failed]{border-color:rgba(255,122,122,.7);box-shadow:0 0 0 1px rgba(255,122,122,.25)}
+.step-badge{margin-left:auto;font-size:.68rem;font-weight:850;letter-spacing:.09em;text-transform:uppercase;padding:.16rem .55rem;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.step-badge[data-state=waiting]{color:var(--muted)}
+.step-badge[data-state=ready]{color:var(--cyan);border-color:rgba(91,168,255,.5)}
+.step-badge[data-state=done]{color:var(--green);border-color:rgba(85,212,122,.5)}
+.step-badge[data-state=failed]{color:var(--red);border-color:rgba(255,122,122,.5)}
+.step-card-summary{margin:.45rem 0 0;font-size:.88rem;color:var(--muted)}
+.step-card[data-state=active] .step-card-summary{color:var(--text)}
+/* Only a finished card collapses. A waiting/ready card keeps its controls
+   reachable — the selects and the Install buttons must never be hidden. */
+.step-card[data-state=done] .step-card-body,
+.step-card[data-state=done] .operator-callout{display:none}
+.step-card[data-state=done] .step-card-summary{margin:.3rem 0 0}
+.operator-callout{margin-top:.8rem;padding:.85rem 1rem;border:1px solid rgba(255,190,120,.55);border-radius:14px;background:rgba(255,190,120,.09);color:#ffd9ac;font-size:.9rem}
+.operator-callout[hidden]{display:none}
+.operator-callout strong{display:block;font-size:.95rem;margin-bottom:.25rem;color:#ffe3c4}
+
+/* Why Install is greyed out, as a bullet list of unmet prerequisites. */
+.prereq-wrap{margin-top:.7rem}
+.prereq-wrap[data-empty=true]{display:none}
+.prereq-head{margin:0 0 .3rem;font-size:.8rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.prereq-list{margin:0;padding-left:1.15rem;color:var(--amber);font-size:.86rem}
+.prereq-list li{margin:.15rem 0}
 
 .device-row{display:grid;grid-template-columns:11rem 1fr;gap:.5rem;font-size:.85rem;padding:.22rem 0;border-bottom:1px dotted rgba(41,64,82,.7)}
 .device-row span{color:var(--muted)}
@@ -72,6 +140,11 @@ input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events
 .terminal-head .dots i{width:.6rem;height:.6rem;border-radius:50%;background:var(--line);display:block}
 .terminal-head strong{font-size:.82rem;letter-spacing:.04em}
 .terminal-head button{margin-left:auto;font-size:.75rem;padding:.35rem .7rem}
+.terminal-head #download-log{margin-left:auto}
+.terminal-head #btn-log-toggle{margin-left:auto}
+/* The log is secondary: collapsible, and out of the way on a narrow page. */
+#terminal[hidden]{display:none}
+.terminal-card[data-collapsed=true]{opacity:.9}
 #terminal{list-style:none;margin:0;padding:.9rem 1rem;font-family:var(--mono);font-size:.82rem;line-height:1.55;height:min(62vh,620px);overflow-y:auto;background:#061220;scrollbar-width:thin}
 .term-line{white-space:pre-wrap;word-break:break-word}
 .term-out{color:#cfe0ee}
