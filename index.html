@@ -159,6 +159,10 @@
             <button id="btn-grant-recovery" class="ghost" type="button">Allow USB access to TWRP</button>
             <button id="btn-recovery-entry" class="ghost" type="button">My Echo is already in recovery</button>
           </div>
+          <p id="device-mode-choice"><strong>Which of these two is your Echo in?</strong> They are different USB modes and only one can work at a time — pressing the wrong one cannot answer.</p>
+          <p class="fine-print" id="choice-fastboot"><strong>Echo is in fastboot (first install)</strong> — the black bootloader screen saying “fastboot mode”. Press <strong>Query device (read-only fastboot)</strong> below.</p>
+          <p class="fine-print" id="choice-recovery"><strong>Echo is already in recovery</strong> — the TWRP screen with a big “Reboot” button. Press <strong>My Echo is already in recovery</strong> below. A device in TWRP cannot answer a fastboot query, and this page now says so instead of storing an empty identity.</p>
+          <p class="fine-print" id="device-mode-choice-done" hidden>Your Echo is identified, so step 3 needs nothing more from you. The two choices above apply only until a device is identified.</p>
           <p class="fine-print">Already unlocked and sitting in TWRP? <strong>My Echo is already in recovery</strong> reads the device's identity from recovery itself, so a reloaded page can still continue. It checks the TWRP version, the board and the Kaeru header in <code>expdb</code> before accepting anything, and it never sends an unlock payload. Choose the USB device named “Echo” in Chrome's list — there is no serial to narrow the list with yet, so every check is done from what the device itself reports.</p>
           <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
           <div id="device-panel" aria-live="polite"></div>

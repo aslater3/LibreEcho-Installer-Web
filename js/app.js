@@ -101,6 +101,8 @@ const dom = {
     recoveryEntry: document.getElementById("btn-recovery-entry"),
     connectAny: document.getElementById("btn-connect-any"),
   },
+  deviceModeChoice: document.getElementById("device-mode-choice"),
+  deviceModeChoiceDone: document.getElementById("device-mode-choice-done"),
 };
 
 export const terminal = new Terminal(dom.terminal, {
@@ -2451,6 +2453,20 @@ export function refreshControls() {
   // Once a device is identified it must be closed, so this can never replace or
   // race a fastboot query or an in-progress run.
   dom.buttons.recoveryEntry.disabled = busy || state.identity !== null || operationBusy;
+  // R4: with no identity there are exactly TWO possible states of the Echo —
+  // fastboot or recovery — and the operator could not tell which button to press.
+  // Two labelled choices say it plainly, and they retire once a device is
+  // identified because by then the question is answered. The USB permission
+  // grant is the exception: it only exists DURING the wait for TWRP, so it stays
+  // hidden the rest of the time rather than sitting there looking like a fourth
+  // choice.
+  if (dom.deviceModeChoice) dom.deviceModeChoice.hidden = state.identity !== null;
+  for (const id of ["choice-fastboot", "choice-recovery"]) {
+    const node = document.getElementById(id);
+    if (node) node.hidden = state.identity !== null;
+  }
+  if (dom.deviceModeChoiceDone) dom.deviceModeChoiceDone.hidden = state.identity === null;
+  if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.hidden = !state.recoveryWaiting;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
   refreshContinueFromTwrp();
