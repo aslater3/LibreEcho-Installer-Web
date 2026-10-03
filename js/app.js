@@ -1451,21 +1451,47 @@ async function claimRecoveryDevice(device, { expectedSerial, expectedBoard, iden
 }
 
 /**
- * True when a granted USBDevice is definitely NOT the selected device. The
- * USB descriptor's `serialNumber` is authoritative when present: a granted
- * Radar on the same origin must never be opened during a Biscuit's wait, because
- * two ADB opens on one USB interface is exactly the interleaved-CNXN failure the
- * serial filter exists to prevent. An empty or absent serialNumber cannot
- * exclude a candidate, so those still fall back to open-and-probe — the
- * ADB-reported serial check in claimRecoveryDevice remains the real gate.
+ * What a granted USBDevice's USB descriptor serial says about it being the
+ * selected device. The descriptor serial is a *narrowing hint*, never the
+ * acceptance gate — `validateRecoverySession`'s ADB-reported serial check
+ * (ro.serialno) stays authoritative, because the two values come from different
+ * sources.
+ *
+ * On this hardware the exclusion IS trusted: the TWRP USB descriptor's iSerial
+ * equals the fastboot `getvar serialno` value, both `G090L90964010665` for the
+ * same physical Echo (USB timeline 18d1:4ee2 / G090L90964010665). So a granted
+ * Radar on the same origin is skipped without ever being opened, which is what
+ * keeps a second ADB open off an unrelated device during a Biscuit's wait — two
+ * opens on one USB interface is exactly the interleaved-CNXN failure this filter
+ * prevents. Matching is trimmed and case-insensitive because iSerial formatting
+ * is not guaranteed to match fastboot's byte-for-byte.
+ *
+ * A blank or absent serialNumber cannot exclude anything, so it stays a
+ * candidate and falls back to open-and-probe.
  */
-function isForeignGrantedDevice(device, expectedSerial) {
+function deviceSerialVerdict(device, expectedSerial) {
   const declared = String(device?.serialNumber ?? "").trim();
-  return declared !== "" && declared !== expectedSerial;
+  if (declared === "") return "unknown";
+  const expected = String(expectedSerial ?? "").trim();
+  if (expected === "") return "unknown";
+  return declared.toUpperCase() === expected.toUpperCase() ? "match" : "mismatch";
 }
 
-/** Tries every already-granted device without ever opening a chooser. */
-async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch, grantedDevices, open, openSession, signal }) {
+/**
+ * Tries every already-granted device without ever opening a chooser.
+ *
+ * `mismatchProbe(device)` is the bounded escape hatch. Matching and blank-serial
+ * candidates are always probed; a descriptor-serial mismatch is not, because on
+ * this hardware the exclusion is sound (see deviceSerialVerdict). But if a whole
+ * wait has reached half its deadline without a single matching/blank candidate
+ * appearing, while a mismatching granted candidate exists, the descriptor serial
+ * is no longer allowed to decide the outcome on its own: that candidate is probed
+ * ONCE, with a masked warning, and the ADB-reported serial still decides whether
+ * it is accepted. This turns "silently skip the right device for the full
+ * countdown" into a bounded, logged probe.
+ */
+async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch,
+  grantedDevices, open, openSession, signal, mismatchProbe = null }) {
   // While the operator's permission chooser is open, the page owns the device
   // search. Polling in parallel is what produced two interleaved CNXN handshakes
   // on one interface; skip the whole round and let the grant resolve.
@@ -1483,7 +1509,7 @@ async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, ep
   if (!Array.isArray(devices) || devices.length === 0) return null;
   for (const device of devices) {
     if (signal?.aborted || isStopped() || isEpochStale(epoch)) throw new RecoveryStopped();
-    if (isForeignGrantedDevice(device, expectedSerial)) {
+    if (deviceSerialVerdict(device, expectedSerial) === "mismatch" && !mismatchProbe?.(device)) {
       // Descriptor-level mismatch: skip without opening, so an unrelated granted
       // device is never claimed and never disrupts the selected one's transport.
       terminal.line(`skipping a granted USB device that is not the selected serial (${device.vendorId}:${device.productId})`);
@@ -1536,6 +1562,23 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
   // to the poll interval.
   const countdownTimer = setInterval(() => paintRecoveryCountdown(deadline), 1000);
   let accepted = false;
+  // Bounded escape hatch for the descriptor-serial pre-filter. If the wait has
+  // burned half its deadline and no matching/blank-serial candidate has ever
+  // appeared, a mismatching granted candidate gets probed exactly once — per
+  // wait — with a masked warning. The ADB-reported serial remains the acceptance
+  // gate, so this can never accept a foreign device; it only stops a descriptor
+  // mismatch from skipping the RIGHT device silently for the whole countdown.
+  let sawProbeableCandidate = false;
+  let mismatchProbed = false;
+  const mismatchProbe = (device) => {
+    if (mismatchProbed || sawProbeableCandidate) return false;
+    if (Date.now() - (deadline - timeoutMs) < timeoutMs / 2) return false;
+    mismatchProbed = true;
+    terminal.warn(`the granted USB device ${device.vendorId}:${device.productId} reports serial ${maskSerial(device.serialNumber)}, `
+      + `not ${maskSerial(expectedSerial)}; probing it once anyway because the USB descriptor serial may not match the fastboot serialno. `
+      + `Only a matching ADB-reported serial is accepted.`);
+    return true;
+  };
   try {
     for (;;) {
       if (isStopped() || controller.signal.aborted || isEpochStale(epoch)) throw new RecoveryStopped();
@@ -1546,8 +1589,16 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
       }
       let claimed = null;
       try {
+        // Listed once here so the escape hatch can see the whole candidate set
+        // before the round decides what to open.
+        const devices = await grantedDevices();
+        if (Array.isArray(devices)) {
+          sawProbeableCandidate = sawProbeableCandidate
+            || devices.some((device) => deviceSerialVerdict(device, expectedSerial) !== "mismatch");
+        }
         claimed = await abortable(pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch,
-          grantedDevices, open, openSession, signal: controller.signal }), controller.signal);
+          grantedDevices: async () => devices, open, openSession, signal: controller.signal,
+          mismatchProbe }), controller.signal);
       } catch (error) {
         if (error instanceof RecoveryStopped) throw error;
         terminal.line(`recovery poll failed: ${error.message}`);
