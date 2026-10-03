@@ -1016,6 +1016,22 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
 // --- device ----------------------------------------------------------------
 
 export async function queryDevice({ any = false, open = openFastboot } = {}) {
+  // The page opens one USB connection at a time. Taken BEFORE any await and
+  // before the state reset below, so a refused query cannot invalidate an
+  // identity an in-flight ADB operation is still using.
+  // `shareWith: ["query"]` — a second query is superseded, not refused: the
+  // deviceQueryEpoch contract already makes the older one close its own session.
+  const releaseOperation = beginDeviceOperation("query", { shareWith: ["query"] });
+  if (!releaseOperation) return null;
+  try {
+    return await runDeviceQuery({ any, open });
+  } finally {
+    releaseOperation();
+  }
+}
+
+/** The body of `queryDevice`, with the page-wide USB slot already claimed. */
+async function runDeviceQuery({ any, open }) {
   // Never carry a previous unlock decision into a failed or superseded query.
   // This function also serves the run-owned query when no device is selected.
   const epoch = ++state.deviceQueryEpoch;
@@ -1168,6 +1184,79 @@ let recoveryWake = null;
 // a contender skips instead of queueing. The mutex stays as the final
 // serialisation point for the case where two owners disagree about a key.
 const recoveryClaims = new Map();
+
+/**
+ * ONE device operation in flight for the whole page.
+ *
+ * The per-device registry above cannot see the fastboot query at all: `queryDevice`
+ * opens a fastboot transport without ever claiming a recovery key, so a fastboot
+ * open and an ADB open could run against the same physical interface at once —
+ * the live 2026-10-03 interleaved-CNXN failure. Ownership has to be page-wide, not
+ * per-key, because the page has exactly one Echo.
+ *
+ * The guard is a plain token, never a queue: a contender refuses immediately with
+ * a terminal.warn and a status-bar message rather than waiting, because "wait,
+ * then open the same interface anyway" is precisely the race. It is taken before
+ * the first await of each entry point and released in a finally, so a refusal, a
+ * cancel, a timeout and a thrown transport error all free it.
+ *
+ * A token object rather than the kind alone, so a same-kind re-entry cannot have
+ * its release clear the newer holder's claim.
+ */
+let deviceOperation = null;
+
+/** Human-readable names, used in the refusal the operator reads. */
+const DEVICE_OPERATION_LABELS = {
+  query: "Query device",
+  entry: "My Echo is already in recovery",
+  grant: "Allow USB access to TWRP",
+  poll: "waiting for TWRP",
+};
+
+function describeOperation(kind) {
+  return DEVICE_OPERATION_LABELS[kind] ?? "another USB operation";
+}
+
+/** The kind of operation this page currently owns, or null. */
+function currentDeviceOperation() {
+  return deviceOperation?.kind ?? null;
+}
+
+/** True while this page owns its single USB operation slot. */
+function deviceOperationBusy() {
+  return deviceOperation !== null;
+}
+
+/**
+ * Claims the page's single USB operation slot.
+ *
+ * Returns a release function instead of throwing, so every caller can release it
+ * in its own `finally` without a try/catch dance. `null` is returned when a
+ * *different* operation already holds the slot — after warning the operator,
+ * which is the whole point of refusing rather than queueing.
+ *
+ * `shareWith` names kinds that may coexist with this one. Only `queryDevice` uses
+ * it: a second query is not a second USB owner, because the epoch contract
+ * (`state.deviceQueryEpoch`) already makes an older in-flight query close its
+ * own late session and throw "superseded" instead of binding. Two different
+ * operations, by contrast, have no such contract and would interleave.
+ */
+function beginDeviceOperation(kind, { shareWith = [] } = {}) {
+  if (deviceOperation && deviceOperation.kind !== kind && !shareWith.includes(deviceOperation.kind)) {
+    // Repaint the controls FIRST. The warning below is mirrored into the status
+    // bar by the terminal's onLine hook, and any repaint afterwards would
+    // overwrite that message with the generic stage text — so the refusal has to
+    // be the last thing this function does.
+    refreshControls();
+    terminal.warn(`${describeOperation(kind)} refused: ${describeOperation(deviceOperation.kind)} `
+      + "is already running on this page. Only one USB connection is opened at a time — "
+      + "wait for it to finish, then press this again.");
+    return null;
+  }
+  const token = { kind };
+  deviceOperation = token;
+  return () => { if (deviceOperation === token) deviceOperation = null; };
+}
 
 /**
  * Identity of a granted USBDevice for ownership purposes. The descriptor serial
@@ -1516,6 +1605,20 @@ export async function startFromRecovery({ request = null, open = openAdb } = {})
   if (state.identity) {
     throw new StageError("recovery", "a device is already identified; query the device in fastboot instead of replacing that identity");
   }
+  // Claimed before requestDevice: it must stay the first device action for the
+  // button's user activation, and no chooser may open while a fastboot query or
+  // an ADB poll already has this one USB interface.
+  const releaseOperation = beginDeviceOperation("entry");
+  if (!releaseOperation) return null;
+  try {
+    return await runRecoveryEntry({ request, open });
+  } finally {
+    releaseOperation();
+  }
+}
+
+/** The body of `startFromRecovery`, with the page-wide USB slot already claimed. */
+async function runRecoveryEntry({ request, open }) {
   if (state.recoveryGrantInFlight) {
     terminal.warn("a browser USB permission chooser is already open; finish that one first");
     return null;
@@ -1807,9 +1910,27 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
           sawProbeableCandidate = sawProbeableCandidate
             || devices.some((device) => deviceSerialVerdict(device, expectedSerial) !== "mismatch");
         }
-        claimed = await abortable(pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch,
-          grantedDevices: async () => devices, open, openSession, signal: controller.signal,
-          mismatchProbe }), controller.signal);
+        // One page-wide USB owner, per round. The claim is taken around the
+        // open+validate only and released every round, and it may coexist with a
+        // grant: the grant button is the operator's way INTO this wait, and the
+        // per-device claim registry below already refuses a grant whose device the
+        // poll is opening. Holding the slot for the whole countdown would make
+        // the only recovery from a stuck poll unavailable. A round refuses
+        // outright (no queue, no second open) when a fastboot query or a
+        // recovery entry currently owns the device; the next round retries
+        // cleanly once that owner is done.
+        const releaseOperation = beginDeviceOperation("poll", { shareWith: ["grant"] });
+        if (!releaseOperation) {
+          await recoverySleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())), controller.signal);
+          continue;
+        }
+        try {
+          claimed = await abortable(pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch,
+            grantedDevices: async () => devices, open, openSession, signal: controller.signal,
+            mismatchProbe }), controller.signal);
+        } finally {
+          releaseOperation();
+        }
       } catch (error) {
         if (error instanceof RecoveryStopped) throw error;
         terminal.line(`recovery poll failed: ${error.message}`);
@@ -1839,7 +1960,7 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
   }
 }
 
-export async function grantRecovery({ request = null, requestWide = null, open = openAdb, openSession = null, signal = null } = {}) {
+export async function grantRecovery(options = {}) {
   // Freeze the run identity, the generation and the abort token BEFORE any
   // await: the permission chooser must be the first device action so the click's
   // user activation stays valid, and a stop that lands while the chooser is open
@@ -1850,6 +1971,25 @@ export async function grantRecovery({ request = null, requestWide = null, open =
   if (state.running && !state.recoveryWaiting) {
     throw new StageError("recovery", "recovery permission can only be granted while the install is waiting for TWRP");
   }
+  // The page-wide slot, so a grant click can never race a fastboot query, a
+  // recovery entry or a second grant. Claimed after the gates above (which must
+  // still throw their own StageErrors) and before the chooser is opened.
+  // `shareWith: ["grant", "poll"]` — the grant button IS the operator's way into
+  // a poll's wait, and the per-device claim registry refuses the actual open when
+  // the poll already holds the device. Everything else refuses immediately.
+  const releaseOperation = beginDeviceOperation("grant", { shareWith: ["grant", "poll"] });
+  if (!releaseOperation) return null;
+  try {
+    return await runRecoveryGrant(options);
+  } finally {
+    releaseOperation();
+  }
+}
+
+/** The body of `grantRecovery`, with the page-wide USB slot already claimed. */
+async function runRecoveryGrant({ request = null, requestWide = null, open = openAdb,
+  openSession = null, signal = null } = {}) {
+  const identity = state.identity;
   const expectedSerial = identity.serialRaw;
   const expectedBoard = identity.profile.board;
   const epoch = state.recoveryEpoch;
@@ -2265,13 +2405,17 @@ export function refreshControls() {
   // The alternative device query stays closed during a run; the only recovery
   // action that opens is the dedicated permission grant, and only while the run
   // is actually waiting for TWRP.
-  dom.buttons.connect.disabled = running;
-  dom.buttons.connectAny.disabled = running;
-  dom.buttons.grantRecovery.disabled = busy && !state.recoveryWaiting;
+  // While any device operation is in flight, every control that would open a USB
+  // connection is disabled: the page owns one interface at a time, and a live
+  // button here is the affordance that produced the interleaved-handshake failure.
+  const operationBusy = deviceOperationBusy();
+  dom.buttons.connect.disabled = running || operationBusy;
+  dom.buttons.connectAny.disabled = running || operationBusy;
+  dom.buttons.grantRecovery.disabled = (busy && !state.recoveryWaiting) || operationBusy;
   // The recovery entry is only ever the answer to "no fastboot identity exists".
   // Once a device is identified it must be closed, so this can never replace or
   // race a fastboot query or an in-progress run.
-  dom.buttons.recoveryEntry.disabled = busy || state.identity !== null;
+  dom.buttons.recoveryEntry.disabled = busy || state.identity !== null || operationBusy;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
   refreshContinueFromTwrp();
