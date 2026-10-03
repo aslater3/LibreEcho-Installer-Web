@@ -2277,6 +2277,12 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     // invalidate any grant whose chooser may still be open.
     invalidateRecovery({ close: true });
     renderStepList(null);
+    // Repaint AFTER invalidate: setRunning(false) above repainted while the old
+    // state.adb was still bound, so on the "recovery accepted, then the install
+    // failed" path the "Continue from TWRP" control stayed hidden until some
+    // unrelated later repaint. The resume affordance depends on the
+    // post-invalidate state.
+    refreshControls();
   }
 }
 

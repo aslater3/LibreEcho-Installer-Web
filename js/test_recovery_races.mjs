@@ -526,6 +526,57 @@ test('"Continue from TWRP" is offered only after a latched unlock with no live s
   assert.equal(node.hidden, true, 'Continue from TWRP was offered for a latch belonging to another serial');
 });
 
+// F2: the control must be repainted by the run's own finally. setRunning(false)
+// repaints while the old state.adb is still bound, so on the "recovery accepted,
+// then the install failed" path the resume affordance stayed hidden until an
+// unrelated later repaint. Driving the real runInstall — rather than hand-setting
+// state — is what catches that.
+test('"Continue from TWRP" is visible straight after a post-recovery install failure', async () => {
+  setup();
+  const previous = globalThis.localStorage;
+  globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+  try {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const digest = await sha256Bytes(bytes);
+    await verifiedBuild();
+    app.state.identity = { ...app.state.identity, profile: { ...PROFILE, lkBuildMap: {
+      '63cb91b-20221007_072309': { payload: 'test.img', size: bytes.length, sha256: digest } } } };
+    app.state.payloadBytes = bytes;
+    app.state.payloadName = 'test.img';
+    // Unknown unlock outcome, so the page latch is what must carry the resume.
+    let flashes = 0;
+    app.state.fastboot = { client: { flash: async () => { flashes += 1; throw new Error('timeout after write'); } } };
+
+    // TWRP is accepted for the right serial, board and header; the install then
+    // fails later (the helper is pushed and the phase shells throw).
+    const twrp = {
+      async shell(command) {
+        if (command.includes('getprop')) return { stdout: '3.7.0_9-0\nbiscuit\nTEST-DOT\n' };
+        if (command.includes('uevent')) return { stdout: 'PARTNAME=expdb\n' };
+        if (command.includes('/size')) return { stdout: '20480\n' };
+        if (command.includes('od -An')) return { stdout: `${HEADER}\n` };
+        throw new Error('device stopped answering during the install phase');
+      },
+      async close() {},
+    };
+    const node = elements.get('btn-continue-twrp');
+
+    await app.runInstall({ dryRun: false, recovery: {
+      timeoutMs: 2000, intervalMs: 5,
+      grantedDevices: async () => [DEVICE],
+      open: async () => ({ device: DEVICE, client: twrp }),
+    } });
+
+    assert.equal(flashes, 1, 'the run never submitted the unlock payload');
+    assert.equal(app.state.unlockSubmitted, 'TEST-DOT', 'the page latch was not set');
+    assert.match(app.terminal.plainText(), /install stage failed|recovery stage failed/i);
+    assert.equal(app.state.adb, null, 'the finally did not drop the bound recovery session');
+    // No manual repaint here: this must be the finally's own refreshControls().
+    assert.equal(node.hidden, false,
+      'the resume affordance stayed hidden until an unrelated later repaint');
+  } finally { globalThis.localStorage = previous; }
+});
+
 // ---------------------------------------------------------------------------
 // Single ownership per USB device, and the descriptor-serial pre-filter
 //
