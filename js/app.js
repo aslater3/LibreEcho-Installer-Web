@@ -300,15 +300,19 @@ function installDoneSummary() {
  * The final state the operator is left in (issue 22: after the run there was no
  * clear "done" anywhere in the status bar). It says what actually happened, and
  * is explicit about what this page did NOT verify.
+ *
+ * That caveat belongs HERE, not at the one call site that published it: the
+ * run's `finally` block republishes the bar from installDoneMessage(), so a
+ * caveat added only to the DONE setStatusBar call is overwritten moments later
+ * and the operator is left reading a claim this page cannot back.
  */
 function installDoneMessage() {
-  if (state.provisionState === "delivered") {
-    const host = provisionHostname();
-    return host
-      ? `Configuration delivered — the Echo will join ${provisionSsid() || "your network"} and finish setup on first boot; open http://${host}.local:8080`
-      : "Configuration delivered — the Echo will join your network and finish setup on first boot; open its setup page at http://libreecho.local:8080";
-  }
-  return "Install finished and a reboot was requested. Open the setup page on the device; the running OS is not verified by this page.";
+  const outcome = state.provisionState === "delivered"
+    ? (provisionHostname()
+      ? `Configuration delivered — the Echo will join ${provisionSsid() || "your network"} and finish setup on first boot; open http://${provisionHostname()}.local:8080`
+      : "Configuration delivered — the Echo will join your network and finish setup on first boot; open its setup page at http://libreecho.local:8080")
+    : "Install finished and a reboot was requested. Open the setup page on the device.";
+  return `${outcome} The running OS is not verified by this page — confirm the device itself before calling it complete.`;
 }
 
 function provisionHostname() {
@@ -2782,9 +2786,12 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
   state.abort = false;
   state.stageProgress = {};
   state.receipts = [];
-  // A fresh run must not inherit the previous run's delivery verdict, and any
-  // secret left over from an earlier attempt is dropped before the new one.
-  clearProvisionSecrets();
+  // A fresh run must not inherit the previous run's delivery verdict. The
+  // step-5 form is NOT cleared here: it is read after finalize, so wiping the
+  // inputs at the start of the run would guarantee a NOT-delivered verdict for
+  // a form the operator deliberately filled in. Secrets are dropped at every
+  // other exit — Stop, page unload, and after delivery (clearProvisionSecrets
+  // with keepSummary).
   state.provisionState = state.provisionMode === "skip" ? "skipped" : "idle";
   state.provisionDetail = "";
   setRunning(true);
@@ -3042,7 +3049,7 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     // pending, so no primary action is offered. Issue 22 wanted an explicit
     // DONE state here rather than a silent, indistinguishable final screen.
     setStatusBar({ step: "install", kind: "ok", action: null,
-      message: `${installDoneMessage()} The running OS is not verified by this page — confirm the device itself before calling it complete.`,
+      message: installDoneMessage(),
       hint: "Done: the install ran to the end and a reboot was requested.",
       secondary: "The full log is beside the steps; use Save log to keep it." });
   } catch (error) {
