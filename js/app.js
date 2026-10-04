@@ -17,7 +17,7 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
+import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, requestRecoveryReboot, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
 import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
 import { PROFILES, payloadForProfile } from "./profiles.js";
 import {
@@ -171,6 +171,9 @@ export const state = {
   downloadedBundle: null,
   downloadTimer: null,
   recoveryWaiting: false,
+  // false only when this run had to ask for TWRP and the bootloader refused, so
+  // the page must not claim the Echo is restarting by itself.
+  recoveryRestartRequested: true,
   recoveryDeadline: null,
   recoveryAbort: null,
   recoveryGrantInFlight: false,
@@ -2507,7 +2510,9 @@ function primaryAction() {
         label: wide ? "Connect to your Echo (showing all)" : "Connect to your Echo in recovery",
         message: wide
           ? "Press this, then choose your Echo from the list. Chrome shows every Echo in recovery on this machine."
-          : "Your Echo is restarting. Press this once, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
+          : state.recoveryRestartRequested
+            ? "Your Echo is restarting. Press this once, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself."
+            : "Your Echo did not accept the restart request, so start TWRP on it yourself. Then press this once and choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
         hint: "It can take about 15 seconds to appear while it restarts — the list updates by itself, so wait if it is not there yet.",
         secondary: wide
           ? "Chrome asks for permission once per USB device. If this is not your Echo, press Stop."
@@ -2784,6 +2789,7 @@ function assertNotAborted(stage) {
 export async function runInstall({ dryRun = false, recovery = {} } = {}) {
   if (state.running || state.fetchingBundle) return;
   state.abort = false;
+  state.recoveryRestartRequested = true;
   state.stageProgress = {};
   state.receipts = [];
   // A fresh run must not inherit the previous run's delivery verdict. The
@@ -2899,6 +2905,15 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
       } else {
         terminal.ok("device is already unlocked; skipping the unlock stage");
         state.stageProgress.unlock = "skipped";
+        // The unlock payload is what normally restarts the Echo. With no payload to
+        // send, ask Kaeru for TWRP explicitly; otherwise nothing restarts it.
+        currentStage("recovery");
+        const restart = await requestRecoveryReboot({ client: state.fastboot?.client, terminal });
+        state.recoveryRestartRequested = restart.requested;
+        if (!restart.requested) {
+          terminal.warn(`could not restart your Echo into TWRP from here (${restart.reason}); `
+            + "start TWRP on the Echo yourself, then choose it in Chrome's list");
+        }
       }
       assertNotAborted("unlock");
       currentStage("recovery");
