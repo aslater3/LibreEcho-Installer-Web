@@ -36,6 +36,7 @@ export const STAGES = [
   { id: "initialize", title: "Initialize userdata (format once)" },
   { id: "transfer", title: "Transfer payloads to userdata" },
   { id: "finalize", title: "Finalize boot slots and features" },
+  { id: "configure", title: "Deliver the one-shot configuration" },
   { id: "verify", title: "Verify and reboot" },
 ];
 
