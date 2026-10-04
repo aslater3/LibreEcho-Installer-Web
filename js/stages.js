@@ -36,6 +36,7 @@ export const STAGES = [
   { id: "initialize", title: "Initialize userdata (format once)" },
   { id: "transfer", title: "Transfer payloads to userdata" },
   { id: "finalize", title: "Finalize boot slots and features" },
+  { id: "configure", title: "Deliver the one-shot configuration" },
   { id: "verify", title: "Verify and reboot" },
 ];
 
@@ -238,6 +239,41 @@ export function assessIdentity(identity, terminal, { selectedBoard = null } = {}
 // ---------------------------------------------------------------------------
 // Stage 4 — unlock
 // ---------------------------------------------------------------------------
+
+/**
+ * Ask an already-unlocked Echo sitting in fastboot to restart into TWRP.
+ *
+ * Kaeru (the unlocked LK on both supported Echos) implements the standard
+ * `reboot-recovery` target: it writes the `boot-recovery` command into the misc
+ * partition's bootloader message and resets, and LK consumes that command on the
+ * next boot. Nothing else is written, in particular not expdb, where Kaeru lives.
+ *
+ * Without this an unlocked device skips the unlock stage (whose payload is what
+ * normally restarts the Echo) and the page waits for a TWRP nothing asked for.
+ *
+ * @returns {Promise<{requested: boolean, reason?: string}>} requested=false means
+ *   the bootloader explicitly refused, so the operator must start TWRP by hand.
+ */
+export async function requestRecoveryReboot({ client, terminal }) {
+  if (!client || typeof client.reboot !== "function") {
+    return { requested: false, reason: "no fastboot connection to send the restart through" };
+  }
+  terminal?.command("fastboot reboot-recovery");
+  try {
+    await client.reboot("recovery");
+  } catch (error) {
+    const detail = String(error?.message ?? error);
+    // Only an explicit FAIL is a refusal. A reset racing the reply surfaces as a
+    // transfer or timeout error, which is the expected way this command ends.
+    if (error?.name === "FastbootFailError") {
+      terminal?.warn(`the bootloader refused reboot-recovery: ${detail}`);
+      return { requested: false, reason: detail };
+    }
+    terminal?.line(`the connection closed while restarting (${detail}); this is expected`);
+  }
+  terminal?.ok("restart into TWRP requested");
+  return { requested: true };
+}
 
 /**
  * Submits the fastbrick payload to `brick`. The community host scripts treat a

@@ -17,7 +17,7 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
+import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, requestRecoveryReboot, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
 import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
 import { PROFILES, payloadForProfile } from "./profiles.js";
 import {
@@ -38,6 +38,10 @@ import {
 import { discoverMirror, fetchReleaseBundle, fetchTargetsJson, createBundleStore } from "./auto-fetch.js";
 import { extractRecoveryMetadata } from "./recovery-metadata.js";
 import { formatSize, formatDuration, computeEta } from "./progress.js";
+import {
+  PROVISION_DEFAULTS, PROVISION_PATH,
+  validateProvision, deliverProvision,
+} from "./provision.js";
 
 const config = installerConfig();
 
@@ -85,6 +89,27 @@ const dom = {
   prereqList: document.getElementById("install-prereqs"),
   logCard: document.getElementById("log-card"),
   logToggle: document.getElementById("btn-log-toggle"),
+  provisionFormWrap: document.getElementById("provision-form-wrap"),
+  statusProvision: document.getElementById("status-provision"),
+  provision: {
+    modeSkip: document.getElementById("provision-mode-skip"),
+    modeFill: document.getElementById("provision-mode-fill"),
+    username: document.getElementById("provision-username"),
+    password: document.getElementById("provision-password"),
+    passwordConfirm: document.getElementById("provision-password-confirm"),
+    ssid: document.getElementById("provision-ssid"),
+    security: document.getElementById("provision-security"),
+    wifiPassword: document.getElementById("provision-wifi-password"),
+    hostname: document.getElementById("provision-hostname"),
+    volume: document.getElementById("provision-volume"),
+    volumeOutput: document.getElementById("provision-volume-output"),
+    wakeWord: document.getElementById("provision-wake-word"),
+    wakeSensitivity: document.getElementById("provision-wake-sensitivity"),
+    sensitivityOutput: document.getElementById("provision-sensitivity-output"),
+    localOnly: document.getElementById("provision-local-only"),
+    telemetry: document.getElementById("provision-telemetry"),
+    hostnamePreview: document.getElementById("provision-hostname-preview"),
+  },
   buttons: {
     refresh: document.getElementById("btn-refresh"),
     download: document.getElementById("btn-download"),
@@ -146,6 +171,9 @@ export const state = {
   downloadedBundle: null,
   downloadTimer: null,
   recoveryWaiting: false,
+  // false only when this run had to ask for TWRP and the bootloader refused, so
+  // the page must not claim the Echo is restarting by itself.
+  recoveryRestartRequested: true,
   recoveryDeadline: null,
   recoveryAbort: null,
   recoveryGrantInFlight: false,
@@ -165,12 +193,243 @@ export const state = {
   // the run would otherwise submit `brick` a second time against a device whose
   // unlock outcome is unknown. Never cleared by a run's `finally`.
   unlockSubmitted: null,
+  // Step 5 (optional one-shot configuration). `provisionMode` is "skip" by
+  // default, so an install never requires configuration. The collected form
+  // lives here ONLY — never in localStorage/sessionStorage/IndexedDB — and is
+  // wiped by clearProvisionSecrets() after delivery, on Stop, and on unload.
+  provisionMode: "skip",
+  provisionForm: null,
+  // "idle" | "skipped" | "delivered" | "failed" — the honest reportable state.
+  provisionState: "idle",
+  provisionDetail: "",
+  // Non-secret by design: both appear in the closing status message so the
+  // operator knows where to point a browser.
+  provisionHostname: null,
+  provisionSsid: null,
 };
 
 function setStatus(node, text, kind = "pending") {
   if (!node) return;
   node.textContent = text;
   node.dataset.state = kind;
+}
+
+// --- step 5: optional one-shot configuration -------------------------------
+//
+// The whole feature is optional and off by default. Nothing is persisted in the
+// browser: the form lives in `state.provisionForm` and in the input elements
+// only, and both are cleared once the run is over, on Stop, and on unload. The
+// only artefact that leaves the browser is one provision file, written by
+// deliverProvision() after finalize and before the reboot.
+
+const provisionInputs = [
+  "username", "password", "passwordConfirm", "ssid", "security", "wifiPassword",
+  "hostname", "volume", "wakeWord", "wakeSensitivity", "localOnly", "telemetry",
+];
+
+/** True when the operator has answered the step-5 question either way. */
+function provisionDecided() {
+  return state.provisionMode === "skip" || state.provisionState !== "idle";
+}
+
+/** The form as the validators and the document builder need it. */
+export function provisionForm() {
+  const node = dom.provision;
+  const value = (name, fallback = "") => {
+    const field = node?.[name];
+    return field?.value === undefined ? fallback : field.value;
+  };
+  const checked = (name) => node?.[name]?.checked === true;
+  return {
+    username: value("username").trim(),
+    password: value("password"),
+    passwordConfirm: value("passwordConfirm"),
+    ssid: value("ssid").trim(),
+    security: value("security", PROVISION_DEFAULTS.security),
+    wifiPassword: value("wifiPassword"),
+    hostname: value("hostname", PROVISION_DEFAULTS.hostname).trim(),
+    volume: value("volume", PROVISION_DEFAULTS.volume),
+    wakeWord: value("wakeWord", PROVISION_DEFAULTS.wake_word),
+    wakeSensitivity: value("wakeSensitivity", PROVISION_DEFAULTS.wake_sensitivity),
+    localOnly: checked("localOnly"),
+    telemetry: checked("telemetry"),
+  };
+}
+
+/** True when the collected form would be delivered as-is. */
+function provisionFormValid() {
+  return state.provisionMode === "skip" || validateProvision(provisionForm()).length === 0;
+}
+
+/** One line describing what step 5 currently means. */
+function provisionSummary() {
+  if (state.provisionState === "delivered") return "Configuration delivered — the Echo will apply it on first boot.";
+  if (state.provisionState === "failed") return "Configuration NOT delivered — set the Echo up on the device.";
+  if (state.provisionState === "skipped") return "Skipped — you will set it up on the device.";
+  if (state.provisionMode === "skip") return "Skipped — you will set it up on the device.";
+  const errors = validateProvision(provisionForm());
+  if (errors.length) return `${errors.length} field(s) still need attention before the install can carry this.`;
+  const form = provisionForm();
+  return form.ssid
+    ? `${form.hostname}.local · joins ${form.ssid} · admin ${form.username}`
+    : `${form.hostname}.local · admin ${form.username} (Wi-Fi set up on the device)`;
+}
+
+/** The status-bar line for step 5. */
+function provisionMessage() {
+  if (state.provisionState === "delivered") {
+    return "Your settings are on the device's userdata. It applies them itself on first boot — this page cannot confirm that it worked.";
+  }
+  if (state.provisionState === "failed") {
+    return `Your settings were NOT delivered (${state.provisionDetail || "unknown reason"}). The install itself is complete; set the Echo up on the device.`;
+  }
+  if (state.provisionMode === "skip") {
+    return "Nothing to do here — the Echo will run its own setup page on first boot. Change your mind and fill this in before pressing Run the install.";
+  }
+  const errors = validateProvision(provisionForm());
+  if (errors.length) return errors[0].message;
+  return "Configuration looks complete. It is written after the install finishes and before the reboot; the password is never stored by this page.";
+}
+
+/** Where the operator goes next, once the device is verified. */
+function installDoneSummary() {
+  if (state.provisionState === "delivered") return "Installed, configuration delivered, reboot requested.";
+  if (state.provisionState === "failed") return "Installed, reboot requested — configuration NOT delivered.";
+  if (state.provisionMode === "skip") return "Installed, reboot requested; set up on the device.";
+  return "Installed, reboot requested.";
+}
+
+/**
+ * The final state the operator is left in (issue 22: after the run there was no
+ * clear "done" anywhere in the status bar). It says what actually happened, and
+ * is explicit about what this page did NOT verify.
+ *
+ * That caveat belongs HERE, not at the one call site that published it: the
+ * run's `finally` block republishes the bar from installDoneMessage(), so a
+ * caveat added only to the DONE setStatusBar call is overwritten moments later
+ * and the operator is left reading a claim this page cannot back.
+ */
+function installDoneMessage() {
+  const outcome = state.provisionState === "delivered"
+    ? (provisionHostname()
+      ? `Configuration delivered — the Echo will join ${provisionSsid() || "your network"} and finish setup on first boot; open http://${provisionHostname()}.local:8080`
+      : "Configuration delivered — the Echo will join your network and finish setup on first boot; open its setup page at http://libreecho.local:8080")
+    : "Install finished and a reboot was requested. Open the setup page on the device.";
+  return `${outcome} The running OS is not verified by this page — confirm the device itself before calling it complete.`;
+}
+
+function provisionHostname() {
+  return state.provisionHostname ?? "";
+}
+
+function provisionSsid() {
+  return state.provisionSsid ?? "";
+}
+
+/** Paints the per-field error text under the step-5 form. */
+function renderProvisionErrors() {
+  const errors = validateProvision(provisionForm());
+  for (const field of provisionInputs) {
+    const node = document.getElementById(`provision-error-${field}`);
+    const message = errors.find((entry) => entry.field === field)?.message ?? "";
+    if (node) node.textContent = message;
+  }
+  if (dom.provisionFormWrap) {
+    dom.provisionFormWrap.dataset.invalid = errors.length ? "true" : "false";
+  }
+  return errors;
+}
+
+/** Keeps the derived outputs (percentages, hostname preview) in step. */
+function renderProvisionDerived() {
+  const node = dom.provision;
+  if (node?.volumeOutput) node.volumeOutput.textContent = `${node.volume?.value ?? PROVISION_DEFAULTS.volume}%`;
+  if (node?.sensitivityOutput) node.sensitivityOutput.textContent = `${node.wakeSensitivity?.value ?? PROVISION_DEFAULTS.wake_sensitivity}%`;
+  if (node?.hostnamePreview) {
+    const host = (node.hostname?.value ?? "").trim() || PROVISION_DEFAULTS.hostname;
+    node.hostnamePreview.textContent = `${host}.local`;
+  }
+}
+
+/**
+ * Wipes every secret this page held: the password/passphrase input values and
+ * the mirrored form object. The delivered hostname and SSID are NOT secrets —
+ * both are printed in the closing message on purpose — so they survive until
+ * that message is published, then are cleared with the rest.
+ */
+export function clearProvisionSecrets({ keepSummary = false } = {}) {
+  const node = dom.provision;
+  for (const name of ["password", "passwordConfirm", "wifiPassword"]) {
+    if (node?.[name]) node[name].value = "";
+  }
+  state.provisionForm = null;
+  if (!keepSummary) {
+    state.provisionSsid = null;
+    state.provisionHostname = null;
+  }
+}
+
+/** Reads the step-5 controls and repaints every derived part of the card. */
+export function onProvisionInput() {
+  state.provisionForm = null;
+  renderProvisionDerived();
+  const errors = renderProvisionErrors();
+  const decided = state.provisionMode === "fill" && errors.length === 0;
+  if (state.provisionMode === "skip") setStatus(dom.statusProvision, "will be set up on the device", "pending");
+  else setStatus(dom.statusProvision, decided ? "ready to install" : `${errors.length} field(s) to fix`,
+    decided ? "ok" : "warn");
+  renderStepCards();
+}
+
+/** Applies the skip/fill choice. Skipping clears every secret immediately. */
+export function setProvisionMode(mode) {
+  const next = mode === "fill" ? "fill" : "skip";
+  state.provisionMode = next;
+  if (dom.provisionFormWrap) dom.provisionFormWrap.hidden = next !== "fill";
+  if (next === "skip") {
+    clearProvisionSecrets();
+    state.provisionState = "skipped";
+    state.provisionDetail = "";
+    setStatus(dom.statusProvision, "will be set up on the device", "pending");
+  } else {
+    state.provisionState = "idle";
+    onProvisionInput();
+  }
+  renderStepCards();
+  return next;
+}
+
+/**
+ * The delivery step inside a run. Returns {delivered, detail} and NEVER throws:
+ * a failed delivery must not fail an otherwise complete install, and it must
+ * never be reported as success.
+ */
+async function deliverProvisionStep({ adb, release, target }) {
+  const form = provisionForm();
+  const errors = validateProvision(form);
+  if (errors.length) {
+    state.provisionState = "failed";
+    state.provisionDetail = errors[0].message;
+    terminal.error(`configuration not delivered: ${errors[0].message}`);
+    return { delivered: false, detail: errors[0].message };
+  }
+  try {
+    const result = await deliverProvision({ adb, form, release, target, terminal, isCancelled: () => state.abort });
+    state.provisionState = "delivered";
+    state.provisionDetail = "";
+    state.provisionHostname = form.hostname;
+    state.provisionSsid = form.ssid;
+    setStatus(dom.statusProvision, "delivered", "ok");
+    terminal.ok(`configuration delivered to ${PROVISION_PATH}; the device applies it on first boot`);
+    return { delivered: true, detail: result };
+  } catch (error) {
+    state.provisionState = "failed";
+    state.provisionDetail = error.message;
+    setStatus(dom.statusProvision, "NOT delivered", "warn");
+    terminal.error(`configuration NOT delivered: ${error.message}`);
+    terminal.info("the install itself is complete — set the Echo up on its own setup page; this page will not retry");
+    return { delivered: false, detail: error.message };
+  }
 }
 
 function renderStepList(activeId = null) {
@@ -221,9 +480,11 @@ function stageMessage(step) {
     case "unlock-payload":
       return state.payloadBytes ? `Unlock payload ${state.payloadName} is verified and ready.`
         : "This device is locked: select the pinned Amonet ZIP so the unlock stage has its verified payload.";
+    case "configure":
+      return provisionMessage();
     case "install":
       if (state.running) return "Install in progress. Watch the progress bar; do not unplug the device.";
-      if (state.stageProgress?.finalize === "done") return "Install finished and a reboot was requested. The running OS is not verified by this page.";
+      if (state.stageProgress?.finalize === "done") return installDoneMessage();
       return blocked ? `Install is not available yet: ${blocked}.` : "Everything is verified. Press Run the install.";
     default:
       return "Working…";
@@ -238,9 +499,10 @@ function stageMessage(step) {
 // sticky bar and the step cards can never disagree with each other or with the
 // log. Nothing important lives only in the terminal panel.
 
-// The five wizard steps, in the order the operator does them. `stage` maps a
+// The six wizard steps, in the order the operator does them. `stage` maps a
 // card to the STAGES entry that makes it active, so the run can highlight the
-// right card as it progresses.
+// right card as it progresses. Step 5 (configure) is optional: skipping it is a
+// first-class, valid outcome and never blocks the install.
 const WIZARD_STEPS = [
   { id: "device-build", title: "Device & build", summary: () => {
     const build = state.release?.tag;
@@ -257,10 +519,11 @@ const WIZARD_STEPS = [
   } },
   { id: "unlock-payload", title: "Unlock payload", summary: () => state.payloadBytes
     ? `${state.payloadName} verified and ready.` : "Not needed." },
+  { id: "configure", title: "Configure your device", summary: () => provisionSummary() },
   { id: "install", title: "Install", summary: () => {
     const blocked = installReadinessReason();
     if (state.running) return "Install in progress.";
-    if (state.stageProgress?.finalize === "done") return "Installed; reboot requested.";
+    if (state.stageProgress?.finalize === "done") return installDoneSummary();
     return blocked ? `Blocked: ${blocked}` : "Ready to run the install.";
   } },
 ];
@@ -270,6 +533,7 @@ const STEP_STAGE_MAP = {
   "download-verify": "release",
   "connect-device": "device",
   "unlock-payload": "unlock",
+  configure: "configure",
   install: "stage",
 };
 
@@ -318,6 +582,9 @@ function stepDone(id) {
   if (id === "download-verify") return state.bundleReady === true;
   if (id === "connect-device") return Boolean(state.identity);
   if (id === "unlock-payload") return Boolean(state.payloadBytes);
+  // Step 5 is done by a DECISION, not by a prerequisite: skipping is a complete,
+  // valid answer, so it must never leave the card "ready" and nagging.
+  if (id === "configure") return provisionDecided();
   return state.stageProgress?.finalize === "done" || installReadinessReason() === null;
 }
 
@@ -326,6 +593,7 @@ function stepReady(id) {
   if (id === "download-verify") return Boolean(state.board) && Boolean(state.release) && !state.bundleReady && !state.fetchingBundle;
   if (id === "connect-device") return Boolean(state.bundleReady) && !state.identity;
   if (id === "unlock-payload") return amonetRequirement().mode === "required" && !state.payloadBytes;
+  if (id === "configure") return provisionDecided() ? false : provisionFormValid();
   return state.identity ? installReadinessReason() === null : false;
 }
 
@@ -2242,7 +2510,9 @@ function primaryAction() {
         label: wide ? "Connect to your Echo (showing all)" : "Connect to your Echo in recovery",
         message: wide
           ? "Press this, then choose your Echo from the list. Chrome shows every Echo in recovery on this machine."
-          : "Your Echo is restarting. Press this once, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
+          : state.recoveryRestartRequested
+            ? "Your Echo is restarting. Press this once, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself."
+            : "Your Echo did not accept the restart request, so start TWRP on it yourself. Then press this once and choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
         hint: "It can take about 15 seconds to appear while it restarts — the list updates by itself, so wait if it is not there yet.",
         secondary: wide
           ? "Chrome asks for permission once per USB device. If this is not your Echo, press Stop."
@@ -2469,6 +2739,15 @@ export function refreshControls() {
   if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.hidden = !state.recoveryWaiting;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
+  // Step 5 is frozen during a run: the document is derived from these exact
+  // values after finalize, so changing them mid-run would deliver something the
+  // operator never saw validated.
+  const provisionLocked = running || state.stageProgress?.finalize === "done";
+  for (const name of provisionInputs) {
+    if (dom.provision[name]) dom.provision[name].disabled = provisionLocked;
+  }
+  if (dom.provision.modeSkip) dom.provision.modeSkip.disabled = provisionLocked;
+  if (dom.provision.modeFill) dom.provision.modeFill.disabled = provisionLocked;
   refreshContinueFromTwrp();
   refreshStatusBar();
 }
@@ -2510,8 +2789,17 @@ function assertNotAborted(stage) {
 export async function runInstall({ dryRun = false, recovery = {} } = {}) {
   if (state.running || state.fetchingBundle) return;
   state.abort = false;
+  state.recoveryRestartRequested = true;
   state.stageProgress = {};
   state.receipts = [];
+  // A fresh run must not inherit the previous run's delivery verdict. The
+  // step-5 form is NOT cleared here: it is read after finalize, so wiping the
+  // inputs at the start of the run would guarantee a NOT-delivered verdict for
+  // a form the operator deliberately filled in. Secrets are dropped at every
+  // other exit — Stop, page unload, and after delivery (clearProvisionSecrets
+  // with keepSummary).
+  state.provisionState = state.provisionMode === "skip" ? "skipped" : "idle";
+  state.provisionDetail = "";
   setRunning(true);
   terminal.phase(1, STAGES.length, dryRun ? "rehearsal: no writes" : "browser one-shot install");
   terminal.info(`release ${state.release?.tag ?? "(none)"} · repository ${config.repository}`);
@@ -2617,6 +2905,15 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
       } else {
         terminal.ok("device is already unlocked; skipping the unlock stage");
         state.stageProgress.unlock = "skipped";
+        // The unlock payload is what normally restarts the Echo. With no payload to
+        // send, ask Kaeru for TWRP explicitly; otherwise nothing restarts it.
+        currentStage("recovery");
+        const restart = await requestRecoveryReboot({ client: state.fastboot?.client, terminal });
+        state.recoveryRestartRequested = restart.requested;
+        if (!restart.requested) {
+          terminal.warn(`could not restart your Echo into TWRP from here (${restart.reason}); `
+            + "start TWRP on the Echo yourself, then choose it in Chrome's list");
+        }
       }
       assertNotAborted("unlock");
       currentStage("recovery");
@@ -2725,17 +3022,50 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     }
     state.stageProgress.finalize = "done";
 
+    // Step 5 delivery. Only here: after finalize returned result=installed, and
+    // before the reboot. It writes ONE file and can never format or re-format
+    // userdata, so a failure is reported without failing the install.
+    if (state.provisionMode === "fill") {
+      currentStage("configure");
+      const provisionTarget = profileForBoard(targetBoard)?.slug ?? null;
+      if (!provisionTarget) {
+        state.provisionState = "failed";
+        state.provisionDetail = `no provision target for board ${targetBoard}`;
+        terminal.error(`configuration NOT delivered: ${state.provisionDetail}`);
+      } else {
+        await deliverProvisionStep({ adb: state.adb, release: state.directRelease, target: provisionTarget });
+      }
+      state.stageProgress.configure = state.provisionState === "delivered" ? "done" : "skipped";
+      assertNotAborted("configure");
+    } else {
+      state.provisionState = "skipped";
+      state.stageProgress.configure = "skipped";
+      terminal.info("configuration skipped: the Echo will run its own setup page on first boot");
+    }
+
     currentStage("verify");
     terminal.phase(STAGES.length, STAGES.length, "verify and reboot");
     assertNotAborted("verify");
     await rebootAndWait({ adb: state.adb, target: "", terminal });
     terminal.warn("reboot requested; installed OS boot, userdata preservation and service readiness are NOT verified by this page");
+    if (state.provisionState === "delivered") {
+      terminal.info(`the configuration is on the device; it applies it on first boot. This page has NOT confirmed that it did — open the setup page on the device to check.`);
+    } else if (state.provisionMode === "skip") {
+      terminal.info("open the setup page on the device to finish setting it up");
+    } else {
+      terminal.warn("the configuration was NOT delivered — open the setup page on the device and set it up there");
+    }
     terminal.info("confirm the same device and its marker-free running image before calling the installation complete");
     state.stageProgress.verify = "done";
+    // Every secret this page held is dropped the moment it is no longer needed:
+    // the closing message keeps only the non-secret hostname/SSID.
+    clearProvisionSecrets({ keepSummary: true });
     // Success is republished to the bar too; the run is over and nothing is
-    // pending, so no primary action is offered.
+    // pending, so no primary action is offered. Issue 22 wanted an explicit
+    // DONE state here rather than a silent, indistinguishable final screen.
     setStatusBar({ step: "install", kind: "ok", action: null,
-      message: "Install finished and a reboot was requested. The running OS is not verified by this page — confirm the device itself before calling it complete.",
+      message: installDoneMessage(),
+      hint: "Done: the install ran to the end and a reboot was requested.",
       secondary: "The full log is beside the steps; use Save log to keep it." });
   } catch (error) {
     const stage = error instanceof StageError ? error.stage : "unknown";
@@ -2857,8 +3187,22 @@ dom.logToggle?.addEventListener("click", () => {
 });
 dom.buttons.abort?.addEventListener("click", () => {
   requestStop();
+  // Stop must not leave a password sitting in the form: the operator can press
+  // Run again, and a stopped run is exactly when the page is abandoned.
+  clearProvisionSecrets();
   terminal.warn("stop requested: a device wait is cancelled now; the current USB operation finishes, then the run stops before the next stage");
 });
+// Step 5 wiring. The mode radio is the default-deny control: "skip" is checked
+// in the markup, so a page that is never touched writes nothing.
+dom.provision.modeSkip?.addEventListener("change", () => setProvisionMode("skip"));
+dom.provision.modeFill?.addEventListener("change", () => setProvisionMode("fill"));
+for (const name of provisionInputs) {
+  dom.provision[name]?.addEventListener("input", onProvisionInput);
+  dom.provision[name]?.addEventListener("change", onProvisionInput);
+}
+// Reload and close must not leave a credential recoverable from this page.
+globalThis.addEventListener?.("pagehide", () => clearProvisionSecrets(), { once: true });
+globalThis.addEventListener?.("beforeunload", () => clearProvisionSecrets(), { once: true });
 document.getElementById("download-log")?.addEventListener("click", () => {
   const blob = new Blob([terminal.plainText()], { type: "text/plain" });
   const link = document.createElement("a");
@@ -2872,6 +3216,7 @@ terminal.info("LibreEcho browser installer — preview");
 terminal.info(`repository: ${config.repository}${config.mirrorBase ? ` · mirror: ${config.mirrorBase}` : ""}`);
 terminal.info("choose your device, then download the build made for it; nothing is downloaded automatically");
 renderBoardOptions();
+setProvisionMode("skip");
 setRunning(false);
 renderStepList(null);
 reportCapabilities()

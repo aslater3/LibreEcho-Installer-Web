@@ -16,7 +16,7 @@
 <div class="status-bar-shell">
   <div class="status-bar" id="status-bar" data-kind="pending" role="status" aria-live="polite">
     <div class="status-bar-line">
-      <span class="status-bar-stage" id="status-bar-stage">Step 1 of 5</span>
+      <span class="status-bar-stage" id="status-bar-stage">Step 1 of 6</span>
       <span class="status-bar-title" id="status-bar-title">Device &amp; build</span>
     </div>
     <p class="status-bar-message" id="status-bar-message">Choose your device to see the builds made for it.</p>
@@ -49,7 +49,7 @@
   <section class="installer-intro">
     <p class="eyebrow">Browser one-shot installer · preview</p>
     <h1>Install LibreEcho from the browser.</h1>
-    <p class="intro-lead">Five steps, in order, with one thing to do at a time. The status bar above always tells you what is happening now and what to press next.</p>
+    <p class="intro-lead">Six steps, in order, with one thing to do at a time. The status bar above always tells you what is happening now and what to press next.</p>
     <div class="preview-banner">
       <strong>Preview, not a supported install path.</strong>
       Read-only device query tested on hardware; unlock and install writes are not.
@@ -199,9 +199,109 @@
       </section>
 
       <!-- 5 -->
-      <section class="card step-card" id="card-install" data-step-card="install" data-state="waiting">
+      <section class="card step-card" id="card-configure" data-step-card="configure" data-state="waiting">
         <header class="step-card-head">
           <span class="step-card-number" aria-hidden="true">5</span>
+          <h2>Configure your device</h2>
+          <span class="step-badge" id="badge-configure" data-state="waiting">waiting</span>
+        </header>
+        <p class="step-card-summary" id="summary-configure">Skipped — you will set it up on the device.</p>
+        <div class="step-card-body">
+          <p>Optional. Fill this in and your Echo applies these settings itself on first boot. Leave it alone and the device runs its own setup page exactly as usual — installing never depends on this step.</p>
+          <fieldset class="provision-choice">
+            <legend>How do you want to set the Echo up?</legend>
+            <label class="radio-row">
+              <input type="radio" name="provision-mode" id="provision-mode-skip" value="skip" checked>
+              <span><strong>Skip — I'll set it up on the device.</strong> Recommended. Nothing is written; the Echo shows its own setup page on first boot.</span>
+            </label>
+            <label class="radio-row">
+              <input type="radio" name="provision-mode" id="provision-mode-fill" value="fill">
+              <span><strong>Configure it now from this page.</strong> The settings are written to the Echo's userdata and applied by the device's own daemon on first boot.</span>
+            </label>
+          </fieldset>
+          <div id="provision-form-wrap" hidden>
+            <h3>Administrator account</h3>
+            <p class="fine-print">The password is turned into the device's own stored hash in this browser. The plaintext never reaches the device and is not kept anywhere once the install finishes.</p>
+            <div class="field">
+              <label for="provision-username">Admin username</label>
+              <input id="provision-username" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="31" placeholder="lowercase letters, numbers, . _ -">
+              <p class="field-error" id="provision-error-username" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-password">Admin password</label>
+              <input id="provision-password" type="password" autocomplete="off" maxlength="128">
+              <p class="field-error" id="provision-error-password" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-password-confirm">Confirm admin password</label>
+              <input id="provision-password-confirm" type="password" autocomplete="off" maxlength="128">
+              <p class="field-error" id="provision-error-passwordConfirm" role="alert"></p>
+            </div>
+            <h3>Wi-Fi</h3>
+            <p class="fine-print">Leave the network name blank to keep the device's own network setup. This page cannot scan for networks and never stores a Wi-Fi password in the browser.</p>
+            <div class="field">
+              <label for="provision-ssid">Network name (SSID)</label>
+              <input id="provision-ssid" type="text" autocomplete="off" maxlength="32" placeholder="Leave blank to skip">
+              <p class="field-error" id="provision-error-ssid" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-security">Security</label>
+              <select id="provision-security">
+                <option value="wpa2">WPA2</option>
+                <option value="open">Open (no password)</option>
+              </select>
+              <p class="field-error" id="provision-error-security" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-wifi-password">Wi-Fi password</label>
+              <input id="provision-wifi-password" type="password" autocomplete="off" maxlength="63">
+              <p class="field-error" id="provision-error-wifiPassword" role="alert"></p>
+            </div>
+            <h3>Essentials</h3>
+            <div class="field">
+              <label for="provision-hostname">Hostname</label>
+              <input id="provision-hostname" type="text" autocomplete="off" maxlength="63" spellcheck="false" placeholder="libreecho">
+              <p class="fine-print">The Echo answers at <strong id="provision-hostname-preview">libreecho.local</strong></p>
+              <p class="field-error" id="provision-error-hostname" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-volume">Initial volume: <output id="provision-volume-output">64%</output></label>
+              <input id="provision-volume" type="range" min="0" max="100" value="64">
+              <p class="field-error" id="provision-error-volume" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-wake-word">Wake word</label>
+              <select id="provision-wake-word">
+                <option value="Alexa">Alexa</option>
+              </select>
+              <p class="fine-print">This image includes the Alexa wake model.</p>
+              <p class="field-error" id="provision-error-wakeWord" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-wake-sensitivity">Wake sensitivity: <output id="provision-sensitivity-output">68%</output></label>
+              <input id="provision-wake-sensitivity" type="range" min="0" max="100" value="68">
+              <p class="field-error" id="provision-error-wakeSensitivity" role="alert"></p>
+            </div>
+            <h3>Privacy</h3>
+            <div class="field field-check">
+              <label><input id="provision-local-only" type="checkbox" checked> Keep audio processing on the device only</label>
+              <p class="field-error" id="provision-error-localOnly" role="alert"></p>
+            </div>
+            <div class="field field-check">
+              <label><input id="provision-telemetry" type="checkbox"> Send diagnostic telemetry</label>
+              <p class="field-error" id="provision-error-telemetry" role="alert"></p>
+            </div>
+          </div>
+          <p class="status-line">Configuration: <span id="status-provision" class="pill" data-state="pending">will be set up on the device</span></p>
+          <p class="fine-print">Nothing here is written until the install finishes installing, and it is written as a single one-shot file that the device reads once on first boot. This page never writes the device's own config, user or Wi-Fi files, and it cannot mark setup complete — only the device does that after it has actually joined your network.</p>
+        </div>
+        <div class="operator-callout" id="callout-configure" hidden></div>
+      </section>
+
+      <!-- 6 -->
+      <section class="card step-card" id="card-install" data-step-card="install" data-state="waiting">
+        <header class="step-card-head">
+          <span class="step-card-number" aria-hidden="true">6</span>
           <h2>Install</h2>
           <span class="step-badge" id="badge-install" data-state="waiting">waiting</span>
         </header>
@@ -219,7 +319,7 @@
             <ul id="install-prereqs" class="prereq-list"></ul>
           </div>
           <details id="stage-list-details">
-            <summary>The 11 install stages and what each one verifies</summary>
+            <summary>The 12 install stages and what each one verifies</summary>
             <ol id="step-list" class="step-list"></ol>
             <ul>
               <li><strong>Release</strong> — both checksum inventories and the recovery ZIP/manifest are verified against the release API's digests before any write.</li>
@@ -229,6 +329,7 @@
               <li><strong>Recovery</strong> — TWRP's ADB serial must match the fastboot serial, and the Kaeru header in <code>expdb</code> must be intact before staging files.</li>
               <li><strong>Stage</strong> — only files that matched the API-anchored normal and TWRP checksum inventories are pushed and re-hashed on the device.</li>
               <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>
+              <li><strong>Configure</strong> — only if you filled in step 5: one <code>provision.json</code> is written to userdata atomically (owner-only, then renamed) after the install is complete and before the reboot. Nothing is logged and no password is stored in the browser.</li>
             </ul>
           </details>
         </div>
