@@ -324,7 +324,7 @@ export async function readKaeruHeader(adb) {
   if (!/^PARTNAME=expdb$/m.test(meta.stdout ?? "") || (sectors.stdout ?? "").trim() !== "20480") {
     throw new StageError("recovery", "expdb identity or geometry is not the pinned Kaeru partition");
   }
-  const bytes = await adb.shell("dd if=/dev/mmcblk0p7 bs=16 count=1 2>/dev/null | od -An -tx1");
+  const bytes = await adb.shell("dd if=/dev/block/mmcblk0p7 bs=16 count=1 2>/dev/null | od -An -tx1");
   const fields = (bytes.stdout ?? "").trim().split(/\s+/);
   if (fields.length !== 16 || fields.some((field) => !/^[0-9a-fA-F]{2}$/.test(field))) {
     throw new StageError("recovery", "cannot read the complete expdb Kaeru header");

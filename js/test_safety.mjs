@@ -308,6 +308,16 @@ test('Kaeru preflight returns an exact header for before/after comparison', asyn
   assert.equal(await stages.readKaeruHeader(adb), '8816885870b203004c4b000000000000');
 });
 
+test('Kaeru preflight reads expdb through /dev/block (TWRP has no /dev/mmcblk0p7)', async () => {
+  // [measured 2026-10-03, TWRP 3.7.0_9-0 on the Echo Dot] /dev/mmcblk0p7 does not
+  // exist; the node is /dev/block/mmcblk0p7. The old path made dd print nothing,
+  // so a healthy device was refused with "cannot read the complete expdb Kaeru header".
+  const adb = { shell: async (command) => ({ stdout: command.includes('uevent') ? 'PARTNAME=expdb\n'
+    : command.includes('/size') ? '20480\n'
+      : command.includes('if=/dev/block/mmcblk0p7 ') ? '88 16 88 58 70 b2 03 00 4c 4b 00 00 00 00 00 00\n' : '' }) };
+  assert.equal(await stages.readKaeruHeader(adb), '8816885870b203004c4b000000000000');
+});
+
 test('recovery wait rejects another granted USB device even when it says TWRP', async () => {
   let closed = 0;
   const session = { client: { shell: async () => ({ stdout: '3.7.0_9-0\nbiscuit\nOTHER-DEVICE\n' }), close: async () => { closed += 1; } } };
