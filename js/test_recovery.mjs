@@ -105,6 +105,9 @@ function setup() {
   app.state.directManifestSha = null;
   app.state.directRoles = null;
   app.state.directTransferTotal = null;
+  // Page-session unlock latch: reset between tests exactly like the other
+  // per-session fields, so one test's submitted unlock cannot leak into the next.
+  app.state.unlockSubmitted = null;
 }
 
 const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -450,6 +453,88 @@ test('a standalone recovery grant is not blocked by a stale stop flag from an ea
   const granted = await app.grantRecovery({ request: () => Promise.resolve(DEVICE), open: async () => session });
   assert.equal(granted?.client, session.client);
   assert.equal(app.state.recoverySerial, 'TEST-DOT');
+});
+
+// ---------------------------------------------------------------------------
+// The 10-minute recovery deadline, the visible countdown, and the unlock latch
+// ---------------------------------------------------------------------------
+
+test('the recovery wait defaults to ten minutes and shows a countdown', async () => {
+  assert.equal(app.RECOVERY_TIMEOUT_MS, 600000, 'the recovery deadline is not ten minutes');
+  assert.equal(app.RECOVERY_TIMEOUT_MS, stages.RECOVERY_TIMEOUT_MS,
+    'the page wait and the shared constant have drifted apart');
+  assert.equal(stages.RECOVERY_TIMEOUT_MS, 600000);
+  // 180 s expired while a healthy TWRP waited on a human in Chrome's chooser.
+  assert.ok(app.RECOVERY_TIMEOUT_MS > 180000, 'the deadline was not lengthened past three minutes');
+
+  assert.equal(app.formatCountdown(9 * 60 * 1000 + 58000), '9:58');
+  assert.equal(app.formatCountdown(45000), '45s');
+  assert.equal(app.formatCountdown(0), '0s');
+  assert.equal(app.formatCountdown(-5), '0s', 'a negative remainder rendered as a real time');
+
+  setup();
+  const promise = app.awaitRecovery({ terminal: quiet, timeoutMs: 400, intervalMs: 10,
+    grantedDevices: async () => [], open: async () => { throw new Error('must not open'); } });
+  await tick(40);
+  assert.equal(app.state.recoveryWaiting, true);
+  assert.match(elements.get('recovery-countdown').textContent, /^\d+(:\d\d|s) left$/,
+    'no countdown is visible while the page waits for TWRP');
+  await assert.rejects(promise, /timed out|TWRP/i);
+  assert.equal(elements.get('recovery-countdown').textContent, '',
+    'the countdown survived the end of the wait');
+});
+
+test('the unlock latch is set before flash:brick leaves the host', async () => {
+  setup();
+  const previous = globalThis.localStorage;
+  const bytes = new Uint8Array([1, 2, 3]);
+  const { sha256Bytes } = await import('./sha256.js');
+  const pinned = { ...PROFILE, lkBuildMap: { '63cb91b-20221007_072309': {
+    payload: 'test.img', size: bytes.length, sha256: await sha256Bytes(bytes) } } };
+  const base = { profile: pinned, lkBuild: '63cb91b-20221007_072309', payloadBytes: bytes,
+    payloadName: 'test.img', serialRaw: 'TEST-DOT', terminal: quiet };
+  const freshStorage = () => {
+    const entries = new Map();
+    globalThis.localStorage = { getItem: (key) => entries.get(key) ?? null,
+      setItem: (key, value) => entries.set(key, value) };
+  };
+  try {
+    // The decisive property: `onSubmit` must have run BEFORE `flash` is called, so
+    // a synchronous throw, an exception or a timeout from the transport all leave
+    // the latch set. Reading the latch only after the await would pass even if the
+    // production code latched afterwards, which is precisely the bug.
+    freshStorage();
+    let latched = null;
+    let latchedWhenFlashed = null;
+    const outcome = await stages.submitUnlockPayload({ ...base,
+      client: { flash: async () => { latchedWhenFlashed = latched; throw new Error('timeout after write'); } },
+      onSubmit: (serial) => { latched = serial; } });
+    assert.equal(outcome.outcome, 'unknown');
+    assert.equal(latchedWhenFlashed, 'TEST-DOT', 'flash:brick was called before the latch was set');
+    assert.equal(latched, 'TEST-DOT');
+
+    // A synchronous throw (not even a rejected promise) must still latch. The
+    // stage reports it as an unknown outcome rather than propagating, so the
+    // assertion is on the latch seen from inside the client.
+    freshStorage();
+    let thrownLatched = null;
+    let seen = 'never';
+    const outcome1 = await stages.submitUnlockPayload({ ...base,
+      client: { flash: () => { seen = String(thrownLatched); throw new Error('transport died'); } },
+      onSubmit: (serial) => { thrownLatched = serial; } });
+    assert.equal(seen, 'TEST-DOT', 'a synchronous flash failure skipped the latch');
+    assert.equal(outcome1.outcome, 'unknown');
+
+    // A latch callback that throws must never block the write it protects.
+    freshStorage();
+    const outcome2 = await stages.submitUnlockPayload({ ...base,
+      client: { flash: async () => { throw new Error('timeout after write'); } },
+      onSubmit: () => { throw new Error('latch bookkeeping exploded'); } });
+    assert.equal(outcome2.outcome, 'unknown');
+
+    // The page latch is only set by runInstall, never by a direct stage call.
+    assert.equal(app.state.unlockSubmitted, null, 'a direct stage call touched page state');
+  } finally { globalThis.localStorage = previous; }
 });
 
 

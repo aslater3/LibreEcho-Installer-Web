@@ -65,6 +65,22 @@ export class RecoveryStopped extends StageError {
 }
 
 /**
+ * How long a recovery wait tolerates TWRP not appearing, in milliseconds.
+ *
+ * Ten minutes, not three: the operator may have to reboot the device by hand and
+ * then find Chrome's device chooser, so a human is inside this deadline. A short
+ * deadline expired against a perfectly healthy TWRP that was simply waiting to be
+ * granted. The wait stays bounded and shows a visible countdown, and a timeout
+ * after a submitted unlock is recoverable in-page (see `state.unlockSubmitted`)
+ * rather than by reloading the page and losing every verified artifact.
+ *
+ * Both recovery waits read this one constant so the page and the standalone
+ * helper cannot drift apart again.
+ */
+export const RECOVERY_TIMEOUT_MS = 10 * 60 * 1000;
+export const RECOVERY_POLL_INTERVAL_MS = 4000;
+
+/**
  * Serialises recovery claims. A background poll and a user-granted permission
  * chooser must never open the same USB interface at the same time, so both run
  * their open/validate step through one lock.
@@ -183,7 +199,18 @@ export async function readFastbootIdentity(client, terminal) {
   return identity;
 }
 
-export function assessIdentity(identity, terminal) {
+/**
+ * Assesses a fastboot identity for the gates that must hold before any write.
+ *
+ * `selectedBoard` is the board of the build actually selected for installation
+ * (the resolved target or verified build metadata). It is null when no build has
+ * been chosen yet, which is the "device only" case: nothing about the build can
+ * be concluded, so no build-vs-device warning is made. A Biscuit-targeted build on
+ * a Biscuit device therefore produces no warning at all — warning on every Biscuit
+ * regardless of the selected build was misleading, because the real block for a
+ * wrong build is the board-mismatch check in runInstall.
+ */
+export function assessIdentity(identity, terminal, { selectedBoard = null } = {}) {
   const findings = [];
   if (!identity.serialRaw) findings.push("fastboot serialno is missing; cannot bind recovery to this device");
   if (!identity.profile) {
@@ -192,9 +219,11 @@ export function assessIdentity(identity, terminal) {
     );
   } else {
     terminal?.ok(`recognised target: ${identity.profile.marketing} (${identity.profile.board})`);
-    if (identity.profile.id === "biscuit") {
+    const board = String(selectedBoard ?? "").trim();
+    if (board && !boardMatches(board, identity.profile.board)) {
       terminal?.warn(
-        "Biscuit requires a Biscuit-targeted published build; a Radar image is experimental, not an install target.",
+        `the selected build targets ${board}, but this device reports ${identity.profile.board}; `
+        + "install is blocked until you choose the build for this device.",
       );
     }
   }
@@ -216,7 +245,7 @@ export function assessIdentity(identity, terminal) {
  * while the payload runs. That ambiguity is surfaced, never retried silently:
  * a timeout is reported as an unknown outcome, which is a stop condition.
  */
-export async function submitUnlockPayload({ client, profile, lkBuild, payloadBytes, payloadName, serialRaw, terminal }) {
+export async function submitUnlockPayload({ client, profile, lkBuild, payloadBytes, payloadName, serialRaw, terminal, onSubmit = null }) {
   if (!profile) throw new StageError("unlock", "device is not a recognised LibreEcho target");
   const selection = payloadForProfile(profile, lkBuild);
   if (!selection || !selection.sha256 || !Number.isSafeInteger(selection.size)) {
@@ -232,16 +261,38 @@ export async function submitUnlockPayload({ client, profile, lkBuild, payloadByt
   if (!serialRaw || typeof localStorage === "undefined") {
     throw new StageError("unlock", "persistent device-bound unlock attempt storage is unavailable");
   }
-  const key = `libreecho.unlock.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${profile.id}:${digest}`))}`;
+  // Two durable guards, both written and checked in the same fail-closed block.
+  //
+  // The digest key keeps the guard precise: exactly this payload for this device
+  // has already been sent.
+  //
+  // The serial key is the coarse backstop the page-session latch cannot provide:
+  // the latch lives in memory, so a reload loses it, while a partially applied
+  // flash:brick writes lk_b and can bring the device back to fastboot LOCKED
+  // reporting a DIFFERENT lk_build_desc. A different build means a different
+  // digest means a different digest key — which would let flash:brick go out a
+  // second time. The serial key cannot be re-keyed by anything the device does,
+  // and it is scoped to one serial, so a different device is unaffected.
+  const digestKey = `libreecho.unlock.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${profile.id}:${digest}`))}`;
+  const serialKey = `libreecho.unlock.sent.${await sha256Bytes(new TextEncoder().encode(String(serialRaw)))}`;
   try {
-    if (localStorage.getItem(key)) throw new StageError("unlock", "unlock attempt already submitted; do not re-submit");
+    if (localStorage.getItem(digestKey) || localStorage.getItem(serialKey)) {
+      throw new StageError("unlock", "unlock attempt already submitted; do not re-submit");
+    }
     // Persist BEFORE sending, because a disconnect, new tab or reload has an unknown outcome.
-    localStorage.setItem(key, "submitted-or-unknown");
+    localStorage.setItem(digestKey, "submitted-or-unknown");
+    localStorage.setItem(serialKey, "submitted-or-unknown");
   } catch (error) {
     if (error instanceof StageError) throw error;
     throw new StageError("unlock", "cannot persist the single-submission guard");
   }
   terminal?.command(`fastboot flash brick <${selection.payload}>`);
+  // Latch BEFORE the write, not after it. Every failure mode of `flash` leaves an
+  // unknown outcome — including a synchronous throw from the client — so a latch
+  // taken after the await would be skipped exactly when it matters most, and a
+  // second Run would submit `brick` again against a device whose unlock state is
+  // unknown. The caller's latch must be set before any byte can leave the host.
+  try { onSubmit?.(serialRaw); } catch { /* the latch must never block the write it protects */ }
   try {
     // Single whole-image download, never chunk this AMNT payload into buffers.
     await client.flash("brick", payloadBytes, {
@@ -273,7 +324,7 @@ export async function readKaeruHeader(adb) {
   if (!/^PARTNAME=expdb$/m.test(meta.stdout ?? "") || (sectors.stdout ?? "").trim() !== "20480") {
     throw new StageError("recovery", "expdb identity or geometry is not the pinned Kaeru partition");
   }
-  const bytes = await adb.shell("dd if=/dev/mmcblk0p7 bs=16 count=1 2>/dev/null | od -An -tx1");
+  const bytes = await adb.shell("dd if=/dev/block/mmcblk0p7 bs=16 count=1 2>/dev/null | od -An -tx1");
   const fields = (bytes.stdout ?? "").trim().split(/\s+/);
   if (fields.length !== 16 || fields.some((field) => !/^[0-9a-fA-F]{2}$/.test(field))) {
     throw new StageError("recovery", "cannot read the complete expdb Kaeru header");
@@ -331,12 +382,22 @@ export function boardMatches(observed, expected) {
 }
 
 /**
+ * @deprecated Not used by the page. The install's recovery wait is
+ * `awaitRecovery` in app.js, which polls already-granted devices through
+ * `pollGrantedRecovery` with the descriptor-serial pre-filter, the single-owner
+ * claim registry and the 10-minute `RECOVERY_TIMEOUT_MS` deadline. This helper
+ * has none of those: it calls `reattachAdb`, which opens EVERY granted device and
+ * shells `getprop ro.serialno` — reintroducing verbatim the defect the page's
+ * poll path removes (a second ADB open on an unrelated granted device, which is
+ * the interleaved-CNXN failure). Kept exported only because
+ * js/test_safety.mjs still imports it; do not add a production caller.
+ *
  * Waits for a previously authorised TWRP device over ADB. A changed USB
  * identity may require a separate user-gesture permission grant. This helper
  * never opens a chooser from its polling loop. The wait
  * is cancellable: `signal` (an AbortSignal) or `isCancelled()` stops it promptly.
  */
-export async function waitForRecovery({ timeoutMs = 180000, intervalMs = 4000, terminal,
+export async function waitForRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalMs = RECOVERY_POLL_INTERVAL_MS, terminal,
   adbDevice = null, expectedSerial = "", expectedBoard = "", openSession = null,
   signal = null, isCancelled = null } = {}) {
   const { reattachAdb } = await import("./transports.js");

@@ -81,10 +81,70 @@ export async function protocolSupport() {
   };
 }
 
+// Every vendor bulk pair — fastboot AND adbd — uses class 0xFF, so the class
+// alone cannot tell the two protocols apart. The subclass 0x42 does, together
+// with the alternate's protocol byte: 0x01 is ADB, 0x03 is fastboot. [measured]
+// on this hardware: LibreEcho's own adbd presents 0xff/0x42/0x01, and fastboot
+// presents 0xff/0x42/0x03.
+const VENDOR_SPECIFIC_CLASS = 0xff;
+const ANDROID_USB_SUBCLASS = 0x42;
+const ADB_PROTOCOL = 0x01;
+
+/**
+ * The descriptor alternate the transport actually claimed, read back from the
+ * open device. `alternateSetting` may be missing from a fake or a future
+ * descriptor, so an unmatched alternateSetting falls back to the interface's
+ * first alternate rather than silently concluding "unknown".
+ */
+function claimedAlternate(device, interfaceNumber, alternateSetting) {
+  for (const iface of device?.configuration?.interfaces ?? []) {
+    if (iface.interfaceNumber !== interfaceNumber) continue;
+    const alternates = iface.alternates ?? [];
+    return alternates.find((alternate) => alternate.alternateSetting === alternateSetting)
+      ?? alternates[0] ?? null;
+  }
+  return null;
+}
+
+/** True when the claimed interface speaks ADB rather than fastboot. */
+function isAdbAlternate(alternate) {
+  return alternate?.interfaceClass === VENDOR_SPECIFIC_CLASS
+    && alternate.interfaceSubclass === ANDROID_USB_SUBCLASS
+    && alternate.interfaceProtocol === ADB_PROTOCOL;
+}
+
+/**
+ * A StageError-shaped error raised from the transport layer.
+ *
+ * `stages.js` imports this module, so importing StageError back would be a
+ * cycle. The name/stage pair is all the page actually reads: `runInstall` keys
+ * its failure message off `error.stage`, and `queryDevice`'s catch resets the
+ * same state for any error.
+ */
+function stageError(stage, message) {
+  const error = new Error(message);
+  error.name = "StageError";
+  error.stage = stage;
+  return error;
+}
+
+/** The one message the operator needs when the Echo is in TWRP, not fastboot. */
+export const RECOVERY_NOT_FASTBOOT_MESSAGE =
+  "this Echo is in recovery (ADB), not fastboot — use “My Echo is already in recovery”";
+
 /**
  * Opens a fastboot session. Without a device the transport prompts the operator
  * through the browser's own device chooser; with one it attaches directly.
  * `any: true` uses an unfiltered chooser, for an identity not in the table.
+ *
+ * A device in TWRP answers on an ADB bulk pair, which `findFastbootInterface`
+ * accepts happily because it is a vendor-class interface with two bulk
+ * endpoints — so without this check a fastboot query claims the recovery
+ * interface, every `getvar` times out, and the page looks like a broken
+ * fastboot device rather than a device in the wrong mode. The claimed
+ * interface's alternate is therefore inspected after the transport opens: an
+ * ADB protocol byte releases the interface, closes the device and refuses,
+ * naming the entry that works instead.
  */
 export async function openFastboot({ device = null, onLog, any = false } = {}) {
   const support = await protocolSupport();
@@ -100,36 +160,100 @@ export async function openFastboot({ device = null, onLog, any = false } = {}) {
   } else {
     transport = await TransportClass.open(fastbootFilters("fastboot"));
   }
+  const handle = transport.device ?? device;
+  const claimed = claimedAlternate(handle, transport.interfaceNumber, transport.alternateSetting);
+  if (isAdbAlternate(claimed)) {
+    if (onLog) {
+      onLog(`interface ${transport.interfaceNumber} is ADB (0x42/0x01), not fastboot; releasing it untouched`);
+    }
+    // Release the interface and the raw handle before refusing: leaving the
+    // recovery interface claimed is what would break the recovery entry the
+    // message points the operator at.
+    await releaseUsbInterface(transport, handle);
+    throw stageError("device", RECOVERY_NOT_FASTBOOT_MESSAGE);
+  }
   const client = new support.fastboot.value(transport, {
     onInfo: (line) => onLog && onLog(`fastboot: ${line}`),
   });
-  if (onLog) onLog(`fastboot interface claimed on ${transport.device?.vendorId ?? "?"}:${transport.device?.productId ?? "?"}`);
-  return { device: transport.device ?? device, transport, client };
+  if (onLog) onLog(`fastboot interface claimed on ${handle?.vendorId ?? "?"}:${handle?.productId ?? "?"}`);
+  return { device: handle, transport, client };
 }
 
-/** Opens an ADB session, prompting for the device when one is not supplied. */
-export async function openAdb({ device = null, onLog, any = false } = {}) {
-  const support = await protocolSupport();
-  if (!support.adb.ok) throw new Error(support.adb.reason);
-  if (!support.adbTransport.ok) throw new Error(support.adbTransport.reason);
-  const TransportClass = support.adbTransport.value;
-  let transport;
-  if (device) {
-    transport = await new TransportClass(device, {}).open();
-  } else if (any) {
-    const chosen = await promptAnyDevice({ onLog });
-    transport = await new TransportClass(chosen, {}).open();
-  } else {
-    transport = await TransportClass.requestDevice({ filters: adbFilters() });
+/**
+ * Fully releases a USB interface, whatever stage of the open failed.
+ *
+ * A CNXN/AUTH timeout — or a `transport.open()` that throws after
+ * `device.open()` already succeeded — leaves the USBDevice open and the
+ * interface claimed even though `openAdb` throws and hands back no session. If
+ * that is not released, the next attempt inherits a half-open transport on the
+ * same USB interface and its two handshakes interleave — the observed
+ * "waiting for CNXN/AUTH" / "no more data from the device" failure.
+ *
+ * Both arms are attempted, never short-circuited: the transport's own close
+ * swallows `releaseInterface`/`device.close()` errors internally, so returning
+ * on success would leave a device it failed to release still open. The raw
+ * handle is therefore closed too, and an interface number that was claimed
+ * before the failure is released explicitly.
+ */
+async function releaseUsbInterface(transport, device) {
+  const handle = transport?.device ?? device;
+  try {
+    await (transport?.close?.());
+  } catch { /* device already gone; still try the raw handle below */ }
+  const interfaceNumber = transport?._interfaceNumber;
+  if (interfaceNumber != null) {
+    try { await handle?.releaseInterface?.(interfaceNumber); } catch { /* device already gone */ }
   }
-  const client = new support.adb.value(transport);
-  const info = await client.connect({ banner: "host::libreecho-browser-installer" });
-  if (onLog) {
-    onLog(`adb interface claimed on ${transport.device?.vendorId ?? "?"}:${transport.device?.productId ?? "?"}`);
-    if (info?.deviceBanner) onLog(`device banner: ${info.deviceBanner}`);
-  }
-  return { device: transport.device ?? device, transport, client, info };
+  try {
+    if (handle?.opened) await handle.close();
+  } catch { /* device already gone */ }
 }
+
+/**
+ * Opens an ADB session, prompting for the device when one is not supplied.
+ *
+ * `TransportClass` / `ClientClass` are an injection seam for the tests; without
+ * them the classes come from the ./lib modules through `protocolSupport()`.
+ */
+export async function openAdb({ device = null, onLog, any = false,
+  TransportClass = null, ClientClass = null } = {}) {
+  if (!TransportClass || !ClientClass) {
+    const support = await protocolSupport();
+    if (!support.adb.ok) throw new Error(support.adb.reason);
+    if (!support.adbTransport.ok) throw new Error(support.adbTransport.reason);
+    TransportClass = support.adbTransport.value;
+    ClientClass = support.adb.value;
+  }
+  // The whole open and handshake are guarded: `open()` throws at three points
+  // *after* device.open() succeeded (selectConfiguration, no ADB interface,
+  // claimInterface — all of which happen on a mode change), and the exception
+  // used to escape before anything released the interface.
+  let transport;
+  try {
+    if (device) {
+      transport = await new TransportClass(device, {}).open();
+    } else if (any) {
+      const chosen = await promptAnyDevice({ onLog });
+      transport = await new TransportClass(chosen, {}).open();
+    } else {
+      transport = await TransportClass.requestDevice({ filters: adbFilters() });
+    }
+    const client = new ClientClass(transport);
+    const info = await client.connect({ banner: "host::libreecho-browser-installer" });
+    if (onLog) {
+      onLog(`adb interface claimed on ${transport.device?.vendorId ?? "?"}:${transport.device?.productId ?? "?"}`);
+      if (info?.deviceBanner) onLog(`device banner: ${info.deviceBanner}`);
+    }
+    return { device: transport.device ?? device, transport, client, info };
+  } catch (error) {
+    // Never leave the interface claimed behind a failed open or handshake: a
+    // retry on the same device would otherwise inherit a half-open interface.
+    await releaseUsbInterface(transport, transport?.device ?? device);
+    throw error;
+  }
+}
+
+
 
 /**
  * Device objects this origin already has permission for, without opening a

@@ -11,6 +11,27 @@
   <link rel="stylesheet" href="css/installer.css">
 </head>
 <body>
+<!-- Sticky status bar: the only thing that must always be on screen. Every stage
+     change, operator action, success and failure is republished here. -->
+<div class="status-bar-shell">
+  <div class="status-bar" id="status-bar" data-kind="pending" role="status" aria-live="polite">
+    <div class="status-bar-line">
+      <span class="status-bar-stage" id="status-bar-stage">Step 1 of 5</span>
+      <span class="status-bar-title" id="status-bar-title">Device &amp; build</span>
+    </div>
+    <p class="status-bar-message" id="status-bar-message">Choose your device to see the builds made for it.</p>
+    <div class="status-bar-track" id="status-bar-progress" role="progressbar" aria-label="Overall progress"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <span class="status-bar-fill" id="status-bar-fill"></span>
+    </div>
+    <div class="status-bar-action" id="status-bar-action-row" hidden>
+      <button id="status-bar-action" class="primary" type="button" data-action-label="">Do this now</button>
+      <span class="status-bar-hint" id="status-bar-hint"></span>
+      <span class="status-bar-secondary" id="status-bar-secondary"></span>
+    </div>
+  </div>
+</div>
+
 <div class="wrap">
   <header class="installer-header">
     <a class="brand" href="https://dev.libreecho.org/">
@@ -28,138 +49,212 @@
   <section class="installer-intro">
     <p class="eyebrow">Browser one-shot installer · preview</p>
     <h1>Install LibreEcho from the browser.</h1>
-    <p>This page runs the install from your browser: it verifies a published release, asks the browser for USB access to the device, and drives the same stages the reviewed host installer drives — fastboot identity, the no-short unlock submission, the recovery-side initial install and a readback receipt after every write.</p>
-    <p>No Python, no platform tools, no drivers: the browser is the host. Only Chromium-based desktop browsers expose WebUSB.</p>
+    <p class="intro-lead">Five steps, in order, with one thing to do at a time. The status bar above always tells you what is happening now and what to press next.</p>
     <div class="preview-banner">
-      <strong>Preview, not a supported install path.</strong> The read-only device query has been tested on Echo hardware; unlock and install writes have not. Image safety is the release publisher's responsibility; this page verifies the published files and hardware target before installation. Hardware-acceptance and recovery-protocol checks still apply. These operations can make a device unrecoverable; the supported route remains the published release and its installation guide.
+      <strong>Preview, not a supported install path.</strong>
+      Read-only device query tested on hardware; unlock and install writes are not.
+      <details class="inline-details">
+        <summary>Read this before starting</summary>
+        <p>This page runs the install from your browser: it verifies a published release, asks the browser for USB access to the device, and drives the same stages the reviewed host installer drives — fastboot identity, the no-short unlock submission, the recovery-side initial install and a readback receipt after every write.</p>
+        <p>No Python, no platform tools, no drivers: the browser is the host. Only Chromium-based desktop browsers expose WebUSB.</p>
+        <p>Image safety is the release publisher's responsibility; this page verifies the published files and hardware target before installation. Hardware-acceptance and recovery-protocol checks still apply. These operations can make a device unrecoverable; the supported route remains the published release and its installation guide.</p>
+      </details>
     </div>
+    <section class="card card-compact" id="capability-card" aria-labelledby="capability-headline">
+      <h2 id="capability-headline" class="visually-hidden">Browser capability</h2>
+      <p class="capability-summary" id="capability-summary">Checking this browser…</p>
+      <details id="capability-detail">
+        <summary>Capability details</summary>
+        <div id="capability" aria-live="polite"></div>
+      </details>
+    </section>
   </section>
 
   <div class="layout">
-    <div>
-      <section class="card">
-        <h2>1 · Browser capability</h2>
-        <p>WebUSB and the protocol modules are checked before anything touches a device.</p>
-        <div id="capability" aria-live="polite"></div>
-      </section>
-
-      <section class="card">
-        <h2>2 · Your device and build</h2>
-        <p>Choose your device first, then pick the build you want. Nothing is downloaded until you ask for it.</p>
-        <div class="field">
-          <label for="device-select">Which device are you installing?</label>
-          <select id="device-select" aria-describedby="release-meta"></select>
-        </div>
-        <div class="field">
-          <label for="release-select">Build to install</label>
-          <select id="release-select" aria-describedby="release-meta"></select>
-        </div>
-        <div class="actions">
-          <button id="btn-refresh" class="ghost" type="button">Check for newer builds</button>
-        </div>
-        <div id="release-meta" class="status-line" style="display:block"></div>
-        <p class="status-line">Build state: <span id="status-release" class="pill" data-state="pending">not loaded</span></p>
-      </section>
-
-      <section class="card">
-        <h2>3 · Download and verify</h2>
-        <p>LibreEcho is downloaded and checked in your browser before anything can be staged. Every file is checked against the release's published checksums and GitHub's own record of it; if anything does not match, the download stops.</p>
-        <p class="fine-print">You need to be on a page that can reach the download mirror. If you already downloaded the files yourself, you can use them instead — see the advanced option below.</p>
-        <div id="download-panel" class="download-panel" style="display:none" aria-live="polite">
-          <div class="download-head">
-            <strong id="download-phase">Preparing</strong>
-            <span id="download-percent">0%</span>
+    <div class="column column-steps">
+      <!-- 1 -->
+      <section class="card step-card" id="card-device-build" data-step-card="device-build" data-state="active">
+        <header class="step-card-head">
+          <span class="step-card-number" aria-hidden="true">1</span>
+          <h2>Device &amp; build</h2>
+          <span class="step-badge" id="badge-device-build" data-state="waiting">waiting</span>
+        </header>
+        <p class="step-card-summary" id="summary-device-build">Nothing selected yet.</p>
+        <div class="step-card-body">
+          <p>Choose your device first, then the build you want. Nothing is downloaded until you ask for it.</p>
+          <div class="field">
+            <label for="device-select">Which device are you installing?</label>
+            <select id="device-select" aria-describedby="release-meta"></select>
           </div>
-          <div class="download-track"><span id="download-bar" class="download-bar"></span></div>
-          <div class="download-meta">
-            <span id="download-bytes">0 MB of 0 MB</span>
-            <span id="download-files"></span>
-            <span id="download-eta"></span>
+          <div class="field">
+            <label for="release-select">Build to install</label>
+            <select id="release-select" aria-describedby="release-meta"></select>
           </div>
-        </div>
-        <div id="download-error" class="download-error" style="display:none" role="alert"></div>
-        <div class="actions">
-          <button id="btn-download" class="primary" type="button" disabled>Download and verify</button>
-          <button id="btn-retry" class="ghost" type="button" style="display:none">Try again</button>
-        </div>
-        <p class="status-line">Download state: <span id="status-bundle" class="pill" data-state="pending">nothing downloaded</span></p>
-        <details id="bundle-advanced">
-          <summary>Advanced: use files I already downloaded</summary>
-          <p class="fine-print">Only needed if this page cannot reach the download mirror (for example you are offline, or a download failed). Download the files for your device from the release page, then select the <code>…-SHA256SUMS</code> files together with the other files. They are checked against the same published checksums — nothing unchecked is ever used.</p>
-          <input id="bundle-input" type="file" multiple aria-label="Release bundle files">
-          <input id="bundle-folder-input" type="file" multiple webkitdirectory directory aria-label="Release bundle folder">
           <div class="actions">
-            <button id="btn-bundle" class="ghost" type="button">Select files I downloaded…</button>
-            <button class="ghost" type="button" onclick="document.getElementById('bundle-folder-input').click()">Select the folder I downloaded…</button>
+            <button id="btn-refresh" class="ghost" type="button">Check for newer builds</button>
           </div>
-        </details>
+          <div id="release-meta" class="status-line" style="display:block"></div>
+          <p class="status-line">Build state: <span id="status-release" class="pill" data-state="pending">not loaded</span></p>
+        </div>
+        <div class="operator-callout" id="callout-device-build" hidden></div>
       </section>
 
-
-      <section class="card">
-        <h2>4 · Device</h2>
-        <p>Query the device in fastboot before any install decision. This reads selected <code>getvar</code> values only; it does not send <code>download</code>, <code>flash</code>, <code>erase</code> or a reboot. The model is inferred from the bootloader-reported product, not independently proven silicon identity. The full serial appears only in the local panel so you can verify the target; the terminal/downloadable log masks it.</p>
-        <p class="fine-print">If the chooser lists nothing, the device is not presenting an identity this page knows (they are listed in <a href="NOTES.html">the installer notes</a>). Use the unfiltered chooser — these devices report device class 0, so a class-based filter cannot match them.</p>
-        <div class="actions">
-          <button id="btn-connect" class="primary" type="button">Query device (read-only fastboot)</button>
-          <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
-          <button id="btn-recovery" class="ghost" type="button">Find previously authorised recovery</button>
-          <button id="btn-grant-recovery" class="ghost" type="button">Grant TWRP USB permission…</button>
+      <!-- 2 -->
+      <section class="card step-card" id="card-download-verify" data-step-card="download-verify" data-state="waiting">
+        <header class="step-card-head">
+          <span class="step-card-number" aria-hidden="true">2</span>
+          <h2>Download &amp; verify</h2>
+          <span class="step-badge" id="badge-download-verify" data-state="waiting">waiting</span>
+        </header>
+        <p class="step-card-summary" id="summary-download-verify">Nothing downloaded.</p>
+        <div class="step-card-body">
+          <p>Every file is checked in your browser against the release's published checksums and GitHub's own record of it; if anything does not match, the download stops.</p>
+          <div id="download-panel" class="download-panel" style="display:none" aria-live="polite">
+            <div class="download-head">
+              <strong id="download-phase">Preparing</strong>
+              <span id="download-percent">0%</span>
+            </div>
+            <div class="download-track"><span id="download-bar" class="download-bar"></span></div>
+            <div class="download-meta">
+              <span id="download-bytes">0 MB of 0 MB</span>
+              <span id="download-files"></span>
+              <span id="download-eta"></span>
+            </div>
+          </div>
+          <div id="download-error" class="download-error" style="display:none" role="alert"></div>
+          <div class="actions">
+            <button id="btn-download" class="primary" type="button" disabled>Download and verify</button>
+            <button id="btn-retry" class="ghost" type="button" style="display:none">Try again</button>
+          </div>
+          <p class="status-line">Download state: <span id="status-bundle" class="pill" data-state="pending">nothing downloaded</span></p>
+          <details id="bundle-advanced">
+            <summary>Advanced: use files I already downloaded</summary>
+            <p class="fine-print">Only needed if this page cannot reach the download mirror (for example you are offline, or a download failed). Download the files for your device from the release page, then select the <code>…-SHA256SUMS</code> files together with the other files. They are checked against the same published checksums — nothing unchecked is ever used.</p>
+            <input id="bundle-input" type="file" multiple aria-label="Release bundle files">
+            <input id="bundle-folder-input" type="file" multiple webkitdirectory directory aria-label="Release bundle folder">
+            <div class="actions">
+              <button id="btn-bundle" class="ghost" type="button">Select files I downloaded…</button>
+              <button class="ghost" type="button" onclick="document.getElementById('bundle-folder-input').click()">Select the folder I downloaded…</button>
+            </div>
+          </details>
         </div>
-        <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
-        <div id="device-panel" aria-live="polite"></div>
-        <p id="amonet-route" role="status" aria-live="polite">Query the device to determine whether an Amonet unlock ZIP is needed.</p>
-        <p id="recovery-wait" class="recovery-wait" role="status" style="display:none"></p>
+        <div class="operator-callout" id="callout-download-verify" hidden></div>
       </section>
 
-      <section class="card" id="amonet-panel" hidden>
-        <h2>5 · Pinned Amonet archive (only for a locked device)</h2>
-        <p>Query the device first. Select the matching <code>amonet-*.zip</code>; the browser verifies the entire archive, extracts the exact LK-build fastbrick member and verifies that member's size and SHA-256. With an approved CORS mirror configured, the fetch button obtains the same pinned ZIP automatically. XDA's attachment is not fetched directly from this page because it does not provide a reliable CORS-readable source. No archive or payload is sent to USB by these preparation controls.</p>
-        <input id="amonet-archive-input" type="file" accept=".zip" aria-label="Pinned Amonet archive">
-        <div class="actions">
-          <button id="btn-amonet-archive" type="button">Select pinned Amonet ZIP…</button>
-          <button id="btn-fetch-amonet" class="ghost" type="button" disabled>Fetch pinned ZIP from configured mirror</button>
+      <!-- 3 -->
+      <section class="card step-card" id="card-connect-device" data-step-card="connect-device" data-state="waiting">
+        <header class="step-card-head">
+          <span class="step-card-number" aria-hidden="true">3</span>
+          <h2>Connect the device</h2>
+          <span class="step-badge" id="badge-connect-device" data-state="waiting">waiting</span>
+        </header>
+        <p class="step-card-summary" id="summary-connect-device">No device queried yet.</p>
+        <div class="step-card-body">
+          <p>Query the device in fastboot before any install decision. This reads selected <code>getvar</code> values only; it does not send <code>download</code>, <code>flash</code>, <code>erase</code> or a reboot. The model is inferred from the bootloader-reported product, not independently proven silicon identity.</p>
+          <p class="fine-print">The full serial appears only in the local panel below so you can verify the target; the terminal and the saved log mask it. If the chooser lists nothing, use the unfiltered chooser — these devices report device class 0, so a class-based filter cannot match them. More in <a href="NOTES.html">the installer notes</a>.</p>
+          <div class="actions">
+            <button id="btn-connect" class="primary" type="button">Query device (read-only fastboot)</button>
+            <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
+            <button id="btn-recovery" class="ghost" type="button">Find previously authorised recovery</button>
+            <button id="btn-grant-recovery" class="ghost" type="button">Allow USB access to TWRP</button>
+            <button id="btn-recovery-entry" class="ghost" type="button">My Echo is already in recovery</button>
+          </div>
+          <p id="device-mode-choice"><strong>Which of these two is your Echo in?</strong> They are different USB modes and only one can work at a time — pressing the wrong one cannot answer.</p>
+          <p class="fine-print" id="choice-fastboot"><strong>Echo is in fastboot (first install)</strong> — the black bootloader screen saying “fastboot mode”. Press <strong>Query device (read-only fastboot)</strong> below.</p>
+          <p class="fine-print" id="choice-recovery"><strong>Echo is already in recovery</strong> — the TWRP screen with a big “Reboot” button. Press <strong>My Echo is already in recovery</strong> below. A device in TWRP cannot answer a fastboot query, and this page now says so instead of storing an empty identity.</p>
+          <p class="fine-print" id="device-mode-choice-done" hidden>Your Echo is identified, so step 3 needs nothing more from you. The two choices above apply only until a device is identified.</p>
+          <p class="fine-print">Already unlocked and sitting in TWRP? <strong>My Echo is already in recovery</strong> reads the device's identity from recovery itself, so a reloaded page can still continue. It checks the TWRP version, the board and the Kaeru header in <code>expdb</code> before accepting anything, and it never sends an unlock payload. Choose the USB device named “Echo” in Chrome's list — there is no serial to narrow the list with yet, so every check is done from what the device itself reports.</p>
+          <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
+          <div id="device-panel" aria-live="polite"></div>
+          <p id="amonet-route" role="status" aria-live="polite">Query the device to determine whether an Amonet unlock ZIP is needed.</p>
+          <p id="recovery-wait" class="recovery-wait" role="status" aria-live="polite" style="display:none"></p>
+          <p id="recovery-countdown" class="recovery-wait" role="status" aria-live="off"></p>
         </div>
-        <details><summary>Advanced: select the extracted fastbrick image instead</summary>
-          <input id="payload-input" type="file" aria-label="Pinned fastbrick payload image">
-          <button class="ghost" type="button" onclick="document.getElementById('payload-input').click()">Select pinned fastbrick image…</button>
-        </details>
-        <p class="status-line">Payload state: <span id="status-payload" class="pill" data-state="pending">none selected</span></p>
+        <div class="operator-callout" id="callout-connect-device" hidden></div>
       </section>
 
-      <section class="card">
-        <h2>6 · Stages</h2>
-        <ol id="step-list" class="step-list"></ol>
-        <div class="actions">
-          <button id="btn-dry-run" class="ghost" type="button">Rehearse (no writes)</button>
-          <button id="btn-run" class="primary" type="button" disabled aria-describedby="install-readiness">Run the install</button>
-          <button id="btn-abort" class="ghost" type="button" disabled>Stop</button>
+      <!-- 4 -->
+      <section class="card step-card" id="amonet-panel" data-step-card="unlock-payload" data-state="waiting" hidden>
+        <header class="step-card-head">
+          <span class="step-card-number" aria-hidden="true">4</span>
+          <h2>Unlock payload</h2>
+          <span class="step-badge" id="badge-unlock-payload" data-state="waiting">waiting</span>
+        </header>
+        <p class="step-card-summary" id="summary-unlock-payload">Not needed.</p>
+        <div class="step-card-body">
+          <p>Select the matching <code>amonet-*.zip</code>; the browser verifies the entire archive, extracts the exact LK-build fastbrick member and verifies that member's size and SHA-256. With an approved CORS mirror configured, the fetch button obtains the same pinned ZIP automatically. No archive or payload is sent to USB by these preparation controls.</p>
+          <input id="amonet-archive-input" type="file" accept=".zip" aria-label="Pinned Amonet archive">
+          <div class="actions">
+            <button id="btn-amonet-archive" type="button">Select pinned Amonet ZIP…</button>
+            <button id="btn-fetch-amonet" class="ghost" type="button" disabled>Fetch pinned ZIP from configured mirror</button>
+          </div>
+          <details>
+            <summary>Advanced: select the extracted fastbrick image instead</summary>
+            <input id="payload-input" type="file" aria-label="Pinned fastbrick payload image">
+            <button class="ghost" type="button" onclick="document.getElementById('payload-input').click()">Select pinned fastbrick image…</button>
+          </details>
+          <p class="status-line">Payload state: <span id="status-payload" class="pill" data-state="pending">none selected</span></p>
         </div>
-        <p id="install-readiness" class="fine-print" role="status" aria-live="polite">Query the device and verify its published build before installation.</p>
+        <div class="operator-callout" id="callout-unlock-payload" hidden></div>
+      </section>
+
+      <!-- 5 -->
+      <section class="card step-card" id="card-install" data-step-card="install" data-state="waiting">
+        <header class="step-card-head">
+          <span class="step-card-number" aria-hidden="true">5</span>
+          <h2>Install</h2>
+          <span class="step-badge" id="badge-install" data-state="waiting">waiting</span>
+        </header>
+        <p class="step-card-summary" id="summary-install">Blocked until the steps above are done.</p>
+        <div class="step-card-body">
+          <div class="actions">
+            <button id="btn-dry-run" class="ghost" type="button">Rehearse (no writes)</button>
+            <button id="btn-run" class="primary" type="button" disabled aria-describedby="install-readiness">Run the install</button>
+            <button id="btn-continue-twrp" class="primary" type="button" hidden aria-describedby="install-readiness">Continue from TWRP</button>
+            <button id="btn-abort" class="ghost" type="button" disabled>Stop</button>
+          </div>
+          <p id="install-readiness" class="fine-print" role="status" aria-live="polite">Query the device and verify its published build before installation.</p>
+          <div id="install-prereq-wrap" class="prereq-wrap">
+            <p class="prereq-head" id="install-prereq-head">Before Install can be pressed:</p>
+            <ul id="install-prereqs" class="prereq-list"></ul>
+          </div>
+          <details id="stage-list-details">
+            <summary>The 11 install stages and what each one verifies</summary>
+            <ol id="step-list" class="step-list"></ol>
+            <ul>
+              <li><strong>Release</strong> — both checksum inventories and the recovery ZIP/manifest are verified against the release API's digests before any write.</li>
+              <li><strong>Bundle</strong> — every selected file is hashed in the browser and compared with the release digest.</li>
+              <li><strong>Device</strong> — <code>getvar product</code>, <code>unlock_status</code> and the LK build description are read from the device itself; an unknown target stops the run.</li>
+              <li><strong>Unlock</strong> — the pinned build-specific payload is checked locally; fastbrick itself changes early boot-chain storage. A timeout is not accepted as proof of success and is never auto-retried.</li>
+              <li><strong>Recovery</strong> — TWRP's ADB serial must match the fastboot serial, and the Kaeru header in <code>expdb</code> must be intact before staging files.</li>
+              <li><strong>Stage</strong> — only files that matched the API-anchored normal and TWRP checksum inventories are pushed and re-hashed on the device.</li>
+              <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>
+            </ul>
+          </details>
+        </div>
+        <div class="operator-callout" id="callout-install" hidden></div>
       </section>
     </div>
 
-    <div>
-      <section class="card terminal-card">
+    <div class="column column-log">
+      <section class="card terminal-card" id="log-card">
         <div class="terminal-head">
           <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
           <strong>install progress</strong>
+          <button id="btn-log-toggle" class="ghost" type="button" aria-expanded="true" aria-controls="terminal">Hide log</button>
           <button id="download-log" class="ghost" type="button">Save log</button>
         </div>
         <ol id="terminal" aria-live="polite" aria-label="Install progress log"></ol>
       </section>
 
       <section class="card">
-        <h2>What each stage verifies</h2>
-        <ul>
-          <li><strong>Release</strong> — both checksum inventories and the recovery ZIP/manifest are verified against the release API's digests before any write.</li>
-          <li><strong>Bundle</strong> — every selected file is hashed in the browser and compared with the release digest.</li>
-          <li><strong>Device</strong> — <code>getvar product</code>, <code>unlock_status</code> and the LK build description are read from the device itself; an unknown target stops the run.</li>
-          <li><strong>Unlock</strong> — the pinned build-specific payload is checked locally; fastbrick itself changes early boot-chain storage. A timeout is not accepted as proof of success and is never auto-retried.</li>
-          <li><strong>Recovery</strong> — TWRP's ADB serial must match the fastboot serial, and the Kaeru header in <code>expdb</code> must be intact before staging files.</li>
-          <li><strong>Stage</strong> — only files that matched the API-anchored normal and TWRP checksum inventories are pushed and re-hashed on the device.</li>
-          <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>
-        </ul>
+        <details>
+          <summary>Before you start: what this page can and cannot tell you</summary>
+          <p>The read-only query reads selected <code>getvar</code> values only. It does not send <code>download</code>, <code>flash</code>, <code>erase</code> or a reboot.</p>
+          <p>The model is inferred from the bootloader-reported product, not independently proven silicon identity.</p>
+          <p>If the chooser lists nothing, the device is not presenting an identity this page knows. Use the unfiltered chooser — these devices report device class 0, so a class-based filter cannot match them.</p>
+          <p>Long-form limitations are kept in <a href="NOTES.html">the installer notes</a> rather than repeated here.</p>
+        </details>
       </section>
     </div>
   </div>
@@ -172,6 +267,6 @@
   </div>
 </footer>
 
-<script type="module" src="js/app.js?v=published-target-1"></script>
+<script type="module" src="js/app.js?v=published-target-3"></script>
 </body>
 </html>

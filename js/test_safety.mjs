@@ -108,6 +108,54 @@ test('unlock attempt persists across tabs without storing the raw serial', async
   } finally { globalThis.localStorage = previousLocal; globalThis.sessionStorage = previousSession; }
 });
 
+test('a different LK build after a reload is still refused for the same serial', async () => {
+  // F4: the page-session latch is in memory, so a reload loses it. The durable
+  // digest key is keyed on serial:profile:digest, and a partially applied
+  // flash:brick writes lk_b — the device can come back to fastboot LOCKED
+  // reporting a DIFFERENT lk_build_desc, which selects a different payload,
+  // hence a different digest, hence a different localStorage key. Without a
+  // serial-scoped key the second submission is allowed through.
+  const previousLocal = globalThis.localStorage;
+  // One storage shared across "reloads": a fresh call with the same Map stands
+  // in for a fresh page session over the same persisted origin storage.
+  const entries = new Map();
+  globalThis.localStorage = { getItem: (key) => entries.get(key) ?? null,
+    setItem: (key, value) => entries.set(key, value) };
+  const writes = [];
+  const serialRaw = 'TEST-DOT';
+  try {
+    const buildA = '63cb91b-20221007_072309';
+    const bytesA = new Uint8Array([1, 2, 3]);
+    const profileA = { ...biscuit, lkBuildMap: { [buildA]: {
+      payload: 'brick-a.img', size: bytesA.length,
+      sha256: await (await import('./sha256.js')).sha256Bytes(bytesA) } } };
+    assert.equal((await submitUnlockPayload({ client: { flash: async () => { writes.push('brick-a'); throw new Error('timeout'); } },
+      profile: profileA, lkBuild: buildA, payloadBytes: bytesA, payloadName: 'brick-a.img',
+      serialRaw, terminal: quiet })).outcome, 'unknown');
+
+    // The device comes back reporting a different LK build after the partial
+    // write, so a different (equally pinned) payload is now selected.
+    const buildB = '63cb91b1-20230101_000000';
+    const bytesB = new Uint8Array([4, 5, 6, 7]);
+    const profileB = { ...biscuit, lkBuildMap: { [buildB]: {
+      payload: 'brick-b.img', size: bytesB.length,
+      sha256: await (await import('./sha256.js')).sha256Bytes(bytesB) } } };
+    const argsB = { client: { flash: async () => { writes.push('brick-b'); throw new Error('timeout'); } },
+      profile: profileB, lkBuild: buildB, payloadBytes: bytesB, payloadName: 'brick-b.img',
+      serialRaw, terminal: quiet };
+
+    // Same page session, and then a simulated reload: the digest key is
+    // different in both cases, so only the serial-scoped key can refuse.
+    await assert.rejects(submitUnlockPayload(argsB), /already submitted|do not re-submit/i,
+      'a second submission with a different LK build was allowed after a reload');
+    await assert.rejects(submitUnlockPayload(argsB), /already submitted|do not re-submit/i,
+      'the refusal did not persist across a simulated reload');
+    assert.deepEqual(writes, ['brick-a'], 'flash:brick left the host a second time for one serial');
+    // Serial-scoped, so a genuinely different device is unaffected.
+    assert.ok(!JSON.stringify([...entries]).includes(serialRaw), 'the raw serial was written to storage');
+  } finally { globalThis.localStorage = previousLocal; }
+});
+
 test('a recovery ZIP phase never silently repeats after a receipt or unknown outcome', async () => {
   const prior = globalThis.localStorage;
   const entries = new Map();
@@ -160,11 +208,40 @@ test('each target declares an exact pinned Amonet ZIP and member path', () => {
 });
 
 const biscuit = PROFILES.find((profile) => profile.id === 'biscuit');
-test('Biscuit identity describes the Radar image as experimental, not impossible', () => {
+const radar = PROFILES.find((profile) => profile.id === 'radar');
+const capture = () => {
   const warnings = [];
+  return { warnings, terminal: { ok() {}, warn: (message) => warnings.push(message) } };
+};
+
+// This replaces the old "Biscuit always warns that Radar is experimental"
+// expectation. That warning was unconditional, so it fired even when the selected
+// build was itself Biscuit-targeted — which is the correct pairing — and told the
+// operator something that was not true. The build-vs-device warning is now driven
+// by the selected build's board, and the real block for a mismatched build is
+// unchanged in runInstall.
+test('a Biscuit device with a Biscuit-targeted build gets no experimental warning', () => {
+  const { warnings, terminal } = capture();
   assessIdentity({ product: 'BISCUIT', profile: biscuit, unlockStatus: 'false', serialRaw: 'TEST-DOT' },
-    { ok() {}, warn: (message) => warnings.push(message) });
-  assert.match(warnings.join(' '), /radar.*experimental|experimental.*radar/i);
+    terminal, { selectedBoard: 'biscuit' });
+  assert.deepEqual(warnings, [], 'a correctly matched Biscuit build produced a warning');
+});
+
+test('a Biscuit device warns only when the selected build is for a different board', () => {
+  const { warnings, terminal } = capture();
+  assessIdentity({ product: 'BISCUIT', profile: biscuit, unlockStatus: 'false', serialRaw: 'TEST-DOT' },
+    terminal, { selectedBoard: radar.board });
+  assert.equal(warnings.length, 1, 'a board-mismatched build produced no warning');
+  assert.match(warnings[0], new RegExp(radar.board, 'i'));
+  assert.match(warnings[0], /biscuit/i);
+});
+
+test('no selected build makes no build-vs-device claim at all', () => {
+  const { warnings, terminal } = capture();
+  const assessment = assessIdentity({ product: 'BISCUIT', profile: biscuit, unlockStatus: 'false',
+    serialRaw: 'TEST-DOT' }, terminal);
+  assert.deepEqual(warnings, [], 'a device-only assessment invented a build mismatch');
+  assert.deepEqual(assessment.findings, [], 'a well-identified locked Biscuit device has findings');
 });
 
 const quiet = { line() {}, info() {}, ok() {}, warn() {}, error() {}, command() {}, endProgress() {} };
@@ -228,6 +305,16 @@ test('Kaeru preflight returns an exact header for before/after comparison', asyn
   const adb = { shell: async (command) => ({ stdout: command.includes('uevent') ? 'PARTNAME=expdb\n'
     : command.includes('/size') ? '20480\n'
       : '88 16 88 58 70 b2 03 00 4c 4b 00 00 00 00 00 00\n' }) };
+  assert.equal(await stages.readKaeruHeader(adb), '8816885870b203004c4b000000000000');
+});
+
+test('Kaeru preflight reads expdb through /dev/block (TWRP has no /dev/mmcblk0p7)', async () => {
+  // [measured 2026-10-03, TWRP 3.7.0_9-0 on the Echo Dot] /dev/mmcblk0p7 does not
+  // exist; the node is /dev/block/mmcblk0p7. The old path made dd print nothing,
+  // so a healthy device was refused with "cannot read the complete expdb Kaeru header".
+  const adb = { shell: async (command) => ({ stdout: command.includes('uevent') ? 'PARTNAME=expdb\n'
+    : command.includes('/size') ? '20480\n'
+      : command.includes('if=/dev/block/mmcblk0p7 ') ? '88 16 88 58 70 b2 03 00 4c 4b 00 00 00 00 00 00\n' : '' }) };
   assert.equal(await stages.readKaeruHeader(adb), '8816885870b203004c4b000000000000');
 });
 
