@@ -47,7 +47,7 @@ import {
   classifyResumeState,
 } from "./resume.js";
 import { acquireWriterLock } from "./writer-lock.js";
-import { reconcileDeviceResume } from "./resume-device.js";
+import { reconcileDeviceResume, readTransactionGuard, retireFinalizedTransaction } from "./resume-device.js";
 import { formatSize, formatDuration, computeEta } from "./progress.js";
 import { RUNNING_ADB_FILTERS, pollRunningEcho, sendSetupToRunningEcho } from "./post-install.js";
 import {
@@ -280,7 +280,7 @@ export const state = {
 // Rough share of a typical run's wall time per stage, so the bar moves at an
 // honest pace. Transfer is dominated by the payload push; verify is the wait for
 // LibreEcho to start.
-const STAGE_WEIGHTS = { release: 1, device: 1, identity: 1, unlock: 3, recovery: 5, stage: 3,
+const STAGE_WEIGHTS = { release: 12, device: 1, identity: 1, unlock: 3, recovery: 5, stage: 3,
   prepare: 2, initialize: 4, transfer: 55, finalize: 8, configure: 1, verify: 16 };
 
 /** 0..100 for the current run position. Pure over STAGES and STAGE_WEIGHTS. */
@@ -295,6 +295,38 @@ export function runPercent(stageId, fraction = 0) {
     done += weight;
   }
   return 0;
+}
+
+/**
+ * Before a run, where each wizard card sits on the SAME scale the run uses. The
+ * old pre-run bar was the card's index over all stages, so the configure card
+ * showed ~45% and pressing Install dropped it to the run's real 10-15%: the
+ * bar went backwards. Every pre-run card now sits before the run's first
+ * stage, and the download fills the "release" share as it progresses.
+ */
+const PRE_RUN_POSITION = {
+  "device-build": ["release", 0],
+  "download-verify": ["release", null],
+  "connect-device": ["device", 0],
+  "unlock-payload": ["identity", 0],
+  configure: ["identity", 0.5],
+  install: ["unlock", 0],
+};
+
+export function preRunPercent(step, downloadFraction = 0) {
+  const [stage, fraction] = PRE_RUN_POSITION[step] ?? ["release", 0];
+  return runPercent(stage, fraction ?? downloadFraction);
+}
+
+/** A permitted TWRP device with this serial is already on USB. Read-only. */
+async function twrpAlreadyPresent(serial) {
+  if (!serial || !globalThis.navigator?.usb?.getDevices) return false;
+  try {
+    const devices = await navigator.usb.getDevices();
+    return devices.some((d) => d.vendorId === 0x18d1 && d.productId === 0x4ee2 && d.serialNumber === serial);
+  } catch {
+    return false;
+  }
 }
 
 /** Moves the bar without republishing the message. */
@@ -1447,8 +1479,8 @@ export function setStatusBar({ step = null, message = "", kind = "pending", acti
   if (dom.statusBar) dom.statusBar.dataset.kind = kind;
   const percent = state.postInstall === "done" ? 100
     : state.runStage ? runPercent(state.runStage, state.runFraction)
-      : Math.max(0, Math.min(100, Math.round(
-        (activeStage >= 0 ? (activeStage / Math.max(1, STAGES.length - 1)) * 100 : 0))));
+      : preRunPercent(stepDef?.id ?? null, state.bundleReady ? 1 : (state.downloadFraction ?? 0));
+  void activeStage;
   if (dom.statusBarFill) dom.statusBarFill.style.width = `${percent}%`;
   // ARIA progress value is set defensively: a host without setAttribute (the node
   // test DOM stubs) must not be able to break a run.
@@ -1667,6 +1699,9 @@ function setDownloadPhase(phase) {
 function renderDownloadProgress({ percent = 0, done = 0, total = 0, index = 0, count = 0, etaMs = null } = {}) {
   const clamped = Math.max(0, Math.min(100, percent));
   if (dom.downloadBar) dom.downloadBar.style.width = `${clamped.toFixed(1)}%`;
+  // The download is the first share of the overall bar too.
+  state.downloadFraction = clamped / 100;
+  if (!state.runStage && dom.statusBarFill) dom.statusBarFill.style.width = `${runPercent("release", state.downloadFraction)}%`;
   if (dom.downloadPercent) dom.downloadPercent.textContent = `${Math.round(clamped)}%`;
   if (dom.downloadBytes) dom.downloadBytes.textContent = `${formatSize(done)} of ${formatSize(total)}`;
   if (dom.downloadFiles) dom.downloadFiles.textContent = count ? `file ${Math.min(Math.max(index, 1), count)} of ${count}` : "";
@@ -3426,6 +3461,17 @@ function primaryAction() {
       kind: "action", focus: true,
       run: () => startFromRecovery().catch((error) => terminal.error(`starting from recovery failed: ${error.message}`)) };
   }
+  if (state.alreadyInstalled && installReadinessReason() === null) {
+    const which = state.alreadyInstalled.sameBuild ? "this build" : "an earlier build";
+    return { step: "install", label: "Erase and reinstall", kind: "warn",
+      message: `This Echo already has LibreEcho (${which}) installed. Installing again erases its settings and data.`,
+      hint: "Nothing has been written. Press Erase and reinstall to replace it, or close this page to keep it as it is.",
+      secondary: "",
+      run: () => {
+        state.reinstallConfirmed = state.identity?.serialRaw ?? null;
+        return runInstall({ dryRun: false });
+      } };
+  }
   if (installReadinessReason() === null) {
     return { step: "install", label: "Install", message: stageMessage("install"), kind: "action",
       run: () => runInstall({ dryRun: false }) };
@@ -3855,7 +3901,12 @@ export async function runInstall({ dryRun = false, recovery = {}, resumeFrom = n
         // The unlock payload is what normally restarts the Echo. With no payload to
         // send, ask Kaeru for TWRP explicitly; otherwise nothing restarts it.
         currentStage("recovery");
-        const restart = await requestRecoveryReboot({ client: state.fastboot?.client, terminal });
+        // A second Install press after a refused run finds the Echo already in
+        // TWRP: the fastboot handle is stale, and "restarting" it only produced a
+        // transport error. Look first; restart only when it is not there.
+        const restart = await twrpAlreadyPresent(state.identity.serialRaw)
+          ? (terminal.ok("your Echo is already in TWRP; no restart is needed"), { requested: true })
+          : await requestRecoveryReboot({ client: state.fastboot?.client, terminal });
         state.recoveryRestartRequested = restart.requested;
         if (!restart.requested) {
           terminal.warn(`could not restart your Echo into TWRP from here (${restart.reason}); `
@@ -3896,6 +3947,39 @@ export async function runInstall({ dryRun = false, recovery = {}, resumeFrom = n
       terminal,
       isCancelled: () => state.abort,
     };
+
+    // An earlier install that FINISHED leaves a finalized record, and the helper
+    // refuses every new install over it. Say so before anything runs and let
+    // the operator choose; never move it aside on the page's own initiative.
+    if (!dryRun && resumeAt === 0) {
+      // Advisory: the helper itself refuses a new install over a finished one,
+      // so a read that cannot tell either way changes nothing and must not
+      // block. Only a definite "finalized" changes what happens.
+      let guard = null;
+      try {
+        guard = await readTransactionGuard(state.adb, () => state.abort);
+      } catch (error) {
+        if (state.abort) throw error;
+        terminal.info(`could not read an earlier install record (${error.message}); the installer checks for itself`);
+      }
+      if (guard?.phase === "finalized") {
+        if (state.reinstallConfirmed !== state.identity.serialRaw) {
+          state.alreadyInstalled = { release: guard.release, sameBuild: guard.release === state.directRelease };
+          throw new StageError("install", "this Echo already has LibreEcho installed", { code: "already-installed" });
+        }
+        const stamp = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
+        const archive = await retireFinalizedTransaction(state.adb, { stamp, isCancelled: () => state.abort });
+        terminal.ok(`the previous install record was moved aside to ${archive} (kept on the Echo, not deleted)`);
+        // This browser's "never repeat" latches belong to the transaction that
+        // was just retired; a fresh one starts with none.
+        const cleared = await retireDirectPhaseGuards({ serialRaw: state.identity.serialRaw, tag: release.tag });
+        if (cleared) terminal.info(`cleared ${cleared} attempt marker(s) this browser held for that earlier install`);
+        state.reinstallConfirmed = null;
+        state.alreadyInstalled = null;
+      } else if (guard) {
+        terminal.info(`the Echo holds an unfinished install record (${guard.phase}); the installer decides whether it may continue`);
+      }
+    }
 
     currentStage("stage");
     // Only the bounded helper and the anchor manifest reach /cache: no payload is
@@ -4162,6 +4246,14 @@ export async function runInstall({ dryRun = false, recovery = {}, resumeFrom = n
       hint: "This usually takes one to two minutes.",
       secondary: "The full log is beside the steps; use Save log to keep it." });
   } catch (error) {
+    if (error instanceof StageError && error.detail?.code === "already-installed") {
+      const which = state.alreadyInstalled?.sameBuild ? "this same build" : `build ${state.alreadyInstalled?.release ?? "unknown"}`;
+      terminal.info(`this Echo already has LibreEcho (${which}) installed; nothing was written. `
+        + "Choose Erase and reinstall to replace it.");
+      // Not a failure: the bar offers the choice (primaryAction) once the
+      // finally below has released the lock and repainted.
+      return;
+    }
     const stage = error instanceof StageError ? error.stage : "unknown";
     terminal.error(`${stage} stage failed: ${error.message}`);
     if (error.detail) terminal.line(String(error.detail));
@@ -4215,6 +4307,7 @@ const POST_INSTALL_ATTACH_MS = 240000;
 // Test seam: replaces the real wait, so host suites never sit on a timer.
 let postInstallHook = null;
 export function __setPostInstallHookForTest(hook) { postInstallHook = hook; }
+export function __primaryActionForTest() { return primaryAction(); }
 
 async function attachRunningEcho({ serial, deadline, generation }) {
   // No WebUSB (a test harness or an unsupported browser): nothing to attach to.

@@ -1010,3 +1010,60 @@ export async function reconcileDeviceResume({
   evidence.dataMount = dataMount;
   return { nextPhase, deviceDigest, guard, receipt, reason, evidence: { ...evidence, skippedPhases } };
 }
+
+// --- an earlier, FINISHED install --------------------------------------------
+//
+// A finished install leaves `transaction.state` with `phase=finalized`, and the
+// shipped helper refuses every new `prepare` over it (`already-finalized`). That
+// is right for a resume, but it also blocks a deliberate reinstall, and the old
+// page reported it as an unexplained "nonzero exit". These two functions let the
+// page say it plainly before anything runs, and, only after the operator chose
+// "Erase and reinstall", move the finished record aside. Nothing is deleted: the
+// whole state directory is renamed, so its guard, receipt and logs stay on the
+// device as evidence. A record that is NOT finalized (an interrupted install) is
+// never moved: that is the case the guard exists to protect.
+
+/** Reads and parses the device guard. `null` when the device holds none. */
+export async function readTransactionGuard(adb, isCancelled = null) {
+  if (typeof adb?.shell !== "function") fail("no-adb-session", "a recovery ADB session is required to read the install record");
+  const read = await readControl(adb, RESUME_GUARD_NAME, RESUME_GUARD_READ_COMMAND, isCancelled);
+  if (!read.present) return null;
+  return parseResumeGuard(read.fields);
+}
+
+export const RETIRE_MARKER = "__LIBREECHO_RETIRE__=";
+
+/** The one rename. `stamp` is a plain token chosen by the caller. */
+export function retireFinalizedCommand(stamp) {
+  cleanToken(stamp, "archive stamp", "retire-stamp-unsafe");
+  const dir = RESUME_STATE_DIR;
+  const archive = `${RESUME_STATE_DIR}.finalized-${stamp}`;
+  return [
+    `__d=${dir}; __a=${archive}`,
+    `if [ -L "$__d" ] || [ ! -d "$__d" ]; then echo ${RETIRE_MARKER}nodir`,
+    `elif [ -e "$__a" ] || [ -L "$__a" ]; then echo ${RETIRE_MARKER}exists`,
+    `elif [ -L "$__d/${RESUME_GUARD_NAME}" ] || ! grep -qx 'phase=finalized' "$__d/${RESUME_GUARD_NAME}" 2>/dev/null; then echo ${RETIRE_MARKER}notfinalized`,
+    `elif mv "$__d" "$__a" && sync; then echo ${RETIRE_MARKER}ok`,
+    `else echo ${RETIRE_MARKER}failed; fi`,
+  ].join("\n");
+}
+
+/**
+ * Moves a FINALIZED state directory aside. Refuses (throws) on anything else.
+ * Returns the archive path.
+ */
+export async function retireFinalizedTransaction(adb, { stamp, isCancelled = null } = {}) {
+  checkCancel(isCancelled);
+  const guard = await readTransactionGuard(adb, isCancelled);
+  if (!guard) fail("retire-no-record", "the Echo holds no install record to move aside");
+  if (guard.phase !== "finalized") {
+    fail("retire-not-finalized", `the Echo's install record is at ${guard.phase}, not finished; an interrupted install is never erased from here`);
+  }
+  checkCancel(isCancelled);
+  const out = String((await adb.shell(retireFinalizedCommand(stamp)))?.stdout ?? "");
+  const match = new RegExp(`${RETIRE_MARKER}([a-z]+)`).exec(out);
+  if (!match || match[1] !== "ok") {
+    fail(`retire-${match?.[1] ?? "unconfirmed"}`, `the finished install record could not be moved aside (${match?.[1] ?? "no confirmation"})`);
+  }
+  return `${RESUME_STATE_DIR}.finalized-${stamp}`;
+}

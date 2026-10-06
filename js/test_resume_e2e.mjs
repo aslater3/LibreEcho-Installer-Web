@@ -1402,3 +1402,66 @@ test('stored verified receipt cannot authorize reboot after installed bytes chan
   assert.equal(session.calls.filter(c => /twrp reboot/.test(c)).length, 0);
   assert.equal(phases(session.calls, 'finalize').length, 0);
 });
+
+
+// ===========================================================================
+// AN ECHO THAT ALREADY FINISHED AN INSTALL (real Dot, 2026-10-06)
+// ===========================================================================
+
+test('a fresh Install on a finished Echo writes nothing and offers Erase and reinstall', async () => {
+  afterReload({ withJournal: false });
+  store.delete(RESUME_JOURNAL_KEY);
+  await app.restoreResumeState();
+  const session = twrp({ guard: guardAfter('finalized', 'formatted') });
+  await primeReady({ adb: session.client });
+  app.state.reinstallConfirmed = null;
+  await app.runInstall();
+  for (const phase of ['prepare', 'initialize', 'transfer', 'finalize']) {
+    assert.equal(phases(session.calls, phase).length, 0, `${phase} ran on a finished Echo`);
+  }
+  assert.equal(session.calls.some((c) => /\bmv\b|__LIBREECHO_RETIRE__/.test(c)), false, 'the record was moved without a choice');
+  assert.ok(app.state.alreadyInstalled, 'the finished install was not recognised');
+  const action = app.__primaryActionForTest();
+  assert.equal(action.label, 'Erase and reinstall');
+  assert.match(action.message, /already has LibreEcho/);
+});
+
+test('Erase and reinstall moves the finished record aside first, then runs prepare', async () => {
+  afterReload({ withJournal: false });
+  store.delete(RESUME_JOURNAL_KEY);
+  await app.restoreResumeState();
+  const session = twrp({ guard: guardAfter('finalized', 'formatted') });
+  const shell = session.client.shell;
+  let retired = false;
+  session.client.shell = async (command) => {
+    const text = String(command);
+    if (text.includes('__LIBREECHO_RETIRE__')) {
+      session.calls.push(text);
+      retired = true;
+      return { stdout: '__LIBREECHO_RETIRE__=ok\n' };
+    }
+    // After the rename the device has no record: answer the guard read as absent.
+    if (retired && text === RESUME_GUARD_READ_COMMAND) return { stdout: framed(2) };
+    return shell(command);
+  };
+  await primeReady({ adb: session.client });
+  app.state.alreadyInstalled = { release: DIRECT_RELEASE, sameBuild: true };
+  await app.__primaryActionForTest().run();
+  const order = session.calls.map((c, i) => [i, c]);
+  const retireAt = order.find(([, c]) => c.includes('__LIBREECHO_RETIRE__'))?.[0];
+  const prepareAt = order.find(([, c]) => /--phase prepare\b/.test(c))?.[0];
+  assert.ok(retireAt !== undefined, 'the finished record was never moved aside');
+  assert.equal(session.calls.some((c) => /\brm -rf? \/cache\/libreecho-direct\b/.test(c)), false, 'the record was deleted');
+  if (prepareAt !== undefined) assert.ok(retireAt < prepareAt, 'prepare ran before the old record was moved');
+  assert.equal(app.state.alreadyInstalled, null);
+});
+
+test('the overall bar never moves backwards from the setup step into the run', () => {
+  const steps = ['device-build', 'download-verify', 'connect-device', 'unlock-payload', 'configure', 'install'];
+  const pre = steps.map((s) => app.preRunPercent(s, 1));
+  for (let i = 1; i < pre.length; i += 1) assert.ok(pre[i] >= pre[i - 1], `${steps[i]} < ${steps[i - 1]}`);
+  const run = ['unlock', 'recovery', 'stage', 'prepare', 'initialize', 'transfer', 'finalize', 'verify']
+    .map((s) => app.runPercent(s, 0));
+  assert.ok(run[0] >= pre.at(-1), `pressing Install moved the bar back: ${pre.at(-1)}% -> ${run[0]}%`);
+  assert.ok(app.preRunPercent('download-verify', 0) < app.preRunPercent('download-verify', 1), 'the download does not move the bar');
+});
