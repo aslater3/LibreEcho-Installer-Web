@@ -6,7 +6,7 @@
 // it verified, and a failed stage stops the run.
 
 import { Terminal } from "./terminal.js";
-import { webusbSupport, describeUsbDevice, requestRecoveryDevice, recoveryChooserFilters, maskSerial } from "./device.js";
+import { webusbSupport, describeUsbDevice, requestRecoveryDevice, recoveryChooserFilters, maskSerial, MODES, classifyDevice } from "./device.js";
 import { protocolSupport, openFastboot, openAdb, grantedAdbDevices } from "./transports.js";
 import {
   installerConfig,
@@ -18,7 +18,7 @@ import {
   amonetArchiveUrl,
 } from "./release.js";
 import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, requestRecoveryReboot, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
-import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
+import { retireDirectPhaseGuards, DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, DIRECT_RECEIPT_PATH, prepareDirectInstall, pushDirectControl, pushDirectPayloads, readLandedPayloads, runDirectPhase } from "./direct-install.js";
 import { PROFILES, payloadForProfile } from "./profiles.js";
 import {
   installableBoards,
@@ -37,7 +37,19 @@ import {
 } from "./targets.js";
 import { discoverMirror, fetchReleaseBundle, fetchTargetsJson, createBundleStore } from "./auto-fetch.js";
 import { extractRecoveryMetadata } from "./recovery-metadata.js";
+import { sha256Bytes } from "./sha256.js";
+import {
+  RESUME_JOURNAL_KEY,
+  browserStorage,
+  readResumeJournal,
+  writeResumeJournal,
+  clearResumeJournal,
+  classifyResumeState,
+} from "./resume.js";
+import { acquireWriterLock } from "./writer-lock.js";
+import { reconcileDeviceResume } from "./resume-device.js";
 import { formatSize, formatDuration, computeEta } from "./progress.js";
+import { RUNNING_ADB_FILTERS, pollRunningEcho, sendSetupToRunningEcho } from "./post-install.js";
 import {
   PROVISION_DEFAULTS, PROVISION_PATH,
   validateProvision, deliverProvision,
@@ -70,6 +82,8 @@ const dom = {
   statusDevice: document.getElementById("status-device"),
   statusPayload: document.getElementById("status-payload"),
   devicePanel: document.getElementById("device-panel"),
+  connectResume: document.getElementById("btn-connect-resume"),
+  connectHint: document.getElementById("connect-hint"),
   recoveryWait: document.getElementById("recovery-wait"),
   recoveryCountdown: document.getElementById("recovery-countdown"),
   continueFromTwrp: document.getElementById("btn-continue-twrp"),
@@ -126,8 +140,6 @@ const dom = {
     recoveryEntry: document.getElementById("btn-recovery-entry"),
     connectAny: document.getElementById("btn-connect-any"),
   },
-  deviceModeChoice: document.getElementById("device-mode-choice"),
-  deviceModeChoiceDone: document.getElementById("device-mode-choice-done"),
 };
 
 export const terminal = new Terminal(dom.terminal, {
@@ -198,6 +210,10 @@ export const state = {
   // lives here ONLY — never in localStorage/sessionStorage/IndexedDB — and is
   // wiped by clearProvisionSecrets() after delivery, on Stop, and on unload.
   provisionMode: "skip",
+  // True once the operator has actually answered step 5 (either way). Skip is
+  // the default, but a default is not an answer: until this is set the card
+  // stays open, so the setup form is never hidden behind a collapsed card.
+  provisionChosen: false,
   provisionForm: null,
   // "idle" | "skipped" | "delivered" | "failed" — the honest reportable state.
   provisionState: "idle",
@@ -206,7 +222,89 @@ export const state = {
   // operator knows where to point a browser.
   provisionHostname: null,
   provisionSsid: null,
+  // --- reload / resume -------------------------------------------------------
+  // Everything below is restored from the durable resume journal (js/resume.js).
+  // It is a HINT about what the previous page session was doing: it restores the
+  // board, the release tag and the device digest so the operator can be told what
+  // they were doing, and nothing else. It never restores an identity, never marks
+  // a bundle verified, and never authorises a write. `resumeMayReunUnlock` and
+  // `resumeMayFormat` are hard false: a journal is written by a tab on a shared
+  // origin and cannot be what re-sends flash:brick or reformats userdata.
+  resumeBoard: null,
+  resumeReleaseTag: null,
+  resumeSerialSha256: null,
+  resumePhase: null,
+  resumeUnlockSubmitted: false,
+  resumeMayReunUnlock: false,
+  resumeMayFormat: false,
+  // The device digest `reconcileResume` measured on the DEVICE during this
+  // session's resume (js/resume-device.js). It is the value the helper's guard is
+  // bound to, and it is what binds a resume to one physical Echo. Null until a
+  // resume has reconciled; never taken from the journal.
+  resumeDeviceDigest: null,
+  // The DEVICE's own guard phase, as `reconcileDeviceResume` read it. This is
+  // what tells the run whether the device's receipt is (or is not) prepare
+  // evidence. Never taken from the journal: the journal's `phase` is a
+  // different vocabulary and a browser-tab claim. Null until a resume reconciles.
+  resumeGuardPhase: null,
+  // Set when this page session identified a previously granted device read-only
+  // on load. It names the device; it never starts work.
+  autoIdentifiedSerial: null,
+  // Set when the granted device set could not be narrowed to one, so the next
+  // Connect press must ask which device rather than picking for the operator.
+  resumeDeviceAmbiguous: false,
+  // Exactly one USB-busy explanation is published per contention episode, so a
+  // retry loop cannot flood the log with the same sentence.
+  usbBusyReportedFor: null,
+  // The durable cross-tab writer lock handle (js/writer-lock.js). `recoveryClaims`
+  // is a Map and cannot see another tab of this origin, so this is what makes a
+  // second tab refuse BEFORE it opens the device. Null whenever this tab does
+  // not hold it.
+  writerLock: null,
+  // Overall progress of a run. `runStage` is the STAGES id the run is on and
+  // `runFraction` how far through it (only the payload push and the boot wait
+  // report a fraction). The bar used to be derived from the wizard CARD, and the
+  // whole run lives on one card, so it sat at the same value for the entire run.
+  runStage: null,
+  runFraction: 0,
+  // After the reboot: what the running Echo reported. "booting" | "applying" |
+  // "done" | "needs-setup" | "setup-failed" | "timeout" | "no-permission" | null.
+  postInstall: null,
+  postInstallIp: null,
+  postInstallDetail: "",
+  // An open ADB session to the RUNNING image, held only while step 5 is waiting
+  // to be sent to a device that needs setup.
+  postInstallSession: null,
 };
+
+// Rough share of a typical run's wall time per stage, so the bar moves at an
+// honest pace. Transfer is dominated by the payload push; verify is the wait for
+// LibreEcho to start.
+const STAGE_WEIGHTS = { release: 1, device: 1, identity: 1, unlock: 3, recovery: 5, stage: 3,
+  prepare: 2, initialize: 4, transfer: 55, finalize: 8, configure: 1, verify: 16 };
+
+/** 0..100 for the current run position. Pure over STAGES and STAGE_WEIGHTS. */
+export function runPercent(stageId, fraction = 0) {
+  const total = STAGES.reduce((sum, stage) => sum + (STAGE_WEIGHTS[stage.id] ?? 1), 0);
+  let done = 0;
+  for (const stage of STAGES) {
+    const weight = STAGE_WEIGHTS[stage.id] ?? 1;
+    if (stage.id === stageId) {
+      return Math.round(((done + weight * Math.max(0, Math.min(1, fraction))) / total) * 100);
+    }
+    done += weight;
+  }
+  return 0;
+}
+
+/** Moves the bar without republishing the message. */
+function setRunProgress(stageId, fraction = 0) {
+  state.runStage = stageId;
+  state.runFraction = fraction;
+  const percent = runPercent(stageId, fraction);
+  if (dom.statusBarFill) dom.statusBarFill.style.width = `${percent}%`;
+  try { dom.statusBarProgress?.setAttribute?.("aria-valuenow", String(percent)); } catch { /* no ARIA support */ }
+}
 
 function setStatus(node, text, kind = "pending") {
   if (!node) return;
@@ -375,6 +473,7 @@ export function onProvisionInput() {
   renderProvisionDerived();
   const errors = renderProvisionErrors();
   const decided = state.provisionMode === "fill" && errors.length === 0;
+  if (state.postInstall) refreshStatusBar();
   if (state.provisionMode === "skip") setStatus(dom.statusProvision, "will be set up on the device", "pending");
   else setStatus(dom.statusProvision, decided ? "ready to install" : `${errors.length} field(s) to fix`,
     decided ? "ok" : "warn");
@@ -382,9 +481,11 @@ export function onProvisionInput() {
 }
 
 /** Applies the skip/fill choice. Skipping clears every secret immediately. */
-export function setProvisionMode(mode) {
+export function setProvisionMode(mode, { chosen = true } = {}) {
   const next = mode === "fill" ? "fill" : "skip";
   state.provisionMode = next;
+  // The page's own initial default is not the operator's answer.
+  if (chosen) state.provisionChosen = true;
   if (dom.provisionFormWrap) dom.provisionFormWrap.hidden = next !== "fill";
   if (next === "skip") {
     clearProvisionSecrets();
@@ -396,7 +497,711 @@ export function setProvisionMode(mode) {
     onProvisionInput();
   }
   renderStepCards();
+  refreshStatusBar();
   return next;
+}
+
+// --- reload / resume --------------------------------------------------------
+//
+// The reload strand, in one paragraph. A run rebots the Echo into TWRP, the
+// operator reloads the page (or the browser does), and every piece of context the
+// page held was in memory: the identity, the chosen board, the release and the
+// verified bundle. The device is now in TWRP, so `queryDevice` cannot reach it —
+// and `awaitRecovery`/`findRecovery` require a fastboot `serialno` the device no
+// longer has. Every continuation path refused, so the operator was left sitting
+// in TWRP with a page that could not help.
+//
+// The fix has two halves, and keeping them separate is the whole point:
+//
+//   1. `restoreResumeState()` reads a durable, non-secret journal so the page can
+//      say "you were installing X on THIS Echo". It restores nothing that grants
+//      authority: no identity, no bundle readiness, no unlock latch.
+//   2. `planResume()` refuses to continue until the immutable release assets AND
+//      the actual device have both been re-verified. The journal is the hint; the
+//      device is the authority. A reload therefore re-derives everything it needs
+//      and re-asks the operator for nothing.
+//
+// Two things are unconditionally false here and are not configurable: the journal
+// can never authorise re-sending `flash:brick`, and it can never authorise
+// re-formatting userdata. Those live behind the durable `libreecho.unlock.*` and
+// `libreecho.direct.*` guards, which survive a reload by construction and which
+// nothing in this file removes.
+
+/** True when a journal exists at all, whatever it says. */
+export function hasResumeJournal(storage = browserStorage()) {
+  return readResumeJournal(storage).ok;
+}
+
+/**
+ * Restores the non-secret transaction context after a reload.
+ *
+ * Never throws and never blocks the page: a first-time visitor, a corrupt record
+ * and a storage-disabled browser all end up with the ordinary Connect flow, which
+ * is exactly where they should be. The two authority flags are set from
+ * `classifyResumeState`, which hard-codes them false.
+ */
+export async function restoreResumeState({ storage = browserStorage(), announce = true } = {}) {
+  state.resumeBoard = null;
+  state.resumeReleaseTag = null;
+  state.resumeSerialSha256 = null;
+  state.resumePhase = null;
+  state.resumeUnlockSubmitted = false;
+  state.resumeMayReunUnlock = false;
+  state.resumeMayFormat = false;
+  const read = readResumeJournal(storage);
+  const classified = classifyResumeState(read);
+  state.resumeMayReunUnlock = classified.mayReunUnlock;
+  state.resumeMayFormat = classified.mayReformat;
+  if (!classified.resumable) {
+    // Not an error: most visitors have no journal. Report it once, quietly, and
+    // leave the page in its normal first-run state.
+    if (announce && !classified.fresh) terminal.info(`no usable resume record (${read.reason}); starting a fresh connection`);
+    refreshControls();
+    return { ok: false, reason: read.reason ?? "there is no resume journal" };
+  }
+  const journal = classified.journal;
+  state.resumeBoard = journal.board;
+  state.resumeReleaseTag = journal.releaseTag;
+  state.resumeSerialSha256 = journal.serialSha256;
+  state.resumePhase = journal.phase;
+  state.resumeUnlockSubmitted = journal.unlockState !== "none";
+  if (announce) {
+    terminal.info(`a resume record was found: ${journal.board} · ${journal.releaseTag} · stopped at the ${journal.phase} phase. `
+      + "Nothing has been written; the device and the build are checked again before anything continues.");
+    if (state.resumeUnlockSubmitted) {
+      terminal.info("an unlock payload was submitted before the reload, so it will NOT be sent again");
+    }
+  }
+  refreshControls();
+  return { ok: true, journal, classified, reason: null };
+}
+
+/**
+ * Records the current transaction so a reload can name it. Called as a run
+ * progresses; every call is best-effort and a refusal is reported, never thrown,
+ * because a missing journal only costs convenience.
+ *
+ * The body is built from a fixed field list. The step-5 form is never passed in
+ * — `writeResumeJournal` refuses secret-shaped fields anyway, and refusing them
+ * twice is deliberate.
+ */
+export function recordResumeProgress({ phase = null, bundleManifestSha256 = null,
+  deviceDigest = null, kaeruHeader = null, target = null, storage = browserStorage() } = {}) {
+  const identity = state.identity;
+  if (!identity?.serialRaw) return { ok: false, reason: "no device identity to record" };
+  // Persist only the explicit non-secret allowlist below, even when the form is filled.
+  return (async () => {
+    const body = {
+      version: 1,
+      serialSha256: await sha256Bytes(new TextEncoder().encode(String(identity.serialRaw))),
+      board: identity.profile?.board ?? state.bundleBoard ?? null,
+      releaseTag: state.release?.tag ?? null,
+      provisionMode: state.provisionMode === "fill" ? "fill" : "skip",
+      phase: phase ?? state.resumePhase ?? "fresh",
+      unlockState: state.unlockSubmitted === identity.serialRaw || state.resumeUnlockSubmitted
+        ? "submitted" : "none",
+      bundleManifestSha256, deviceDigest, kaeruHeader, target,
+      updatedAt: Date.now(),
+    };
+    const result = writeResumeJournal(storage, body);
+    if (!result.ok) terminal.warn(`this run cannot be resumed after a reload: ${result.reason}`);
+    return result;
+  })();
+}
+
+/**
+ * Decides whether the transaction may continue, and where.
+ *
+ * Both verifications are mandatory and neither is optional:
+ *   - `verifyRelease` must re-establish the immutable release assets. After a
+ *     reload there is no verified bundle in memory, so this is usually the step
+ *     that refuses: the journal alone can never stand in for re-fetching and
+ *     re-verifying the signed inventory.
+ *   - `verifyDevice` must re-establish the actual device. A journal naming a
+ *     serial digest is not evidence that device is plugged in, or that it is the
+ *     same device, or that its userdata is where it was left.
+ *
+ * Returns `startAt: null` whenever either fails, so a caller cannot accidentally
+ * continue from a partial plan.
+ */
+export async function planResume({ verifyRelease, verifyDevice, storage = browserStorage() } = {}) {
+  const read = readResumeJournal(storage);
+  const classified = classifyResumeState(read);
+  if (!classified.resumable) {
+    return { ok: false, reason: read.reason ?? "there is nothing to resume", startAt: null };
+  }
+  const release = await verifyRelease?.({ journal: classified.journal });
+  if (!release?.ok) {
+    return { ok: false, reason: `the release did not reverify: ${release?.reason ?? "not checked"}`, startAt: null };
+  }
+  const device = await verifyDevice?.({ journal: classified.journal });
+  if (!device?.ok) {
+    return { ok: false, reason: `the device did not reverify: ${device?.reason ?? "not checked"}`, startAt: null };
+  }
+  const phase = classified.phase ?? "fresh";
+  return {
+    ok: true,
+    reason: null,
+    startAt: phase,
+    journal: classified.journal,
+    release,
+    device,
+    // Hard false, independent of everything above: a journal never re-arms the
+    // unlock and never re-arms formatting.
+    mayReunUnlock: false,
+    mayReformat: false,
+    // `initialize` formats userdata. Re-entering it is only ever safe on the
+    // device's own evidence that it already ran, which the caller must supply.
+    requiresDeviceEvidenceForFormat: phase === "initialize",
+  };
+}
+
+/**
+ * Checks a connected recovery client against the journal's serial digest.
+ *
+ * The digest is compared, never a stored plain serial, so this is a matching
+ * test rather than an identity lookup. A different device is refused outright:
+ * continuing another Echo's install would write the wrong device.
+ */
+export async function assertResumeMatchesDevice(client) {
+  const read = readResumeJournal();
+  const classified = classifyResumeState(read);
+  if (!classified.resumable) return { ok: true, reason: null, serial: null, header: null };
+  const probe = await probeRecoveryEntry({ client, terminal });
+  const observed = await sha256Bytes(new TextEncoder().encode(String(probe.serial)));
+  if (observed !== classified.journal.serialSha256) {
+    const reason = `this is a different Echo than the resume record describes (${maskSerial(probe.serial)}); refusing to continue another device's install`;
+    terminal.error(reason);
+    throw new StageError("recovery", reason);
+  }
+  return { ok: true, reason: null, serial: probe.serial, header: probe.header };
+}
+
+/**
+ * Identifies a device this origin was already granted, without a chooser and
+ * without writing anything.
+ *
+ * This runs on page load, so the only thing it may do is name a device. It never
+ * starts an install, never sends a payload and never reboots — a reload must not
+ * be able to mutate a device by itself. Three outcomes:
+ *   - exactly one granted candidate that matches the journal → identified
+ *   - more than one candidate → ambiguous, and the operator must choose
+ *   - no candidate (or only non-matching ones) → nothing to do
+ */
+export async function autoIdentifyGrantedDevice({ grantedDevices = grantedAdbDevices, open = openAdb } = {}) {
+  let devices;
+  try {
+    devices = await grantedDevices();
+  } catch (error) {
+    return { identified: false, ambiguous: false, reason: `this browser will not list previously allowed devices (${error.message})` };
+  }
+  if (!Array.isArray(devices) || devices.length === 0) {
+    return { identified: false, ambiguous: false, reason: "no USB device is currently allowed for this page" };
+  }
+  const read = readResumeJournal();
+  const expected = classifyResumeState(read).journal?.serialSha256 ?? null;
+  // Narrow by the USB descriptor serial, which is a HINT (deviceSerialVerdict):
+  // a blank serial cannot exclude anything, so those candidates are kept and
+  // resolved by the ADB-reported serial instead. When a journal exists, only a
+  // descriptor whose digest matches may be considered a candidate at all — that is
+  // what stops a reload from auto-attaching to a different Echo.
+  let candidates = devices;
+  if (expected) {
+    candidates = [];
+    for (const device of devices) {
+      const declared = String(device?.serialNumber ?? "").trim();
+      if (!declared) { candidates.push(device); continue; }
+      const digest = await sha256Bytes(new TextEncoder().encode(declared));
+      if (digest === expected) candidates.push(device);
+    }
+  }
+  if (candidates.length === 0) {
+    // Reached either because nothing is allowed, or because every allowed device
+    // is a DIFFERENT Echo than the journal describes. Both matter to the
+    // operator and the two need different actions, so the message says which.
+    const allowed = devices.length;
+    return {
+      identified: false,
+      ambiguous: false,
+      differentDevice: true,
+      reason: allowed
+        ? `${allowed} USB device(s) are allowed for this page, but none is the Echo this install was for; `
+          + "start a fresh install for the device you have plugged in"
+        : "no allowed USB device matches the resume record",
+    };
+  }
+  if (candidates.length > 1) {
+    state.resumeDeviceAmbiguous = true;
+    const reason = `${candidates.length} allowed USB devices could be your Echo; choose the one you want from the list`;
+    terminal.info(reason);
+    refreshControls();
+    return { identified: false, ambiguous: true, reason, candidates };
+  }
+  state.resumeDeviceAmbiguous = false;
+  const releaseOperation = beginDeviceOperation("entry");
+  if (!releaseOperation) return { identified: false, ambiguous: false, reason: "another connection is in progress" };
+  try {
+    const identity = await runRecoveryEntry({ request: async () => candidates[0], open });
+    if (!identity) return { identified: false, ambiguous: false, reason: "the device could not be identified" };
+    state.autoIdentifiedSerial = state.identity.serialRaw;
+    return { identified: true, ambiguous: false, reason: null, readOnly: true, mayProceed: false,
+      serial: state.identity.serialRaw, header: state.kaeruHeader };
+  } catch (error) {
+    return { identified: false, ambiguous: false, reason: `the allowed device did not read back as a TWRP Echo (${error.message})` };
+  } finally { releaseOperation(); }
+
+}
+
+/**
+ * The single Connect/Resume action the operator is offered.
+ *
+ * There used to be five connection buttons asking for five different things. One
+ * obvious action is what an ordinary user needs: either "Connect to your Echo"
+ * (nothing was in progress) or "Resume" (a journal names a transaction). Neither
+ * is ever destructive — both route to a read-only probe or a chooser.
+ */
+export function connectAction() {
+  const resumable = Boolean(state.resumeBoard && state.resumeReleaseTag);
+  if (resumable) {
+    return {
+      label: "Resume this install",
+      message: `You were installing ${state.resumeReleaseTag} on your ${state.resumeBoard} Echo, and the page was reloaded. `
+        + "Resume re-checks the build and your device before continuing — nothing is written until both agree.",
+      hint: state.resumeUnlockSubmitted
+        ? "Your unlock payload was already sent, so it will not be sent again."
+        : "",
+      secondary: "If this was a different Echo or a different build, start a fresh install instead.",
+      destructive: false,
+      kind: "action",
+      focus: true,
+      run: () => resumeInstall().catch((error) => terminal.error(`resume failed: ${error.message}`)),
+    };
+  }
+  return {
+    label: "Connect to your Echo",
+    message: state.resumeDeviceAmbiguous
+      ? "More than one USB device could be your Echo. Press this, then choose the right one from Chrome's list."
+      : "Press this, then choose the USB device named “Echo” from Chrome's list. This only reads your device.",
+    hint: "If your Echo is in TWRP recovery, choose it here — no fastboot is needed.",
+    secondary: "Nothing is unlocked, written or restarted by connecting.",
+    destructive: false,
+    kind: "action",
+    focus: true,
+    run: () => connectDevice().catch((error) => terminal.error(`connect failed: ${error.message}`)),
+  };
+}
+
+/**
+ * The one Connect button's body. Mode-aware and read-only: it either identifies
+ * an Echo in fastboot or identifies one in TWRP, and in both cases it only reads.
+ * Nothing here writes, formats, unlocks or reboots.
+ */
+export async function connectDevice({ request = null, open = openAdb, openBoot = openFastboot } = {}) {
+  if (state.running || state.fetchingBundle) throw new StageError("device", "wait for the current operation to finish before connecting again");
+  const releaseOperation = beginDeviceOperation("entry");
+  if (!releaseOperation) return null;
+  state.abort = false;
+  const epoch = nextRecoveryEpoch();
+  try {
+    // Invoke the chooser directly from the click, before awaiting any USB work.
+    const choose = request ?? (() => navigator.usb.requestDevice({ filters: [...MODES.fastboot.filters, ...MODES.adb.filters] }));
+    const device = await choose();
+    if (isStopped() || isEpochStale(epoch)) throw new RecoveryStopped();
+    if (!device) return null;
+    const expected = readResumeJournal().journal?.serialSha256;
+    if (expected && device.serialNumber && await sha256Bytes(new TextEncoder().encode(device.serialNumber)) !== expected) {
+      throw new StageError("device", "this is a different Echo from the saved install; reconnect the original Echo");
+    }
+    // An Echo already running LibreEcho (its own adbd, 18d1:d001) is not an
+    // install target from here: check how it is doing and offer setup instead.
+    if (RUNNING_ADB_FILTERS.some((f) => f.vendorId === device.vendorId && f.productId === device.productId)) {
+      releaseOperation();
+      return await waitForLibreEcho({ device, serial: device.serialNumber ?? "" });
+    }
+    const modes = classifyDevice(device).interfaces.filter(i => i.interfaceClass === 255 && i.interfaceSubclass === 66);
+    const isFastboot = modes.some(i => i.interfaceProtocol === 3);
+    const isAdb = modes.some(i => i.interfaceProtocol === 1);
+    // Exact known identities are a fallback for browsers without descriptors.
+    const recovery = isAdb || (!isFastboot && device.vendorId === 0x18d1 && device.productId === 0x4ee2);
+    const fastboot = isFastboot || (!isAdb && device.vendorId === 0x0bb4 && device.productId === 0x0c01);
+    if (recovery === fastboot) throw new StageError("device", "the Echo's USB mode is unclear; reconnect it and try again");
+    await closeRecoverySession(state.fastboot);
+    state.fastboot = null;
+    invalidateRecovery({ close: true });
+    state.identity = null;
+    if (recovery) return await runRecoveryEntry({ request: async () => device, open });
+    const identity = await runDeviceQuery({ any: false, open: options => openBoot({ ...options, device }) });
+    if (expected && await sha256Bytes(new TextEncoder().encode(identity.serialRaw)) !== expected) {
+      await closeRecoverySession(state.fastboot); state.fastboot = null; state.identity = null;
+      throw new StageError("device", "the connected Echo does not match the saved install");
+    }
+    return identity;
+  } catch (error) {
+    if (isChooserCancel(error)) { terminal.info("No device was selected. Press Connect when you are ready."); return null; }
+    throw error;
+  } finally {
+    state.recoveryGrantInFlight = false;
+    releaseOperation();
+    refreshControls();
+  }
+}
+
+/**
+ * The Resume button's body.
+ *
+ * A resume is refused unless BOTH the release assets and the device reverify, so
+ * this function's first act is to build a plan and stop if it is not safe. Only
+ * then does it re-enter the ordinary run flow, which re-derives everything from
+ * the device — the journal contributes a starting point and nothing more.
+ */
+/**
+ * Re-establishes the immutable release assets for a resume.
+ *
+ * This is the step a journal cannot substitute for, and it is deliberately the
+ * real download+verify path rather than a lookup in `state.releases`. After a
+ * reload the page holds no verified bundle at all, and the journal names a tag —
+ * a tag is not an inventory. So unless this page session has *already* verified
+ * the exact recorded build for the exact recorded board (nothing lost, nothing
+ * to re-derive), the bundle is re-fetched and re-hashed from the published
+ * checksums before any device work.
+ */
+export async function reverifyReleaseForResume(journal) {
+  if (!journal?.releaseTag) return { ok: false, reason: "no release was recorded" };
+  const board = journal.board ?? null;
+  if (!isInstallableBoard(board)) return { ok: false, reason: `the recorded board ${board} is not one this installer can install` };
+  // Already verified in THIS page session, for this exact tag and board. A
+  // resume pressed without a reload lands here and needs nothing re-fetched.
+  if (state.bundleReady && state.release?.tag === journal.releaseTag
+    && state.bundleBoard === board && state.bundleHardwareAccepted === true) {
+    return { ok: true, release: state.release, alreadyVerified: true };
+  }
+  // The release list is not in memory after a reload; read it before deciding
+  // the recorded tag no longer exists.
+  if (state.releases.length === 0) {
+    try { await loadReleases(); } catch (error) {
+      return { ok: false, reason: `the build list could not be read (${error.message})` };
+    }
+  }
+  const release = state.releases.find((entry) => entry.tag === journal.releaseTag) ?? null;
+  if (!release) {
+    return { ok: false, reason: `the recorded build ${journal.releaseTag} is no longer published; download and verify a build yourself` };
+  }
+  if (!releaseOffersBoard(release, board)) {
+    return { ok: false, reason: `the recorded build ${journal.releaseTag} is not offered for ${boardLabel(board)}` };
+  }
+  state.board = board;
+  state.release = release;
+  // The real path: fetch every asset and re-hash it against the API-anchored
+  // inventory. This is what earns `bundleReady` again.
+  const verified = await fetchBundleAutomatically({ board });
+  if (!verified) return { ok: false, reason: `the build ${journal.releaseTag} did not download and verify` };
+  if (state.bundleBoard !== board) {
+    return { ok: false, reason: `the verified build is for ${boardLabel(state.bundleBoard)}, not ${boardLabel(board)}` };
+  }
+  return { ok: true, release, alreadyVerified: false };
+}
+
+/**
+ * Reads the helper's own receipt back off the device.
+ *
+ * A resume that says "finalize" is claiming the image was installed. Exit status
+ * is not evidence — the helper writes a machine-readable receipt for exactly
+ * this reason — so the claim is checked against what the device actually holds
+ * before the page continues to the reboot and reports anything as done.
+ *
+ * This path constant is imported. It was not: the template interpolated
+ * `undefined`, every call threw a ReferenceError, and the `catch` turned every
+ * answer into `null`. That made every receipt check in the page vacuously pass
+ * as "nothing readable" while looking like a device that reported nothing.
+ */
+export async function readInstallReceipt(adb) {
+  if (!adb?.shell) return null;
+  try {
+    const result = await adb.shell(`cat ${DIRECT_RECEIPT_PATH} 2>/dev/null || true`);
+    const receipt = {};
+    for (const line of String(result?.stdout ?? "").split(/\r?\n/)) {
+      const match = /^([a-z][a-z0-9_]*)=(.*)$/.exec(line.trim());
+      if (match) receipt[match[1]] = match[2];
+    }
+    return Object.keys(receipt).length ? receipt : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The device-authoritative resume decision, and the ONLY thing allowed to name a
+ * resume point.
+ *
+ * `journal.phase` is a browser-tab claim. It can be stale (written before the
+ * mutation that then failed), ahead (written before the mutation), or behind (a
+ * phase completed but the journal write never landed). Reading a skip from it can
+ * skip a GPT reshape that never ran, or re-enter `initialize` and format userdata
+ * a second time. So the browser journal is passed in only as corroboration, and
+ * the answer comes from `reconcileDeviceResume`, which reads the device's own
+ * durable guard — `/cache/libreecho-direct/transaction.state`, written by the
+ * shipped helper with `guard_write` BEFORE each mutation.
+ *
+ * Every refusal is returned rather than thrown, so the caller can speak to the
+ * operator: `{ ok: false, reason, code }`. A `StageError` from the module is
+ * unwrapped into its stable `detail.code` here, so nothing has to parse prose.
+ *
+ * `browserPrepareAttempted` must be an EXPLICIT boolean. The one case with no
+ * guard to read is a genuinely fresh transaction, and reshaping userdata is only
+ * safe when this browser can positively say no prepare was ever attempted.
+ * Anything else — `undefined` included — is a refusal, because "this browser does
+ * not know" is exactly the fact that makes prepare unsafe.
+ *
+ * @returns {Promise<{ok: boolean, nextPhase?: string, reason?: string, code?: string,
+ *   deviceDigest?: string, guard?: object, evidence?: object}>}
+ */
+export async function reconcileResume({ adb, journal = null, browserPrepareAttempted = null,
+  isCancelled = null } = {}) {
+  // The immutable bindings the guard is matched against. All four come from state
+  // this run re-derived from the verified bundle and the verified device; none is
+  // read from the journal.
+  const target = state.target?.board ?? state.bundleBoard ?? null;
+  const manifestSha256 = state.directManifestSha ?? null;
+  const release = state.directRelease ?? null;
+  const serialRaw = state.identity?.serialRaw ?? state.recoverySerial ?? null;
+  const kaeruHeader = state.kaeruHeader ?? null;
+  if (!adb?.shell) return { ok: false, reason: "no Echo is connected in recovery; nothing can be reconciled", code: "no-adb-session" };
+  if (!manifestSha256) {
+    return { ok: false, reason: "the verified bundle manifest is not in this page session; nothing can be reconciled", code: "bundle-manifest-unpinned" };
+  }
+  try {
+    const reconciled = await reconcileDeviceResume({
+      adb, journal: journalForGuard(journal, release), manifestSha256, target, release, serialRaw, kaeruHeader,
+      browserPrepareAttempted, isCancelled,
+    });
+    return { ok: true, ...reconciled, reason: null, code: null };
+  } catch (error) {
+    if (error instanceof RecoveryStopped) throw error;
+    if (!(error instanceof StageError)) {
+      return { ok: false, reason: `the device could not be reconciled: ${error.message}`, code: "reconcile-failed" };
+    }
+    return { ok: false, reason: error.message, code: error.detail?.code ?? "reconcile-refused", detail: error.detail };
+  }
+}
+
+/**
+ * Translates a browser journal into the namespace the DEVICE's guard uses.
+ *
+ * There are two different "release" strings in one transaction and they are not
+ * interchangeable:
+ *
+ *   * `releaseTag` — the PUBLISHED TAG (`radar-puffin-v0.14.0`), which is what the
+ *     GitHub release is called and what the journal records;
+ *   * `release` — the BUNDLE MANIFEST RELEASE (`radar-puffin-build-test`), the
+ *     `release=` line inside the signed `bundle.manifest`, which is what
+ *     `--release` passes to the helper and what the device's guard and receipt
+ *     record.
+ *
+ * `reconcileDeviceResume` cross-checks a journal's release against the guard's, so
+ * handing it the published tag would refuse EVERY resume as
+ * `journal-binding-mismatch` — a mismatch that means only "two namespaces were
+ * compared", not "a different transaction". This rewrites the one field into the
+ * guard's namespace and leaves every other field untouched, so the journal still
+ * corroborates exactly as much as it can.
+ *
+ * If this run cannot name a manifest release, there is nothing safe to translate
+ * to, so the journal is dropped rather than passed in a namespace that can only
+ * produce a false refusal. Losing corroboration is always better than losing the
+ * resume.
+ */
+function journalForGuard(journal, manifestRelease) {
+  if (!journal || typeof manifestRelease !== "string" || manifestRelease === "") return null;
+  return { ...journal, releaseTag: manifestRelease };
+}
+
+/**
+ * A test-only seam onto the reconcile decision, so a suite can drive the refusal
+ * codes without priming a whole run. Not reachable from any page control.
+ */
+export async function __reconcileResumeForTest({ adb, browserPrepareAttempted = null, journal = null } = {}) {
+  return reconcileResume({ adb, journal, browserPrepareAttempted });
+}
+
+/**
+ * The Resume button's body.
+ *
+ * A resume is refused unless BOTH the release assets and the device reverify, so
+ * this function's first act is to build a plan and stop if it is not safe. Only
+ * then does it re-enter the ordinary run flow, which re-derives everything from
+ * the device — the journal contributes a starting point and nothing more.
+ *
+ * The starting point is the whole point. `runInstall({ resumeFrom })` re-runs the
+ * recorded phase and everything after it, and skips the phases before it. That is
+ * what makes a resume a resume rather than a reinstall: re-entering `initialize`
+ * would reshape userdata a second time, and re-entering `transfer` would push the
+ * whole image again over an install that may already be complete.
+ */
+export async function resumeInstall({ verifyRelease = null, verifyDevice = null } = {}) {
+  if (state.running || state.fetchingBundle) {
+    throw new StageError("install", "wait for the current operation to finish before resuming");
+  }
+  // Claim the writer lock BEFORE any device command. The reverification below
+  // reads the recovery session and the Kaeru header, so a resume that probed
+  // first would talk to a device another tab is already writing to — the exact
+  // interleaved-handshake failure the in-memory claim exists to prevent, one
+  // layer up. runInstall adopts this live grant; Web Locks are non-reentrant,
+  // so it must not request the same exclusive lock again.
+  const claim = await acquireWriterLock();
+  if (!claim.ok) {
+    terminal.warn(`cannot resume: ${claim.reason}`);
+    terminal.info("nothing was written and nothing was read from a device another tab is using. "
+      + "Close the other tab, or wait for it to finish, then press the button again.");
+    setStatusBar({ step: "connect-device", kind: "bad", action: null,
+      message: `Resume not started: ${claim.reason}`,
+      secondary: "Nothing was written. Only one tab of this page may install at a time." });
+    refreshControls();
+    return null;
+  }
+  state.writerLock = claim;
+  try {
+    return await resumeLocked({ verifyRelease, verifyDevice });
+  } finally {
+    // Only released here when the resume never reached runInstall, which owns
+    // the lock from its own point of view once it takes over.
+    if (state.writerLock === claim) {
+      await claim.release();
+      state.writerLock = null;
+    }
+  }
+}
+
+/** The body of resumeInstall, called with the writer lock already held. */
+async function resumeLocked({ verifyRelease = null, verifyDevice = null } = {}) {
+  // Re-fetch and re-verify the signed inventory. After a reload there is nothing
+  // verified in memory, and a journal cannot substitute for the release assets.
+  const reverified = verifyRelease ?? ((context) => reverifyReleaseForResume(context.journal));
+  // Re-establish the actual device. The journal says which Echo; only the device
+  // can confirm it, so this refuses rather than assumes.
+  const deviceCheck = verifyDevice ?? (async () => {
+    if (!state.adb) return { ok: false, reason: "no Echo is connected; press Connect first" };
+    if (!state.resumeSerialSha256) return { ok: true };
+    const digest = await sha256Bytes(new TextEncoder().encode(String(state.identity?.serialRaw ?? state.recoverySerial ?? "")));
+    if (digest !== state.resumeSerialSha256) {
+      return { ok: false, reason: "the connected Echo is not the one this install was for" };
+    }
+    return { ok: true, serial: state.recoverySerial };
+  });
+  const plan = await planResume({ verifyRelease: reverified, verifyDevice: deviceCheck });
+  if (!plan.ok) {
+    terminal.warn(`cannot resume: ${plan.reason}`);
+    terminal.info("nothing was written and nothing was retried. Download and verify the build again, then run the install from the start — "
+      + "the phases that already ran are guarded on the device and will not be repeated blindly.");
+    refreshControls();
+    return null;
+  }
+  // The device must still be verified as the journal's device before any phase.
+  if (state.adb && plan.journal.serialSha256) {
+    await assertResumeMatchesDevice(state.adb);
+  }
+  // Said UNCONDITIONALLY, and before the device is asked anything, because it is
+  // the one thing an operator must never have to re-derive: a resume never
+  // re-sends the unlock payload. It is emitted here, above the reconciliation,
+  // because the reconciliation is exactly where a resume most often refuses — and
+  // a refusal must not be the outcome where the no-rearm claim was never made.
+  if (plan.journal?.unlockState && plan.journal.unlockState !== "none") {
+    terminal.ok("an unlock payload was submitted before the page was reloaded, so it will NOT be sent again");
+  }
+  // The release re-verified above, so the immutable bindings the guard is matched
+  // against are in place. The resume POINT is now the device's to say, not the
+  // journal's: plan.startAt (journal.phase) is deliberately not used for it.
+  const journal = readResumeJournal().journal ?? null;
+  const reconciled = await reconcileResume({
+    adb: state.adb,
+    journal,
+    browserPrepareAttempted: browserPreparedAttempted(plan.journal),
+    isCancelled: () => state.abort,
+  });
+  if (!reconciled.ok) {
+    terminal.warn(`cannot resume: ${reconciled.reason}`);
+    if (reconciled.code) terminal.line(`device reconciliation refused: ${reconciled.code}`);
+    terminal.info("nothing was written. The device keeps the record of what already happened to it, so this is safe to retry once the cause is clear — "
+      + "but nothing here will be guessed at, repeated or reformatted for you.");
+    setStatusBar({ step: "install", kind: "bad", action: null,
+      message: `Resume not started: ${reconciled.reason}`,
+      secondary: "Nothing was written. The device's own transaction record decides what may still run." });
+    refreshControls();
+    return null;
+  }
+  const skipped = reconciled.evidence?.skippedPhases ?? [];
+  terminal.ok(reconciled.guard
+    ? `the device's own transaction record says this install reached the ${reconciled.guard.phase} phase`
+    : "the device holds no transaction record; this is a fresh transaction");
+  if (skipped.length) {
+    terminal.ok(`already done on the device, and not repeated: ${skipped.join(", ")}`);
+  }
+  state.resumeDeviceDigest = reconciled.deviceDigest ?? null;
+  state.resumeGuardPhase = reconciled.guard?.phase ?? null;
+  // The prepare receipt the reconciliation already parsed and accepted as bound
+  // to THIS bundle on THIS device. Handing it to the run avoids a second, looser
+  // `readInstallReceipt` parse that could disagree with the bound one.
+  state.resumePrepareReceipt = reconciled.receipt ?? null;
+  // `initialize` reshapes userdata and `finalize` writes boot slots, so neither is
+  // ever entered on a browser's word. What the guard says about them is what the
+  // module already decided above.
+  if (reconciled.nextPhase === "verify-installed") {
+    // THE finalized CASE IS NOT SUCCESS. The guard records what the helper
+    // STARTED; it does not record that the image landed, and the receipt is
+    // overwritten by every later invocation. Two states are refused outright here,
+    // before any command, because continuing from either would be a guess:
+    //
+    //   * no receipt at all — the device cannot say what its last invocation did;
+    //   * an unclassified failed receipt. The helper's already-finalized
+    //     refusal is the sole exception: it permits a new readback, not success.
+    //
+    // A present, bound receipt permits the fresh installed-state observation
+    // below. The run never re-runs the real finalize.
+    const receipt = reconciled.receipt;
+    if (!receipt) {
+      terminal.warn("the device's record says finalize completed, but its receipt cannot be read, "
+        + "so nothing here can say whether the image actually landed");
+      terminal.info("nothing was written. This is the one point where a repeated install would destroy work — "
+        + "check the device, then start a fresh install deliberately.");
+      setStatusBar({ step: "install", kind: "bad", action: null,
+        message: "Resume not started: the device's finalize receipt cannot be read",
+        secondary: "Nothing was written. The install is not repeated on an unverified device." });
+      refreshControls();
+      return null;
+    }
+    // A prior readback deliberately leaves failed/already-finalized. It can
+    // authorize another readback, never a write or success from that old file.
+    if (receipt.result === "failed" && receipt.error !== "already-finalized") {
+      terminal.warn(`the device's last installer invocation FAILED (result=failed, ${receipt.error ?? "no reason recorded"}), `
+        + "so its outcome has to be classified on the device before anything continues");
+      terminal.info("nothing was written. Preserve the current device state; do not re-run the installer over it "
+        + "without classifying that failure first.");
+      setStatusBar({ step: "install", kind: "bad", action: null,
+        message: `Resume not started: the device reports result=failed (${receipt.error ?? "unknown"})`,
+        secondary: "Nothing was written. The failed invocation must be classified on the device first." });
+      refreshControls();
+      return null;
+    }
+    terminal.ok(`the device's record says finalize completed; its receipt reports result=${receipt.result}, `
+      + "so the run will verify what is actually installed before claiming anything");
+  }
+  return runInstall({ dryRun: false, resumeFrom: reconciled.nextPhase });
+}
+
+/**
+ * Whether this browser can say that no prepare attempt was ever made.
+ *
+ * This is the single fact that makes the "device holds no guard" case safe, since
+ * prepare is the phase that reshapes userdata. It is answered from the durable
+ * per-phase attempt guard the run wrote BEFORE each destructive phase — a browser
+ * that never wrote one cannot have attempted it. `null` (not `false`) is returned
+ * when the answer is unknowable, because `undefined` is a refusal upstream and a
+ * guess here would reshape userdata.
+ */
+function browserPreparedAttempted(journalRecord) {
+  if (!journalRecord) return null;
+  // A journal naming any phase past fresh means this browser got at least as far
+  // as deciding to prepare; a fresh/none record is the only "definitely not" case.
+  if (journalRecord.phase && journalRecord.phase !== "fresh") return true;
+  return false;
 }
 
 /**
@@ -448,6 +1253,7 @@ function renderStepList(activeId = null) {
 }
 
 function currentStage(id) {
+  if (state.running && STAGES.some((stage) => stage.id === id)) { state.runStage = id; state.runFraction = 0; }
   renderStepList(id);
   // A stage change is the primary driver of the sticky bar: it re-points the
   // step counter, the title and the progress bar at the card the operator
@@ -485,7 +1291,9 @@ function stageMessage(step) {
     case "install":
       if (state.running) return "Install in progress. Watch the progress bar; do not unplug the device.";
       if (state.stageProgress?.finalize === "done") return installDoneMessage();
-      return blocked ? `Install is not available yet: ${blocked}.` : "Everything is verified. Press Run the install.";
+      if (blocked) return `Install is not available yet: ${blocked}.`;
+      return state.provisionChosen ? "Everything is verified. Press Install."
+        : "Everything is verified. Optional: fill in step 5 (account and Wi-Fi) so your Echo sets itself up, then press Install.";
     default:
       return "Working…";
   }
@@ -584,7 +1392,10 @@ function stepDone(id) {
   if (id === "unlock-payload") return Boolean(state.payloadBytes);
   // Step 5 is done by a DECISION, not by a prerequisite: skipping is a complete,
   // valid answer, so it must never leave the card "ready" and nagging.
-  if (id === "configure") return provisionDecided();
+  if (id === "configure") {
+    if (state.postInstall === "needs-setup" || state.postInstall === "setup-failed") return false;
+    return state.provisionChosen && provisionDecided();
+  }
   return state.stageProgress?.finalize === "done" || installReadinessReason() === null;
 }
 
@@ -593,7 +1404,10 @@ function stepReady(id) {
   if (id === "download-verify") return Boolean(state.board) && Boolean(state.release) && !state.bundleReady && !state.fetchingBundle;
   if (id === "connect-device") return Boolean(state.bundleReady) && !state.identity;
   if (id === "unlock-payload") return amonetRequirement().mode === "required" && !state.payloadBytes;
-  if (id === "configure") return provisionDecided() ? false : provisionFormValid();
+  if (id === "configure") {
+    if (state.postInstall === "needs-setup" || state.postInstall === "setup-failed") return true;
+    return !state.provisionChosen || (provisionDecided() ? false : provisionFormValid());
+  }
   return state.identity ? installReadinessReason() === null : false;
 }
 
@@ -631,8 +1445,10 @@ export function setStatusBar({ step = null, message = "", kind = "pending", acti
   if (dom.statusBarTitle) dom.statusBarTitle.textContent = stepDef ? stepDef.title : "Ready";
   if (dom.statusBarMessage) dom.statusBarMessage.textContent = message;
   if (dom.statusBar) dom.statusBar.dataset.kind = kind;
-  const percent = Math.max(0, Math.min(100, Math.round(
-    (activeStage >= 0 ? (activeStage / Math.max(1, STAGES.length - 1)) * 100 : 0))));
+  const percent = state.postInstall === "done" ? 100
+    : state.runStage ? runPercent(state.runStage, state.runFraction)
+      : Math.max(0, Math.min(100, Math.round(
+        (activeStage >= 0 ? (activeStage / Math.max(1, STAGES.length - 1)) * 100 : 0))));
   if (dom.statusBarFill) dom.statusBarFill.style.width = `${percent}%`;
   // ARIA progress value is set defensively: a host without setAttribute (the node
   // test DOM stubs) must not be able to break a run.
@@ -1580,6 +2396,30 @@ function isRecoveryDeviceBusy(device) {
   return recoveryClaims.has(claimKey(device));
 }
 
+/**
+ * One actionable explanation per contention episode.
+ *
+ * The busy refusal used to be published by every caller that hit it — the grant,
+ * the entry, and every poll round — so a device that stayed busy for a ten
+ * minute wait produced hundreds of identical lines that buried the real message.
+ * The episode is keyed on the device's claim identity and released when the
+ * contention ends, so a retry after the other owner finishes explains itself
+ * again.
+ */
+function reportUsbBusyOnce(device, what) {
+  const key = claimKey(device);
+  if (state.usbBusyReportedFor === key) return false;
+  state.usbBusyReportedFor = key;
+  terminal.warn(`this USB device is already open elsewhere in this page, so ${what} cannot run. `
+    + "Wait a few seconds for the other operation to finish, or press Stop, then try again.");
+  return true;
+}
+
+/** Ends a contention episode so the next refusal explains itself again. */
+function clearUsbBusyEpisode(device) {
+  if (state.usbBusyReportedFor === claimKey(device)) state.usbBusyReportedFor = null;
+}
+
 /** Raised when a claim is refused because another owner holds the device. */
 class RecoveryDeviceBusy extends StageError {
   constructor(device) {
@@ -1957,6 +2797,12 @@ async function runRecoveryEntry({ request, open }) {
         try {
           const probe = await probeRecoveryEntry({ client: opened.client, terminal });
           if (isStopped() || isEpochStale(epoch)) throw new RecoveryStopped();
+          const journal = readResumeJournal().journal;
+          if (journal && (await sha256Bytes(new TextEncoder().encode(probe.serial)) !== journal.serialSha256
+            || probe.profile.board !== journal.board)) {
+            throw new StageError("recovery", "this is a different Echo from the saved install; reconnect the original Echo");
+          }
+          if (isStopped() || isEpochStale(epoch)) throw new RecoveryStopped();
           // The same five fields claimRecoveryDevice binds, so every later gate
           // (acceptedRecoveryFor, the Kaeru before/after comparison, runInstall's
           // resumedRecovery short-circuit) treats this exactly like a polled
@@ -1980,7 +2826,7 @@ async function runRecoveryEntry({ request, open }) {
     });
   } catch (error) {
     if (error instanceof RecoveryDeviceBusy) {
-      terminal.warn("another part of this page already has this USB device open; wait a few seconds and press the button again");
+      reportUsbBusyOnce(device, "identifying your Echo from recovery");
       refreshControls();
       return null;
     }
@@ -1988,6 +2834,8 @@ async function runRecoveryEntry({ request, open }) {
   } finally {
     state.recoveryGrantInFlight = false;
   }
+  // The contention is over, so the next refusal is allowed to explain itself.
+  clearUsbBusyEpisode(device);
   const identity = state.identity;
   renderDevicePanel(identity, assessIdentity(identity, undefined,
     { selectedBoard: state.target?.board ?? state.bundleBoard ?? null }));
@@ -2494,6 +3342,20 @@ function renderPrerequisites() {
  * and finally the install itself.
  */
 function primaryAction() {
+  const after = postInstallAction();
+  if (after) return after;
+  // A journal naming an unfinished transaction outranks EVERYTHING below,
+  // including "choose your device" and "download the build". After a reload the
+  // page has neither a board nor a release selected — they were in memory — so
+  // any check ordered before this one would send the operator back to step 1 for
+  // a transaction that is already three phases into an install. Resume is the
+  // answer to "where was I", and it reverifies the build and the device itself.
+  if (!state.running && !state.identity && state.resumeBoard && state.resumeReleaseTag) {
+    const action = connectAction();
+    return { step: "connect-device", label: action.label, message: action.message,
+      hint: action.hint, secondary: action.secondary, kind: "action", focus: true,
+      run: action.run };
+  }
   if (state.running) {
     if (state.recoveryWaiting) {
       const wide = state.recoveryChooserWide;
@@ -2585,7 +3447,7 @@ function refreshStatusBar() {
     return;
   }
   setStatusBar({ step: action.step, message: action.message, kind: action.kind ?? "pending",
-    action: action.suppressed ? null : { label: action.label },
+    action: action.suppressed ? null : { label: action.label, disabled: action.disabled === true },
     hint: action.hint ?? "", secondary: action.secondary ?? "",
     // The recovery gesture needs a focused button: requestDevice requires a
     // fresh user activation, so the Run click's activation is long expired by
@@ -2716,6 +3578,16 @@ export function refreshControls() {
   // connection is disabled: the page owns one interface at a time, and a live
   // button here is the affordance that produced the interleaved-handshake failure.
   const operationBusy = deviceOperationBusy();
+  // The one connect/resume control. It is disabled by exactly the same rule as
+  // every other USB-opening control — one interface at a time — and its label is
+  // republished from connectAction() so it always says what pressing it will do.
+  if (dom.connectResume) {
+    const action = connectAction();
+    dom.connectResume.textContent = action.label;
+    dom.connectResume.disabled = busy || operationBusy;
+    dom.connectResume.hidden = state.identity !== null && !state.resumeBoard;
+  }
+  if (dom.connectHint) dom.connectHint.textContent = connectAction().hint;
   dom.buttons.connect.disabled = running || operationBusy;
   dom.buttons.connectAny.disabled = running || operationBusy;
   dom.buttons.grantRecovery.disabled = (busy && !state.recoveryWaiting) || operationBusy;
@@ -2723,26 +3595,16 @@ export function refreshControls() {
   // Once a device is identified it must be closed, so this can never replace or
   // race a fastboot query or an in-progress run.
   dom.buttons.recoveryEntry.disabled = busy || state.identity !== null || operationBusy;
-  // R4: with no identity there are exactly TWO possible states of the Echo —
-  // fastboot or recovery — and the operator could not tell which button to press.
-  // Two labelled choices say it plainly, and they retire once a device is
-  // identified because by then the question is answered. The USB permission
-  // grant is the exception: it only exists DURING the wait for TWRP, so it stays
-  // hidden the rest of the time rather than sitting there looking like a fourth
-  // choice.
-  if (dom.deviceModeChoice) dom.deviceModeChoice.hidden = state.identity !== null;
-  for (const id of ["choice-fastboot", "choice-recovery"]) {
-    const node = document.getElementById(id);
-    if (node) node.hidden = state.identity !== null;
-  }
-  if (dom.deviceModeChoiceDone) dom.deviceModeChoiceDone.hidden = state.identity === null;
   if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.hidden = !state.recoveryWaiting;
   dom.buttons.refresh.disabled = running;
   dom.buttons.abort.disabled = !running;
   // Step 5 is frozen during a run: the document is derived from these exact
   // values after finalize, so changing them mid-run would deliver something the
   // operator never saw validated.
-  const provisionLocked = running || state.stageProgress?.finalize === "done";
+  // After the install the form re-opens only when the running Echo needs setup
+  // and this page holds a USB session to deliver it over.
+  const provisionLocked = running
+    || (state.stageProgress?.finalize === "done" && !state.postInstallSession);
   for (const name of provisionInputs) {
     if (dom.provision[name]) dom.provision[name].disabled = provisionLocked;
   }
@@ -2786,7 +3648,48 @@ function assertNotAborted(stage) {
   if (state.abort) throw new StageError(stage, "aborted by the operator");
 }
 
-export async function runInstall({ dryRun = false, recovery = {} } = {}) {
+/**
+ * The protocol-2 phases, in the order a fresh run performs them.
+ *
+ * `resumeFrom` names the earliest phase that still has to run. Everything before
+ * it is skipped — but ONLY after the release and the device have both reverified
+ * (resumeInstall does that before calling here), and only for a real write run.
+ * A rehearsal always walks the whole list, because it writes nothing.
+ *
+ * `resumeFrom` is the DEVICE's answer (`reconcileResume` → nextPhase), never the
+ * browser journal's phase. The vocabulary is the module's `RESUME_NEXT_PHASES`,
+ * which is deliberately NOT the same set as the helper's phase names: it adds
+ * `payloads` (the browser's own push, which is a separate step from the helper's
+ * `transfer`) and `verify-installed` (read-only, past finalize). Anything outside
+ * the set restarts from the top rather than skipping, because skipping a phase
+ * this list does not contain would be a guess.
+ *
+ * The six names are ORDERED, and the order is load-bearing:
+ *
+ *   prepare -> initialize -> transfer -> payloads -> finalize -> verify-installed
+ *
+ * `transfer` and `payloads` are adjacent but distinct on purpose. `transfer` means
+ * "the helper must still create and gate the landing zone"; `payloads` means "it
+ * already did, and only the browser's push is outstanding". Collapsing them into
+ * one index would either re-run the helper phase over a device that already did
+ * it, or skip the push entirely over a device that never received the image.
+ */
+const DIRECT_PHASES = ["prepare", "initialize", "transfer", "payloads", "finalize", "verify-installed"];
+
+/**
+ * Where a resume re-enters, as an index into DIRECT_PHASES.
+ *
+ * Anything unknown — `null`, `"fresh"`, or a browser journal's own phase
+ * vocabulary — restarts from the top. Skipping a phase on the strength of a value
+ * this list does not contain would be a guess, and a guess here can format
+ * userdata.
+ */
+function resumePhaseIndex(phase) {
+  const index = DIRECT_PHASES.indexOf(phase);
+  return index < 0 ? 0 : index;
+}
+
+export async function runInstall({ dryRun = false, recovery = {}, resumeFrom = null } = {}) {
   if (state.running || state.fetchingBundle) return;
   state.abort = false;
   state.recoveryRestartRequested = true;
@@ -2800,6 +3703,34 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
   // with keepSummary).
   state.provisionState = state.provisionMode === "skip" ? "skipped" : "idle";
   state.provisionDetail = "";
+  state.postInstall = null;
+  state.postInstallIp = null;
+  state.runStage = null;
+  state.runFraction = 0;
+  let afterInstall = null;
+  // Hold the browser's exclusive Web Lock across the entire run. It never
+  // expires while this tab is alive. Resume passes ownership of its live grant
+  // into this run rather than attempting a second, non-reentrant acquisition.
+  let writer = state.writerLock;
+  const adopt = writer?.ok === true && writer.held;
+  if (!dryRun && !adopt) {
+    writer = await acquireWriterLock();
+    if (!writer.ok) {
+      terminal.warn(`cannot start the install: ${writer.reason}`);
+      terminal.info("nothing was written. Close the other tab, or wait for it to finish, then press the button again.");
+      setStatusBar({ step: "install", kind: "bad", action: null,
+        message: `Install not started: ${writer.reason}`,
+        secondary: "Nothing was written. Only one tab of this page may install at a time." });
+      refreshControls();
+      return null;
+    }
+  }
+  if (writer?.ok === true) state.writerLock = writer;
+  const resumeAt = dryRun ? 0 : resumePhaseIndex(resumeFrom);
+  if (!dryRun && resumeAt > 0) {
+    terminal.info(`resuming at the ${DIRECT_PHASES[resumeAt]} phase; `
+      + `the ${DIRECT_PHASES.slice(0, resumeAt).join(", ")} phase(s) already ran and are not repeated`);
+  }
   setRunning(true);
   terminal.phase(1, STAGES.length, dryRun ? "rehearsal: no writes" : "browser one-shot install");
   terminal.info(`release ${state.release?.tag ?? "(none)"} · repository ${config.repository}`);
@@ -2838,6 +3769,10 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
       { selectedBoard: state.target?.board ?? state.bundleBoard ?? null });
     state.stageProgress.identity = "done";
     const profile = state.identity.profile;
+    // Name the transaction now that there is a device and a release to name it
+    // with. Best-effort: a missing journal costs convenience on a later reload,
+    // never the run.
+    await recordResumeProgress({ phase: "fresh" }).catch(() => {});
     // The board comes from the resolved target (or the verified build metadata).
     // A legacy release without a targets.json descriptor is Radar-only.
     const knownBoard = state.target?.board ?? state.bundleBoard ?? null;
@@ -2867,6 +3802,15 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     }
 
     const resumedRecovery = state.adb && state.recoverySerial === state.identity.serialRaw && state.kaeruHeader;
+    // A resume whose journal says the unlock already went out. The page-session
+    // latch (`state.unlockSubmitted`) is exactly what a reload destroys, and the
+    // durable `libreecho.unlock.sent.*` guard inside submitUnlockPayload is what
+    // still holds — but relying on that alone would mean the run reached the
+    // unlock branch at all, and re-reading a locked fastboot identity is not
+    // evidence that brick was not already sent. So the journal's word is treated
+    // as a hard skip: continue, never re-submit.
+    const resumeUnlockSettled = Boolean(resumeFrom) && (state.resumeUnlockSubmitted
+      || readResumeJournal().journal?.unlockState !== "none");
     // The unlock latch is per page session and keyed to the serial. Once flash:brick
     // has been sent the outcome is unknown (usually the device stops answering), so
     // the ONLY correct follow-up is the recovery wait — never a second submission.
@@ -2875,6 +3819,9 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     const unlockAlreadySent = state.unlockSubmitted === state.identity.serialRaw;
     if (resumedRecovery) {
       terminal.ok("continuing from verified recovery without re-submitting the unlock payload");
+      state.stageProgress.unlock = "done";
+    } else if (resumeUnlockSettled) {
+      terminal.ok("an unlock payload was submitted before the page was reloaded, so it will NOT be sent again");
       state.stageProgress.unlock = "done";
     } else if (unlockAlreadySent) {
       terminal.ok("the unlock payload was already submitted in this page session; continuing from TWRP without re-submitting it");
@@ -2921,6 +3868,9 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
       // keeping the dedicated permission action available while it waits.
       await awaitRecovery(recovery);
     }
+    // From here on the unlock is settled one way or another, so the journal must
+    // say so: after a reload this is what keeps flash:brick from being resent.
+    await recordResumeProgress({ phase: "fresh", kaeruHeader: state.kaeruHeader }).catch(() => {});
     const kaeruBefore = await readKaeruHeader(state.adb);
     if (resumedRecovery && kaeruBefore !== state.kaeruHeader) {
       throw new StageError("recovery", "Kaeru header changed since recovery was verified; do not install");
@@ -2955,17 +3905,69 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     assertNotAborted("stage");
 
     currentStage("prepare");
-    const prepared = await runDirectPhase({ ...phaseShared, phase: "prepare" });
-    state.receipts.push(prepared);
-    phaseShared.deviceDigest = prepared.device_digest;
-    if (!["prepare-ok", "prepare-noop"].includes(prepared.result)) {
-      throw new StageError("prepare", `the prepare phase returned result=${prepared.result ?? "unknown"}`);
+    let prepared = null;
+    // A resume past prepare must NOT re-run it: prepare is the phase that
+    // reshapes userdata when the layout does not match, so re-entering it can
+    // destroy work the previous run already did. It was skipped only because the
+    // DEVICE's guard said so (see reconcileResume), and the device digest that
+    // binds the rest of the run to this device comes from the same evidence.
+    if (resumeAt > DIRECT_PHASES.indexOf("prepare")) {
+      // The helper OVERWRITES the receipt on every invocation, so whatever is
+      // there now describes the LAST thing that ran — a transfer, a finalize, or
+      // a read-only rehearsal — and it is not prepare evidence at all.
+      //
+      // Skipping prepare needs NO receipt when the device's guard already says
+      // the transaction got past it (`initialize`/`transfer`/`finalizing`/
+      // `finalized` are only ever written after prepare completed). Judging the
+      // latest receipt as prepare evidence would refuse every such continuation,
+      // naming a perfectly good `result=installed` as a broken prepare.
+      //
+      // `guardPhase === 'prepare'` is the ONE case where the latest receipt IS
+      // the prepare evidence, and it is exactly the case the reconciliation has
+      // already verified as bound to this bundle on this device before handing
+      // the run a resume point at all. So only there is its result judged, and a
+      // non-prepare result there is still a refusal.
+      const lastSeen = state.resumePrepareReceipt ?? await readInstallReceipt(state.adb);
+      if (state.resumeGuardPhase === "prepare" && lastSeen?.result
+        && !["prepare-ok", "prepare-noop"].includes(lastSeen.result)) {
+        throw new StageError("prepare", `the device reports prepare result=${lastSeen.result}; classify it before continuing`);
+      }
+      prepared = { ...(lastSeen ?? {}), device_digest: state.resumeDeviceDigest ?? lastSeen?.device_digest ?? null };
+      terminal.ok(`continuing after a prepare phase the device's record says completed `
+        + `(the last invocation the device recorded was ${lastSeen?.result ?? "nothing readable"}); it is not re-run`);
+      // The digest is the binding for every later phase. When the reconciliation
+      // measured one, use it; never leave a later phase unbound.
+      prepared = { ...(prepared ?? {}), device_digest: state.resumeDeviceDigest ?? prepared?.device_digest ?? null };
+    } else {
+      prepared = await runDirectPhase({ ...phaseShared, phase: "prepare" });
+      state.receipts.push(prepared);
+      if (!["prepare-ok", "prepare-noop"].includes(prepared.result)) {
+        throw new StageError("prepare", `the prepare phase returned result=${prepared.result ?? "unknown"}`);
+      }
+      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+        throw new StageError("install", "expdb Kaeru header changed during the prepare phase; do not reboot");
+      }
+      assertNotAborted("prepare");
     }
-    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-      throw new StageError("install", "expdb Kaeru header changed during the prepare phase; do not reboot");
-    }
-    assertNotAborted("prepare");
-    if (prepared.reboot_required === "1") {
+    phaseShared.deviceDigest = prepared?.device_digest ?? null;
+    // The device digest is the receipt's own device binding: it is what lets a
+    // resume prove it is talking to the same device the helper measured.
+    //
+    // The journal must name the LAST PHASE THE DEVICE COMPLETED, never the one
+    // this run is entering. Writing `prepare` unconditionally here rewound the
+    // record of a resume whose device had already reached `initialize`: the next
+    // reload then read a journal claiming less progress than the device had
+    // actually made, and the only thing that saved it was the device guard
+    // catching the disagreement. A journal that lags is a hint that misleads.
+    // `resumeGuardPhase` is the device's own answer and is only ever a phase the
+    // helper had actually reached.
+    const completedPhase = resumeAt > DIRECT_PHASES.indexOf("prepare")
+      ? (state.resumeGuardPhase ?? "prepare")
+      : "prepare";
+    await recordResumeProgress({ phase: completedPhase, bundleManifestSha256: state.directManifestSha,
+      deviceDigest: phaseShared.deviceDigest, kaeruHeader: state.kaeruHeader,
+      target: targetBoard }).catch(() => {});
+    if (resumeAt <= DIRECT_PHASES.indexOf("prepare") && prepared.reboot_required === "1") {
       terminal.info("userdata was reshaped; rebooting recovery before it can be initialized");
       await rebootAndWait({ adb: state.adb, target: "recovery", terminal });
       // The reboot disconnected the pre-reboot session: drop it so the next wait
@@ -2982,43 +3984,131 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     assertNotAborted("prepare");
 
     currentStage("initialize");
-    const initialized = await runDirectPhase({ ...phaseShared, phase: "initialize" });
-    state.receipts.push(initialized);
-    if (initialized.result !== "initialized") {
-      throw new StageError("initialize", `the initialize phase returned result=${initialized.result ?? "unknown"}`);
+    // `initialize` is the one userdata-formatting phase, so it is never re-entered
+    // because a journal said so. It is skipped only when the DEVICE's guard
+    // recorded format_state=formatted, and the module verified the layout
+    // fingerprint before returning that answer — so this branch reads the
+    // evidence rather than assuming, and userdata is never reshaped a second time.
+    if (resumeAt > DIRECT_PHASES.indexOf("initialize")) {
+      const earlier = await readInstallReceipt(state.adb);
+      terminal.ok(`the device's record says userdata is already formatted `
+        + `(the device reports ${earlier?.result ?? "no stored receipt"}); userdata is not reshaped again`);
+    } else {
+      const initialized = await runDirectPhase({ ...phaseShared, phase: "initialize" });
+      state.receipts.push(initialized);
+      await recordResumeProgress({ phase: "initialize", bundleManifestSha256: state.directManifestSha,
+        deviceDigest: phaseShared.deviceDigest, kaeruHeader: state.kaeruHeader,
+        target: targetBoard }).catch(() => {});
+      if (initialized.result !== "initialized") {
+        throw new StageError("initialize", `the initialize phase returned result=${initialized.result ?? "unknown"}`);
+      }
+      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+        throw new StageError("install", "expdb Kaeru header changed during initialize; do not install");
+      }
+      state.stageProgress.initialize = "done";
+      assertNotAborted("initialize");
     }
-    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-      throw new StageError("install", "expdb Kaeru header changed during initialize; do not install");
-    }
-    state.stageProgress.initialize = "done";
-    assertNotAborted("initialize");
 
     currentStage("transfer");
-    const transferred = await runDirectPhase({ ...phaseShared, phase: "transfer" });
-    state.receipts.push(transferred);
-    if (transferred.result !== "transferred") {
-      throw new StageError("transfer", `the transfer phase returned result=${transferred.result ?? "unknown"}`);
+    // The helper's `transfer` phase creates the landing zone and gates free space.
+    // It is distinct from the browser's own push (`payloads` below): a resume may
+    // need neither, one, or both, and the device's guard decides which.
+    if (resumeAt > DIRECT_PHASES.indexOf("transfer")) {
+      terminal.ok("the device's record says the transfer phase already ran; it is not re-run");
+    } else {
+      const transferred = await runDirectPhase({ ...phaseShared, phase: "transfer" });
+      state.receipts.push(transferred);
+      await recordResumeProgress({ phase: "transfer", bundleManifestSha256: state.directManifestSha,
+        deviceDigest: phaseShared.deviceDigest, kaeruHeader: state.kaeruHeader,
+        target: targetBoard }).catch(() => {});
+      if (transferred.result !== "transferred") {
+        throw new StageError("transfer", `the transfer phase returned result=${transferred.result ?? "unknown"}`);
+      }
+      assertNotAborted("transfer");
+      state.stageProgress.transfer = "done";
+      assertNotAborted("transfer");
     }
+
+    // `payloads` is not a STAGES id — the push is the second half of the same
+    // "Transfer payloads to userdata" card, so it repaints that stage rather than
+    // inventing a thirteenth one.
+    currentStage("transfer");
+    // A device whose guard says FINALIZED already consumed the payloads: the
+    // helper hardlinked or moved them into the installed tree. Re-pushing the
+    // whole image into /data there is a large mutation on a device that is
+    // already installed, so it is never done. The read-only hash readback still
+    // runs as evidence, and a file it cannot find is reported rather than
+    // repaired — restoring it is a deliberate fresh install, not a resume.
+    const verifyingFinalized = resumeAt > DIRECT_PHASES.indexOf("finalize");
+    // Did the browser's push land? Never an assumption either way: skipping it
+    // unconditionally wastes the whole image, and running it unconditionally
+    // re-sends it over an install that may already be complete. The answer is a
+    // read-only hash of the landing zone. The finalize phase re-hashes whatever is
+    // actually there and refuses if it is incomplete, so a skipped push cannot
+    // fake a complete install.
+    const landed = await readLandedPayloads({
+      adb: state.adb, roles: state.directRoles, terminal, isCancelled: () => state.abort,
+    });
     assertNotAborted("transfer");
-    const pushed = await pushDirectPayloads({ adb: state.adb, roles: state.directRoles, files: state.files, sums: state.sums, terminal, isCancelled: () => state.abort });
-    terminal.ok(`pushed ${pushed.fileCount} verified payload(s) into ${DIRECT_INCOMING_DIR}`);
+    const present = new Set(landed.checked.filter((entry) => entry.present).map((entry) => entry.name));
+    const missing = landed.checked.filter((entry) => !entry.present);
+    if (verifyingFinalized) {
+      if (missing.length) {
+        terminal.warn(`${missing.length} of ${landed.checked.length} landing-zone payload(s) are absent or do not match `
+          + `(${missing.slice(0, 4).map((entry) => `${entry.name}: ${entry.reason}`).join(", ")}); `
+          + "nothing is pushed over an already-installed device");
+      }
+      terminal.ok("this install is already finalized, so no payload is pushed again");
+    } else if (missing.length === 0) {
+      terminal.ok(`all ${landed.checked.length} verified payload(s) are already on the device and match; nothing is pushed again`);
+    } else {
+      terminal.info(`${missing.length} of ${landed.checked.length} payload(s) are missing or do not match `
+        + `(${missing.slice(0, 4).map((entry) => `${entry.name}: ${entry.reason}`).join(", ")}); pushing only those`);
+      const rolesToPush = state.directRoles.filter((role) => !present.has(role.name));
+      const pushed = await pushDirectPayloads({
+        adb: state.adb, roles: rolesToPush, files: state.files, sums: state.sums, terminal,
+        isCancelled: () => state.abort,
+        onProgress: (fraction) => setRunProgress("transfer", fraction),
+      });
+      terminal.ok(`pushed ${pushed.fileCount} verified payload(s) into ${DIRECT_INCOMING_DIR}`);
+    }
     state.stageProgress.transfer = "done";
     assertNotAborted("transfer");
 
     currentStage("finalize");
-    // The landed-completely gate: finalize --dry-run verifies every upload by
-    // digest and writes nothing. Only then is the real finalize (no format) run.
-    const rehearsal = await runDirectPhase({ ...phaseShared, phase: "finalize", dryRun: true });
-    if (rehearsal.result !== "dry-run-ok") {
-      throw new StageError("finalize", `the landed-completely check returned result=${rehearsal.result ?? "unknown"}`);
-    }
-    const finalized = await runDirectPhase({ ...phaseShared, phase: "finalize" });
-    state.receipts.push(finalized);
-    if (finalized.result !== "installed") {
-      throw new StageError("finalize", `the finalize phase returned result=${finalized.result ?? "unknown"}`);
-    }
-    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-      throw new StageError("install", "expdb Kaeru header changed during finalize; do not reboot");
+    // Finalized guards require a FRESH observation of installed bytes. A stored
+    // receipt is only historical evidence. The helper's finalized branch refuses
+    // the write (rc=1, already-finalized) but attaches installed readback before
+    // it ever touches the consumed landing zone. Normal dry-run success is NOT
+    // proof of installed state and is refused by this dedicated parser mode.
+    if (verifyingFinalized) {
+      const bootPin = state.directRoles.find(role => role.role === "transfer:boot")?.sha256;
+      if (!bootPin) throw new StageError("finalize", "verified boot pin is missing");
+      const proof = await runDirectPhase({ ...phaseShared, phase: "finalize", dryRun: true,
+        verifyInstalledBootSha256: bootPin });
+      state.receipts.push(proof);
+      terminal.ok("fresh installed-state readback matches this bundle; no boot image or payload was written again");
+    } else {
+      // The landed-completely gate: finalize --dry-run verifies every upload by
+      // digest and writes nothing. Only then is the real finalize (no format) run.
+      const rehearsal = await runDirectPhase({ ...phaseShared, phase: "finalize", dryRun: true });
+      if (rehearsal.result !== "dry-run-ok") {
+        throw new StageError("finalize", `the landed-completely check returned result=${rehearsal.result ?? "unknown"}`);
+      }
+      const finalized = await runDirectPhase({ ...phaseShared, phase: "finalize" });
+      state.receipts.push(finalized);
+      await recordResumeProgress({ phase: "finalize", bundleManifestSha256: state.directManifestSha,
+        deviceDigest: phaseShared.deviceDigest, kaeruHeader: state.kaeruHeader,
+        target: targetBoard }).catch(() => {});
+      if (finalized.result !== "installed") {
+        throw new StageError("finalize", `the finalize phase returned result=${finalized.result ?? "unknown"}`);
+      }
+      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+        throw new StageError("install", "expdb Kaeru header changed during finalize; do not reboot");
+      }
+      // Outcome known: this transaction's "never repeat" guards are retired so
+      // a later reinstall of the same release is possible.
+      await retireDirectPhaseGuards({ serialRaw: phaseShared.serialRaw, tag: phaseShared.tag });
     }
     state.stageProgress.finalize = "done";
 
@@ -3046,26 +4136,30 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     currentStage("verify");
     terminal.phase(STAGES.length, STAGES.length, "verify and reboot");
     assertNotAborted("verify");
+    const installedSerial = state.identity?.serialRaw ?? state.recoverySerial ?? "";
     await rebootAndWait({ adb: state.adb, target: "", terminal });
-    terminal.warn("reboot requested; installed OS boot, userdata preservation and service readiness are NOT verified by this page");
-    if (state.provisionState === "delivered") {
-      terminal.info(`the configuration is on the device; it applies it on first boot. This page has NOT confirmed that it did — open the setup page on the device to check.`);
-    } else if (state.provisionMode === "skip") {
-      terminal.info("open the setup page on the device to finish setting it up");
-    } else {
-      terminal.warn("the configuration was NOT delivered — open the setup page on the device and set it up there");
-    }
-    terminal.info("confirm the same device and its marker-free running image before calling the installation complete");
     state.stageProgress.verify = "done";
+    if (state.provisionMode === "skip") {
+      terminal.info("once LibreEcho starts, this page offers the setup step here (the setup page on the device also works)");
+    }
+    // The install's writes are over. The wait for LibreEcho to start runs AFTER
+    // this run has released its lock and recovery session (below the finally),
+    // because it only reads from the running image.
+    afterInstall = { serial: installedSerial, expectProvision: state.provisionState === "delivered" };
     // Every secret this page held is dropped the moment it is no longer needed:
     // the closing message keeps only the non-secret hostname/SSID.
     clearProvisionSecrets({ keepSummary: true });
+    // The transaction is over, so the resume record goes. This removes exactly
+    // one key — the journal's own — and never the durable libreecho.unlock.*,
+    // libreecho.recovery.* or libreecho.direct.* attempt guards, which must keep
+    // saying "already attempted" for as long as the browser holds them.
+    clearResumeJournal();
     // Success is republished to the bar too; the run is over and nothing is
     // pending, so no primary action is offered. Issue 22 wanted an explicit
     // DONE state here rather than a silent, indistinguishable final screen.
-    setStatusBar({ step: "install", kind: "ok", action: null,
-      message: installDoneMessage(),
-      hint: "Done: the install ran to the end and a reboot was requested.",
+    setStatusBar({ step: "install", kind: "pending", action: null,
+      message: "Installed. Your Echo is restarting into LibreEcho — keep it plugged in while this page checks it started.",
+      hint: "This usually takes one to two minutes.",
       secondary: "The full log is beside the steps; use Save log to keep it." });
   } catch (error) {
     const stage = error instanceof StageError ? error.stage : "unknown";
@@ -3081,6 +4175,14 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
         ? "The unlock payload was already submitted in this page session; it will not be sent again."
         : "" });
   } finally {
+    // The durable writer lock is released on EVERY exit — success, refusal,
+    // failure and Stop — so a failed run never leaves the operator locked out of
+    // their own next attempt. `release()` only ever removes this tab's own lock.
+    if (state.writerLock === writer && writer?.held) {
+      writer.setPhase("done");
+      await writer.release();
+      state.writerLock = null;
+    }
     setRunning(false);
     // The run owns no recovery session once it ends; drop the bound handle and
     // invalidate any grant whose chooser may still be open.
@@ -3093,9 +4195,232 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     // post-invalidate state.
     refreshControls();
   }
+  if (afterInstall && !dryRun) {
+    if (postInstallHook) await postInstallHook(afterInstall);
+    else await waitForLibreEcho(afterInstall);
+  }
+}
+
+// --- after the install: did LibreEcho actually start? ----------------------
+//
+// The old page stopped at "reboot requested" and told the operator to go and
+// find the setup page. The one-shot installer this replaces did better: it
+// waited for the device's own ADB, then opened the setup page. This does the
+// same from the browser, read-only: it re-attaches to the SAME Echo (serial
+// checked) on LibreEcho's own adbd, waits for startup-ready and the web
+// service, and then either reports where the device is on the network, or —
+// if nobody configured it — offers the setup form right here.
+
+const POST_INSTALL_ATTACH_MS = 240000;
+// Test seam: replaces the real wait, so host suites never sit on a timer.
+let postInstallHook = null;
+export function __setPostInstallHookForTest(hook) { postInstallHook = hook; }
+
+async function attachRunningEcho({ serial, deadline, generation }) {
+  // No WebUSB (a test harness or an unsupported browser): nothing to attach to.
+  if (!globalThis.navigator?.usb) return null;
+  const support = await protocolSupport();
+  if (!support.adbTransport.ok || !support.adb.ok) throw new Error(support.adbTransport.reason || support.adb.reason);
+  const Transport = support.adbTransport.value;
+  const Client = support.adb.value;
+  while (Date.now() < deadline) {
+    if (state.abort || generation !== state.postInstallGeneration) return null;
+    const devices = await Transport.getDevices({ filters: RUNNING_ADB_FILTERS }).catch(() => []);
+    for (const device of devices) {
+      if (serial && device.serialNumber && device.serialNumber !== serial) continue;
+      let transport;
+      try {
+        transport = await new Transport(device, {}).open();
+        const client = new Client(transport);
+        await client.connect({ banner: "host::libreecho-browser-installer" });
+        return { device, transport, client };
+      } catch {
+        try { await transport?.close(); } catch { /* re-enumerating */ }
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  return null;
+}
+
+/** The bar's action after an install, or null while nothing post-install applies. */
+function postInstallAction() {
+  const s = state.postInstall;
+  if (!s || (state.running && s !== "booting")) return null;
+  const host = state.provisionHostname || "libreecho";
+  const check = () => waitForLibreEcho({ request: true }).catch((error) => terminal.error(error.message));
+  if (s === "booting" || s === "applying") {
+    // While booting the button is live: a browser that has never been allowed to
+    // use the RUNNING Echo (a different USB identity from TWRP) cannot find it
+    // on its own, and making the operator wait out the whole deadline first is
+    // the "nothing is happening" screen the operator reported.
+    return { step: "install", label: "Check my Echo", kind: "pending", suppressed: s === "applying",
+      run: check,
+      message: s === "applying"
+        ? "LibreEcho is running and applying your settings — joining your Wi-Fi. Keep it plugged in."
+        : "Installed. Your Echo is restarting into LibreEcho — keep it plugged in while this page checks it started.",
+      hint: s === "applying" ? "This usually takes one to two minutes."
+        : "This usually takes one to two minutes. If Chrome has not been allowed to use the running Echo yet, press Check my Echo and choose “LibreEcho”.",
+      secondary: "" };
+  }
+  if (s === "done") {
+    const url = `http://${state.postInstallIp}:8080/`;
+    return { step: "install", label: "Open your Echo's page", kind: "ok", focus: true,
+      message: `Done — your Echo is running LibreEcho and is on your network at ${state.postInstallIp} (also ${host}.local).`,
+      hint: "Press the button to open its page.", secondary: "",
+      run: () => window.open(url, "_blank", "noopener") };
+  }
+  if (s === "needs-setup" || s === "setup-failed") {
+    const ready = Boolean(state.postInstallSession) && validateProvision(provisionForm()).length === 0
+      && Boolean(provisionForm().ssid);
+    return { step: "configure", label: state.postInstallSession ? "Send settings to your Echo" : "Check my Echo",
+      kind: s === "setup-failed" ? "bad" : "action", focus: ready,
+      message: s === "setup-failed"
+        ? `LibreEcho is running, but it did not finish setting itself up (${state.postInstallDetail || "unknown reason"}). Check step 5 and send the settings again.`
+        : "LibreEcho is running. Now set it up: fill in step 5 — account and Wi-Fi — then press Send settings to your Echo.",
+      hint: ready ? "The settings go over USB; nothing is reinstalled."
+        : "Fill in every field in step 5, including your Wi-Fi name and password.",
+      secondary: "", disabled: state.postInstallSession ? !ready : false,
+      run: state.postInstallSession
+        ? () => sendSettingsToRunningEcho().catch((error) => terminal.error(error.message))
+        : check };
+  }
+  return { step: "install", label: "Check my Echo", kind: "warn", focus: true,
+    message: s === "no-permission"
+      ? "Installed, but this page could not reach your Echo after it restarted. Press Check my Echo and choose “LibreEcho” in Chrome's list."
+      : "Installed, but your Echo has not finished starting yet. Leave it plugged in and press Check my Echo.",
+    hint: "Checking only reads; nothing is reinstalled.", secondary: "", run: check };
+}
+
+function publishPostInstall() {
+  refreshStatusBar();
+}
+
+/**
+ * Waits for the installed Echo to come up and routes to the next step. Also the
+ * body of the "Check my Echo" action, so a slow first boot or a page reload can
+ * pick up from here.
+ */
+export async function waitForLibreEcho({ serial = state.identity?.serialRaw ?? "", expectProvision = false, request = false, device = null,
+  open = openAdb, pollOptions = {} } = {}) {
+  // Each wait takes a generation. A newer one (a Check my Echo press during the
+  // background wait) supersedes it: the old loop stops and leaves the outcome
+  // to the newer call.
+  state.postInstallGeneration = (state.postInstallGeneration ?? 0) + 1;
+  const generation = state.postInstallGeneration;
+  const superseded = () => generation !== state.postInstallGeneration;
+  state.postInstall = "booting";
+  state.postInstallDetail = "";
+  setRunProgress("verify", 0.05);
+  terminal.phase(STAGES.length, STAGES.length, "waiting for LibreEcho to start");
+  publishPostInstall();
+  let session = null;
+  try {
+    if (request || device) {
+      // From a button press: may ask Chrome for permission to the running image.
+      const chosen = device ?? await navigator.usb.requestDevice({ filters: RUNNING_ADB_FILTERS });
+      const opened = await open({ device: chosen, onLog: (line) => terminal.line(line) });
+      session = { device: chosen, transport: opened.transport, client: opened.client };
+      serial = serial || chosen.serialNumber || "";
+    } else {
+      session = await attachRunningEcho({ serial, deadline: Date.now() + POST_INSTALL_ATTACH_MS, generation });
+    }
+    if (!session) {
+      if (superseded()) return state.postInstall;
+      state.postInstall = "no-permission";
+      terminal.warn("LibreEcho's own USB connection did not appear with the permission this page already has");
+      publishPostInstall();
+      refreshControls();
+      return state.postInstall;
+    }
+    terminal.ok("re-attached to your Echo on LibreEcho's own ADB");
+    const started = Date.now();
+    const { probe, verdict } = await pollRunningEcho({
+      client: session.client, expectedSerial: serial, expectProvision,
+      isCancelled: () => state.abort, ...pollOptions,
+      onProbe: (_probe, v) => setRunProgress("verify", Math.min(0.95, 0.2 + (Date.now() - started) / 300000 + (v.state === "applying" ? 0.3 : 0))),
+    });
+    state.postInstall = verdict.state;
+    state.postInstallIp = verdict.ip ?? probe.ip ?? null;
+    state.postInstallDetail = verdict.error ? `${verdict.error}${verdict.wifi ? `, Wi-Fi ${verdict.wifi}` : ""}` : "";
+    if (verdict.state === "done") {
+      setRunProgress("verify", 1);
+      terminal.ok(`LibreEcho started, is set up, and is on the network at ${state.postInstallIp}`);
+    } else if (verdict.state === "needs-setup") {
+      setRunProgress("verify", 1);
+      terminal.ok("LibreEcho started; it has not been set up yet");
+      state.postInstallSession = session;
+      session = null; // kept open for "Send settings to your Echo"
+      state.provisionState = "idle";
+      if (state.provisionMode !== "fill") setProvisionMode("fill");
+    } else if (verdict.state === "setup-failed") {
+      terminal.warn(`LibreEcho started but setup did not complete: ${state.postInstallDetail}`);
+      state.postInstallSession = session;
+      session = null;
+      state.provisionState = "idle";
+      if (state.provisionMode !== "fill") setProvisionMode("fill");
+    } else {
+      terminal.warn(`LibreEcho did not report ready in time (last state: ${verdict.last})`);
+    }
+  } catch (error) {
+    if (isChooserCancel(error)) { terminal.info("No device was selected."); state.postInstall = "no-permission"; }
+    else { terminal.warn(`checking LibreEcho failed: ${error.message}`); state.postInstall = "timeout"; }
+  } finally {
+    if (session) { try { await session.client?.close?.(); } catch { try { await session.transport?.close?.(); } catch { /* gone */ } } }
+  }
+  publishPostInstall();
+  refreshControls();
+  return state.postInstall;
+}
+
+/** "Send settings to your Echo": step 5 delivered to the RUNNING image over USB. */
+export async function sendSettingsToRunningEcho({ waitOptions = {} } = {}) {
+  const session = state.postInstallSession;
+  if (!session?.client) throw new StageError("configure", "reconnect your Echo first (press Check my Echo)");
+  const target = profileForBoard(state.identity?.profile?.board ?? state.board)?.slug ?? null;
+  const release = state.directRelease || state.release?.tag || "";
+  state.running = true;
+  refreshControls();
+  try {
+    terminal.phase(STAGES.length, STAGES.length, "sending your settings to the running Echo");
+    await sendSetupToRunningEcho({ client: session.client, form: provisionForm(), release, target, terminal,
+      isCancelled: () => state.abort });
+    state.provisionState = "delivered";
+    state.provisionHostname = provisionForm().hostname;
+    state.provisionSsid = provisionForm().ssid;
+    clearProvisionSecrets({ keepSummary: true });
+    terminal.ok("settings delivered; your Echo is applying them");
+  } catch (error) {
+    terminal.error(`settings NOT delivered: ${error.message}`);
+    setStatusBar({ step: "configure", kind: "bad", message: `Your settings were not delivered: ${error.message}`,
+      hint: "Fix step 5 and press Send settings to your Echo again.", secondary: "" });
+    state.running = false;
+    refreshControls();
+    return null;
+  }
+  state.running = false;
+  state.postInstallSession = null;
+  refreshControls();
+  // Only the web service restarted, so the same USB session still works: reuse
+  // it to watch the device apply the settings and join the Wi-Fi.
+  return waitForLibreEcho({ serial: state.identity?.serialRaw ?? session.device?.serialNumber ?? "",
+    expectProvision: true, device: session.device ?? {}, open: async () => session, ...waitOptions });
 }
 
 // --- wiring ----------------------------------------------------------------
+
+/**
+ * A test-only seam onto the per-device claim registry. The USB-busy
+ * deduplication is about two owners of one interface, and reproducing that needs
+ * a second owner; this creates one without opening a real device. It is exported
+ * for the suite and is not reachable from any page control.
+ */
+export function __claimDeviceForTest(device) {
+  const key = claimKey(device);
+  if (recoveryClaims.has(key)) return null;
+  recoveryClaims.set(key, { epoch: state.recoveryEpoch, at: Date.now() });
+  return () => recoveryClaims.delete(key);
+}
 
 dom.buttons.refresh?.addEventListener("click", () => loadReleases().catch((error) => terminal.error(error.message)));
 dom.deviceSelect?.addEventListener("change", () => {
@@ -3147,6 +4472,15 @@ dom.buttons.fetchArchive?.addEventListener("click", () => {
 });
 dom.payloadInput?.addEventListener("change", (event) => {
   loadPayload(event.target.files?.[0]).catch((error) => terminal.error(`payload read failed: ${error.message}`));
+});
+// The ONE connect action. It is a dispatcher, not a second implementation: it
+// calls connectAction(), which is the same object the sticky status bar renders,
+// so the in-card button and the bar can never disagree about what pressing this
+// does. Everything else about a connection (which USB mode, fastboot or recovery)
+// is decided by what the device actually answers.
+dom.connectResume?.addEventListener("click", () => {
+  const action = connectAction();
+  action.run();
 });
 dom.buttons.connect?.addEventListener("click", () => {
   queryDevice().catch((error) => terminal.error(`device query failed: ${error.message}`));
@@ -3216,9 +4550,23 @@ terminal.info("LibreEcho browser installer — preview");
 terminal.info(`repository: ${config.repository}${config.mirrorBase ? ` · mirror: ${config.mirrorBase}` : ""}`);
 terminal.info("choose your device, then download the build made for it; nothing is downloaded automatically");
 renderBoardOptions();
-setProvisionMode("skip");
+setProvisionMode("skip", { chosen: false });
 setRunning(false);
 renderStepList(null);
+// A reload restores only the non-secret transaction context, before anything
+// else, so the status bar can already say what this page was doing. It restores
+// no identity and no bundle readiness, so the Connect/Resume action stays gated.
+restoreResumeState().then((restored) => {
+  // Read-only identification of a previously granted device. This may NAME a
+  // device and nothing else: it is deliberately not chained to any run, so a page
+  // load can never begin a write, an unlock or a reboot.
+  return autoIdentifyGrantedDevice().catch((error) => {
+    terminal.info(`this page will ask which device to use: ${error.message}`);
+    return null;
+  }).then((identified) => {
+    if (restored?.ok || identified?.identified) refreshControls();
+  });
+});
 reportCapabilities()
   .then(({ support }) => {
     if (support.ok) loadReleases();

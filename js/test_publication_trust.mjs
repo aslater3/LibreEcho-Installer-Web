@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { directFixture, combinedFixture } from './combined-fixture.mjs';
+import { installWebLocksFixture, resetWebLocksFixture } from './web-locks-fixture.mjs';
 
 class Element {
   constructor() {
@@ -28,6 +29,19 @@ globalThis.document = {
   createElement() { return new Element(); },
 };
 globalThis.window = { isSecureContext: false, location: { search: '' } };
+// --- Web Locks (js/writer-lock.js) ------------------------------------------
+// app.js takes the browser's origin-wide exclusive writer lock before any device
+// command and FAILS CLOSED without it, so under node — which has `navigator` but
+// no `navigator.locks` — every install here would stop at "cannot start the
+// install: this browser does not offer Web Locks" and never reach the behaviour
+// under test. This is a faithful LockManager double, not an allow-anything stub:
+// it excludes a second holder of the same name and holds the grant until the
+// granted callback settles. Installed AFTER the `navigator` redefinition above,
+// which replaces the whole object. See js/test_web_locks_integration.mjs, which
+// drives the real acquireWriterLock against it and would fail if it became one.
+installWebLocksFixture();
+test.beforeEach(() => { resetWebLocksFixture(); });
+
 const app = await import('./app.js');
 
 async function verifiedFixture({ board = 'biscuit', accepted = true, protocol2 = true } = {}) {

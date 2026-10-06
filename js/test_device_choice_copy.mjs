@@ -1,21 +1,9 @@
-// R4 (UX, copy only): with no identity, card 3 must say WHICH button to press.
-//
-// The live 2026-10-03 page presented three buttons with nothing to say when each
-// applied, so an operator whose Echo was sitting in TWRP pressed "Query device",
-// watched every getvar time out, and had no way to tell that the recovery entry
-// beside it was the one that worked. Card 3 now names the two states the Echo can
-// be in — fastboot (first install) and already in recovery — points each at its
-// own button, and the USB permission grant is hidden unless a wait for TWRP is
-// actually running.
-//
-// Nothing here changes a gate: it asserts only what the operator can read and
-// press. Deterministic DOM only — no USB, no chooser, no adb, no fastboot.
-
+// Connection UX: one mode-aware action; protocol controls stay under Advanced.
+// DOM fixture only: no USB, chooser, adb, fastboot or real browser.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-// --- minimal DOM so the real page module imports under node ---------------
 class Element {
   constructor() {
     this.children = [];
@@ -67,12 +55,10 @@ globalThis.localStorage = {
   removeItem: (key) => store.delete(key),
 };
 const app = await import('./app.js');
-
 const PROFILE = {
   id: 'radar', product: 'RADAR', marketing: 'Amazon Echo', board: 'radar_puffin',
   libreEcho: 'stable', userdataContractSectors: [20480],
 };
-
 function blankPage({ identity = null, recoveryWaiting = false } = {}) {
   Object.assign(app.state, {
     releases: [], release: null, board: null, target: null, targetsJson: null, sums: null,
@@ -84,80 +70,73 @@ function blankPage({ identity = null, recoveryWaiting = false } = {}) {
     recoveryGrantInFlight: false, recoveryChooserWide: false, recoveryAlreadyGranted: false,
     recoverySession: null, recoveryAcceptedEpoch: 0, recoveryEpoch: 0,
     unlockSubmitted: null, stageProgress: {},
+    resumeBoard: null, resumeReleaseTag: null, resumeUnlockSubmitted: false,
+    resumeDeviceAmbiguous: false,
   });
 }
 
-// ---------------------------------------------------------------------------
-// A. the card names both states and points each at its own button
-// ---------------------------------------------------------------------------
-
-test('card 3 names both possible Echo states and which button each one uses', async () => {
+test('card 3 offers one primary connect action without making users choose a USB mode', async () => {
   const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
-
-  // The two labels the operator actually has to choose between.
-  assert.match(html, /Echo is in fastboot \(first install\)/,
-    'the fastboot choice is not named');
-  assert.match(html, /Echo is already in recovery/,
-    'the recovery choice is not named');
-  // Each must be tied to the button that works for it, by the real label.
-  assert.match(html, /Echo is in fastboot \(first install\)[\s\S]*?Query device \(read-only fastboot\)/,
-    'the fastboot choice does not point at the query button');
-  assert.match(html, /Echo is already in recovery[\s\S]*?My Echo is already in recovery/,
-    'the recovery choice does not point at the recovery entry');
-  // And the distinction has to be a physical one the operator can recognise.
-  assert.match(html, /fastboot mode/, 'the fastboot screen is not described');
-  assert.match(html, /TWRP/, 'the recovery screen is not described');
+  const card = html.match(/<section[^>]*id="card-connect-device"[\s\S]*?<\/section>/)?.[0];
+  assert.ok(card, 'connection card exists');
+  const advanced = card.match(/<details[^>]*id="connect-advanced"[^>]*>[\s\S]*?<\/details>/)?.[0];
+  assert.ok(advanced, 'advanced controls remain available');
+  assert.doesNotMatch(advanced.split('>')[0], /\bopen(?:\s|=|$)/, 'Advanced starts closed');
+  assert.equal((card.match(/id="btn-connect-resume"/g) ?? []).length, 1);
+  assert.doesNotMatch(advanced, /id="btn-connect-resume"/, 'primary action is outside Advanced');
+  for (const id of ['btn-connect', 'btn-connect-any', 'btn-recovery', 'btn-grant-recovery', 'btn-recovery-entry']) {
+    assert.ok(advanced.includes(`id="${id}"`), `${id} stays under Advanced`);
+  }
+  assert.doesNotMatch(card, /id="(?:choice-fastboot|choice-recovery|device-mode-choice)"/);
+  assert.match(card, /choose the USB device named “Echo”/);
+  assert.match(card, /no fastboot is needed/);
+  assert.equal((advanced.match(/<p(?:\s|>)/g) ?? []).length,
+    (advanced.match(/<\/p>/g) ?? []).length, 'all Advanced paragraphs are closed');
 });
 
-test('the two choices are shown while no device is identified', () => {
-  blankPage({ identity: null });
+test('the primary connect action is visible before identification', () => {
+  blankPage();
   app.refreshControls();
-
-  assert.equal(elements.get('device-mode-choice').hidden, false,
-    'the choice prompt was hidden with no identity');
-  assert.equal(elements.get('choice-fastboot').hidden, false);
-  assert.equal(elements.get('choice-recovery').hidden, false);
-  assert.equal(elements.get('device-mode-choice-done').hidden, true,
-    'the "already identified" note was shown before anything was identified');
+  const button = elements.get('btn-connect-resume');
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, 'Connect to your Echo');
 });
 
-test('the two choices retire once a device is identified', () => {
+test('fresh connection retires after identification', () => {
   blankPage({ identity: {
     product: 'RADAR', unlockStatus: 'true', serialRaw: 'RADAR-DOT', profile: PROFILE,
   } });
   app.refreshControls();
-
-  assert.equal(elements.get('device-mode-choice').hidden, true,
-    'the mode choice stayed up after the device was identified');
-  assert.equal(elements.get('choice-fastboot').hidden, true);
-  assert.equal(elements.get('choice-recovery').hidden, true);
-  assert.equal(elements.get('device-mode-choice-done').hidden, false,
-    'nothing told the operator that step 3 is finished');
+  assert.equal(elements.get('btn-connect-resume').hidden, true);
 });
 
-// ---------------------------------------------------------------------------
-// B. the grant button exists only while a wait for TWRP is running
-// ---------------------------------------------------------------------------
+test('a saved transaction keeps the resume action visible after identification', () => {
+  blankPage({ identity: {
+    product: 'RADAR', unlockStatus: 'true', serialRaw: 'RADAR-DOT', profile: PROFILE,
+  } });
+  app.state.resumeBoard = 'radar_puffin';
+  app.state.resumeReleaseTag = 'fixture-release';
+  app.refreshControls();
+  const button = elements.get('btn-connect-resume');
+  assert.equal(button.hidden, false);
+  assert.equal(button.textContent, 'Resume this install');
+});
 
 test('the USB permission grant is hidden unless a wait for TWRP is running', () => {
   blankPage({ recoveryWaiting: false });
   app.refreshControls();
-  assert.equal(elements.get('btn-grant-recovery').hidden, true,
-    'the grant button looked like a fourth choice with no wait running');
-
+  assert.equal(elements.get('btn-grant-recovery').hidden, true);
   blankPage({ recoveryWaiting: true });
   app.refreshControls();
-  assert.equal(elements.get('btn-grant-recovery').hidden, false,
-    'the grant button stayed hidden during the one state it exists for');
+  assert.equal(elements.get('btn-grant-recovery').hidden, false);
 });
 
-test('an empty fastboot identity leaves both choices visible', () => {
-  // The refusal path clears state.identity, so the operator is back at exactly
-  // the choice this card exists to disambiguate — it must not be left hidden.
-  blankPage({ identity: null });
+test('a query without identity leaves the primary action available', () => {
+  blankPage();
   app.refreshControls();
-  assert.equal(elements.get('choice-fastboot').hidden, false);
-  assert.equal(elements.get('choice-recovery').hidden, false);
+  assert.equal(elements.get('btn-connect-resume').hidden, false);
+  assert.equal(elements.get('btn-connect-resume').disabled, false);
   assert.equal(elements.get('btn-recovery-entry').disabled, false,
-    'the recovery choice was left disabled after a query read nothing');
+    'advanced recovery entry remains available after an empty query');
 });

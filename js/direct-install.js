@@ -15,6 +15,7 @@
 // not the outcome — the receipt is.
 
 import { sha256Blob, sha256Bytes } from "./sha256.js";
+import { parseResumeReceipt } from "./resume-device.js";
 import { parseCacheFreeBytes, StageError, RecoveryStopped } from "./stages.js";
 import { readZipMember } from "./amonet.js";
 import { verifyEd25519Signature } from "./signature.js";
@@ -264,6 +265,29 @@ async function readDirectLog(adb, tail = 40) {
   }
 }
 
+/** The browser's per-phase "never repeat" guard key for one device and release. */
+export async function directPhaseGuardKey(serialRaw, tag, phase) {
+  return `libreecho.direct.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${tag}:${phase}`))}`;
+}
+
+/**
+ * Retires the per-phase guards of a transaction whose outcome is KNOWN: finalize
+ * returned result=installed and the Kaeru header was unchanged. The guards exist
+ * so an attempt with an unknown outcome is never blindly repeated. Left in place
+ * after success, they blocked any later reinstall of the same release on the
+ * same Echo from this browser, forever ("prepare phase already attempted"). The
+ * device's own finalized transaction record still refuses a stale repeat.
+ */
+export async function retireDirectPhaseGuards({ serialRaw, tag, phases = ["prepare", "initialize", "transfer", "finalize"] } = {}) {
+  if (!serialRaw || !tag || typeof localStorage === "undefined") return 0;
+  let removed = 0;
+  for (const phase of phases) {
+    const key = await directPhaseGuardKey(serialRaw, tag, phase);
+    try { if (localStorage.getItem(key) !== null) { localStorage.removeItem(key); removed += 1; } } catch { /* storage unavailable */ }
+  }
+  return removed;
+}
+
 /**
  * Runs one explicit helper phase. Require both successful helper exit and a
  * uniquely keyed receipt bound to a fresh random nonce, protocol, phase, bundle,
@@ -275,9 +299,15 @@ async function readDirectLog(adb, tail = 40) {
  * `finalize --dry-run` is not guarded, so it never blocks the real finalize.
  */
 export async function runDirectPhase({ adb, phase, dryRun = false, serialRaw, tag,
-  bundleManifestSha256, target, release, stateDir, incomingDir, deviceDigest = null, terminal, isCancelled = null } = {}) {
+  bundleManifestSha256, target, release, stateDir, incomingDir, deviceDigest = null, terminal, isCancelled = null,
+  verifyInstalledBootSha256 = null } = {}) {
   if (!adb?.shell) throw new StageError("install", "a recovery ADB session is required to run a phase");
   if (isCancelled?.()) throw new RecoveryStopped();
+  const installedReadback = verifyInstalledBootSha256 !== null;
+  if (installedReadback && (phase !== "finalize" || dryRun !== true
+    || !SHA256_HEX.test(verifyInstalledBootSha256) || !SHA256_HEX.test(deviceDigest ?? ""))) {
+    throw new StageError("install", "installed readback requires a dry-run finalize and pinned boot/device digests");
+  }
   if (!globalThis.crypto?.getRandomValues) throw new StageError("install", "secure invocation randomness is unavailable");
   const invocationId = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, "0")).join("");
   const command = directPhaseCommand({ phase, dryRun, bundleManifestSha256, target, release, stateDir, incomingDir, invocationId });
@@ -285,7 +315,7 @@ export async function runDirectPhase({ adb, phase, dryRun = false, serialRaw, ta
     if (!serialRaw || !tag || typeof localStorage === "undefined") {
       throw new StageError("install", "persistent device-bound recovery attempt storage is unavailable");
     }
-    const key = `libreecho.direct.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${tag}:${phase}`))}`;
+    const key = await directPhaseGuardKey(serialRaw, tag, phase);
     if (isCancelled?.()) throw new RecoveryStopped();
     try {
       if (localStorage.getItem(key)) throw new StageError("install", `${phase} phase already attempted; classify the device and receipt before any repeat`);
@@ -304,7 +334,7 @@ export async function runDirectPhase({ adb, phase, dryRun = false, serialRaw, ta
   if (isCancelled?.()) throw new RecoveryStopped();
   const text = String(result?.stdout ?? "");
   const envelope = /(?:^|\n)__HELPER_RC__(\d+)\r?\n__RECEIPT__/.exec(text);
-  if (!envelope || text.split("__RECEIPT__").length !== 2 || envelope[1] !== "0") {
+  if (!envelope || text.split("__RECEIPT__").length !== 2 || envelope[1] !== (installedReadback ? "1" : "0")) {
     throw new StageError(phase, "recovery helper exit status missing or nonzero; outcome is not accepted");
   }
   const receipt = Object.create(null);
@@ -324,6 +354,18 @@ export async function runDirectPhase({ adb, phase, dryRun = false, serialRaw, ta
   const binding = await sha256Bytes(new TextEncoder().encode(`2|${phase}|${bundleManifestSha256}|${receipt.device_digest}|${target}|${release}`));
   if (isCancelled?.()) throw new RecoveryStopped();
   if (receipt.invocation_sha256 !== binding) throw new StageError(phase, "receipt invocation digest mismatch");
+  if (installedReadback) {
+    // A finalized guard takes the helper's readback/refusal branch BEFORE
+    // landing-zone validation. Accept only that exact fresh observation, never
+    // an ordinary dry-run result or an arbitrary failed installer invocation.
+    const proof = parseResumeReceipt(text.slice(envelope.index + envelope[0].length));
+    if (receipt.result !== "failed" || receipt.error !== "already-finalized"
+      || proof.installedState !== "verified"
+      || proof.installedBootSha256 !== verifyInstalledBootSha256.toLowerCase()) {
+      throw new StageError(phase, "fresh installed-state readback does not match the selected bundle");
+    }
+    return receipt;
+  }
   if (receipt.result === "failed") throw new StageError(phase, `the ${phase} phase failed: ${receipt.error ?? "unknown"}`);
   const allowed = dryRun ? ["dry-run-ok", ...(phase === "prepare" ? ["prepare-noop"] : [])] : {
     prepare: ["prepare-ok", "prepare-noop"], initialize: ["initialized"], transfer: ["transferred"], finalize: ["installed"],
@@ -337,10 +379,12 @@ export async function runDirectPhase({ adb, phase, dryRun = false, serialRaw, ta
  * zone. Each file's digest is re-verified locally immediately before it is
  * pushed, and cancellation is re-checked before every push.
  */
-export async function pushDirectPayloads({ adb, roles, files, sums, terminal, isCancelled = null } = {}) {
+export async function pushDirectPayloads({ adb, roles, files, sums, terminal, isCancelled = null, onProgress = null } = {}) {
   if (!adb?.push) throw new StageError("transfer", "a recovery ADB session is required to push payloads");
   if (!Array.isArray(roles) || roles.length === 0) throw new StageError("transfer", "no transfer roles were selected");
   let pushedBytes = 0;
+  let totalBytes = 0;
+  for (const role of roles) totalBytes += files?.get?.(role?.name)?.size ?? 0;
   for (const role of roles) {
     if (isCancelled?.()) throw new RecoveryStopped();
     if (!safeMemberName(role?.name)) throw new StageError("transfer", `refusing an unsafe upload name: ${role?.name ?? "(none)"}`);
@@ -355,11 +399,83 @@ export async function pushDirectPayloads({ adb, roles, files, sums, terminal, is
     if (isCancelled?.()) throw new RecoveryStopped();
     const remote = `${DIRECT_INCOMING_DIR}/${role.name}`;
     terminal?.command(`adb push ${role.name} → ${remote} (${blob.size} bytes)`);
-    await adb.push(remote, blob);
+    const before = pushedBytes;
+    await adb.push(remote, blob, {
+      onProgress: ({ sent }) => {
+        if (!totalBytes) return;
+        const fraction = (before + sent) / totalBytes;
+        terminal?.progress?.(`pushing ${role.name}`, fraction,
+          `${Math.round((before + sent) / 1048576)} / ${Math.round(totalBytes / 1048576)} MiB`);
+        onProgress?.(fraction);
+      },
+    });
     if (isCancelled?.()) throw new RecoveryStopped();
     pushedBytes += blob.size;
+    terminal?.endProgress?.();
     terminal?.ok(`pushed ${role.name}`);
   }
   terminal?.endProgress?.();
   return { pushedBytes, fileCount: roles.length };
+}
+
+/**
+ * Reads the landing zone back and reports, per role, whether the file already on
+ * the device is byte-identical to the locally verified one.
+ *
+ * WHY THIS EXISTS. A resume that skips the helper's `transfer` phase has to
+ * decide whether the browser's own payload push also already happened. Skipping
+ * the push unconditionally wastes the whole image; pushing it unconditionally
+ * re-sends hundreds of megabytes over an install that may already be complete.
+ * The only answer that is not a guess is a read-back comparison.
+ *
+ * READ-ONLY BY CONSTRUCTION. It runs `sha256sum` over the two documented landing
+ * paths and nothing else. No phase runs, no file is created, moved or removed,
+ * and no path outside `DIRECT_INCOMING_DIR` is ever named. A size check would not
+ * be enough: a truncated or substituted file can match a length exactly, and only
+ * the digest is what the helper's own `finalize_validate` will later re-check.
+ *
+ * A role whose file is absent, unreadable or different is reported `present:
+ * false` with the reason, so the caller re-pushes exactly that one. An
+ * UNREADABLE probe (transport error, or output that does not parse) is never
+ * reported as "already present": it is `present: false, reason: "unreadable"`,
+ * because the fail-closed reading of "I could not tell" is "assume it is not
+ * there and push it again", which is safe, over "assume it is fine".
+ *
+ * @returns {Promise<{checked: Array<{role, name, sha256, remote, present, reason}>, allPresent: boolean}>}
+ */
+export async function readLandedPayloads({ adb, roles, terminal, isCancelled = null } = {}) {
+  if (!adb?.shell) throw new StageError("transfer", "a recovery ADB session is required to read the landing zone back");
+  if (!Array.isArray(roles) || roles.length === 0) {
+    throw new StageError("transfer", "no transfer roles were selected for the landing-zone readback");
+  }
+  const check = () => { if (isCancelled?.()) throw new RecoveryStopped(); };
+  const checked = [];
+  for (const role of roles) {
+    check();
+    if (!safeMemberName(role?.name)) throw new StageError("transfer", `refusing an unsafe upload name: ${role?.name ?? "(none)"}`);
+    const wanted = String(role.sha256 ?? "").toLowerCase();
+    if (!SHA256_HEX.test(wanted)) throw new StageError("transfer", `${role.name}: landing-zone readback needs a pinned digest`);
+    const remote = `${DIRECT_INCOMING_DIR}/${role.name}`;
+    const record = { role: role.role, name: role.name, sha256: wanted, remote, present: false, reason: null };
+    let observed = null;
+    try {
+      // `/sbin/sha256sum <path> 2>/dev/null || true` — the same shape the control
+      // push readback uses, so one command answers "is this exact file there?".
+      const result = await adb.shell(`/sbin/sha256sum ${remote} 2>/dev/null || true`);
+      const fields = String(result?.stdout ?? "").trim().split(/\s+/).filter(Boolean);
+      // `sha256sum` prints "<digest>  <path>". Requiring BOTH means a line that
+      // merely contains 64 hex characters is not accepted as a digest.
+      if (fields.length === 2 && fields[1] === remote && SHA256_HEX.test(fields[0])) observed = fields[0].toLowerCase();
+    } catch {
+      observed = null;
+    }
+    check();
+    if (observed === null) record.reason = "absent or unreadable";
+    else if (observed !== wanted) record.reason = "digest mismatch";
+    else { record.present = true; record.reason = null; }
+    checked.push(record);
+  }
+  const already = checked.filter((entry) => entry.present).length;
+  terminal?.info(`landing zone: ${already} of ${checked.length} verified payload(s) are already on the device`);
+  return { checked, allPresent: checked.length > 0 && already === checked.length };
 }

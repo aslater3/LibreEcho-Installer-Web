@@ -269,11 +269,76 @@ export async function requestRecoveryReboot({ client, terminal }) {
       terminal?.warn(`the bootloader refused reboot-recovery: ${detail}`);
       return { requested: false, reason: detail };
     }
+    // The reset-the-link family: the device is gone BECAUSE it did what we asked,
+    // so the restart did happen. Everything else is a different failure and must
+    // not be reported as a restart.
+    //
+    // The distinction is not cosmetic. A write that failed never reached the
+    // device, and a protocol error means the device answered something that was
+    // not OKAY — so it did not reset. Reporting either as "restarting" is what
+    // stranded the 2026-10-04 operator: the page claimed the Echo was on its way
+    // to TWRP while nothing had been asked, then waited out the whole countdown.
+    // lib/fastboot/fastboot.js only throws FastbootTimeoutError and the read-side
+    // FastbootError("transport failed while reading the reply") for this case.
+    if (!isResetTheLinkError(error)) {
+      terminal?.warn(`the restart into TWRP did not leave the host (${detail}); `
+        + "the bootloader was never asked, so start TWRP on the Echo yourself");
+      return { requested: false, reason: `the reboot-recovery command never reached the device: ${detail}` };
+    }
     terminal?.line(`the connection closed while restarting (${detail}); this is expected`);
   }
   terminal?.ok("restart into TWRP requested");
   return { requested: true };
 }
+
+/**
+ * True for the errors that mean "the device cut the link", as opposed to "the
+ * command did not get there or the device did not obey".
+ *
+ * Only three names qualify, and they are named rather than pattern-matched so a
+ * new transport error class cannot be silently absorbed as success:
+ *   - FastbootTimeoutError             the device stopped answering mid-command
+ *   - FastbootError on the READ path    the reply read failed (the link dropped)
+ *   - TransportError / WebUSB transfer  an unclassified link loss, which is the
+ *                                       pre-classification spelling this code
+ *                                       must keep honouring
+ * A FastbootProtocolError is explicitly NOT one of these: the device answered,
+ * and it was not OKAY.
+ */
+function isResetTheLinkError(error) {
+  const name = String(error?.name ?? "");
+  const detail = String(error?.message ?? "");
+  if (name === "FastbootTimeoutError") return true;
+  if (name === "FastbootProtocolError" || name === "FastbootFailError") return false;
+  if (name === "FastbootError") {
+    // fastboot.js wraps both directions; only the read path means a lost device.
+    return /reading the reply|while reading/.test(detail);
+  }
+  // A write-side failure is the one case that PROVES the command never left the
+  // host, so it is excluded before anything else is considered. webusb-fastboot-
+  // transport.js throws plain unnamed Errors for every open and write step, so
+  // these strings are the only evidence available for them.
+  if (WRITE_SIDE_FAILURE.test(detail)) return false;
+  // Everything else unclassified is treated as a lost link rather than a silent
+  // no-op. This is the conservative direction: the page then waits for TWRP and
+  // says what to check if it never appears, instead of failing a restart that
+  // probably did happen.
+  return name === "TransportError" || name === "NetworkError"
+    || RESET_THE_LINK.test(detail);
+}
+
+/**
+ * Failures on the path that WRITES the command, so the bootloader never saw it.
+ * `transferOut` is the write; `transferIn` is the read and is deliberately
+ * absent, because a stalled read after the command went out is the reset racing
+ * the reply. "device reset failed" is absent for the same reason — the outcome
+ * of a failed USB reset is genuinely unknown, so it stays in the ambiguous
+ * group rather than being guessed either way.
+ */
+const WRITE_SIDE_FAILURE = /transferOut|wrote \d+ of|failed to send|could not open the device|could not select configuration|no fastboot interface|claimInterface/;
+
+/** Wording that means the link went away rather than the write failing. */
+const RESET_THE_LINK = /device (?:disconnected|reset)|disconnected|stalled|network error|reset by peer/i;
 
 /**
  * Submits the fastbrick payload to `brick`. The community host scripts treat a
