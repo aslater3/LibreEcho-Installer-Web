@@ -168,6 +168,11 @@ export function validateProvision(form = {}) {
 
   if (!validHostname(form.hostname)) {
     fail("hostname", `The hostname must be 1–${HOSTNAME_MAX_BYTES} letters, numbers or hyphens, and cannot start or end with a hyphen.`);
+  } else if ([form.password, form.wifiPassword].some((secret) => typeof secret === "string" && secret !== ""
+    && secret.toLowerCase() === String(form.hostname).toLowerCase())) {
+    // The hostname is announced to the whole network (mDNS, AirPlay, DHCP), so
+    // a password typed or autofilled into this box would be published.
+    fail("hostname", "The hostname is the same as one of your passwords, and it is visible to everything on your network. Choose a different hostname.");
   }
   const volume = percentOf(form.volume);
   if (!validPercent(volume)) fail("volume", `Volume must be a whole number from 0 to ${PERCENT_MAX}.`);
