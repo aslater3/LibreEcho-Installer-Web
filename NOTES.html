@@ -56,7 +56,7 @@
     <p>Two honest consequences:</p>
     <ul>
       <li><strong>Default:</strong> download the release assets with your browser from the release page, then select them (or the whole folder) in the installer. Include both <code>SHA256SUMS</code> and <code>TWRPINSTALL-SHA256SUMS</code>, the <code>libreecho-install.zip</code> and <code>bundle.manifest</code>. Both inventories are checked against the GitHub release API's asset digests before their listed files are accepted.</li>
-      <li><strong>Optional mirrors:</strong> <code>?mirror=</code> may help fetch release checksum listings. A separate operator-approved <code>?amonetMirror=https://…</code> enables the pinned Amonet ZIP fetch button. Neither option bypasses the archive, payload, release, board, hardware-acceptance or recovery-protocol checks; the normal release bundle still requires operator-selected files.</li>
+      <li><strong>Release download mirror:</strong> release files are fetched in-page from <code>https://dl.libreecho.org</code>, a read-only CORS pass-through to the GitHub release download URLs (GitHub's own download endpoint cannot be read by a web page). The mirror is untrusted transport: every file is still checked against the release's <code>SHA256SUMS</code> and GitHub's asset digests, and anything that does not match stops the download. <code>?mirror=https://…</code> points at a different mirror; <code>?mirror=</code> (empty) turns it off so only operator-selected files are used. A separate operator-approved <code>?amonetMirror=https://…</code> enables the pinned Amonet ZIP fetch button. None of these options bypass the archive, payload, release, board, hardware-acceptance or recovery-protocol checks.</li>
     </ul>
 
     <h2>Browser requirements</h2>
