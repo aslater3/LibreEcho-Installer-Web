@@ -91,7 +91,7 @@ jobs:
       - name: Stage the site
         run: |
           mkdir -p "$RUNNER_TEMP/site"
-          rsync -a --exclude='.git' --exclude='.github' published/ "$RUNNER_TEMP/site/"
+          rsync -a --exclude='.git' --exclude='.github' --exclude='mirror' published/ "$RUNNER_TEMP/site/"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

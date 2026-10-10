@@ -1,0 +1,14 @@
+{
+  "name": "libreecho-dl",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "dl.libreecho.org", "custom_domain": true }],
+  // Privacy: no Workers logs, traces or Logpush.
+  "observability": { "enabled": false, "logs": { "enabled": false, "invocation_logs": false } },
+  "logpush": false,
+  // Private bucket, filled by sync-r2-mirror.yml in LibreEcho-Installer-Web.
+  // Objects are served from R2 first; GitHub releases are the fallback.
+  "r2_buckets": [{ "binding": "ASSETS", "bucket_name": "libreecho-releases" }]
+}
