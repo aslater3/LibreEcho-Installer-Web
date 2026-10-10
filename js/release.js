@@ -39,6 +39,15 @@ function defaultMirror() {
   return ["localhost", "127.0.0.1"].includes(window.location?.hostname) ? "" : DEFAULT_MIRROR;
 }
 
+// The pinned Amonet ZIPs live at <DEFAULT_MIRROR>/amonet/<name>. Only used when
+// the release mirror is the default one (an explicit ?mirror= opts out), and
+// the ZIP is still checked against the size and SHA-256 pinned in profiles.js.
+function defaultAmonetMirror(explicitMirror) {
+  if (explicitMirror !== undefined) return "";
+  const base = defaultMirror();
+  return base ? `${base}/amonet` : "";
+}
+
 const TAG_PATTERN = /^radar-puffin-(?<kind>v\d+\.\d+\.\d+|nightly-[0-9a-f-]+|build-[0-9a-f-]+)$/;
 
 export function installerConfig() {
@@ -55,7 +64,7 @@ export function installerConfig() {
   return {
     repository: query.repository ?? global.repository ?? DEFAULT_REPOSITORY,
     mirrorBase: (query.mirror ?? global.mirrorBase ?? defaultMirror()).replace(/\/+$/, ""),
-    amonetMirrorBase: (query.amonetMirror ?? global.amonetMirrorBase ?? "").replace(/\/+$/, ""),
+    amonetMirrorBase: (query.amonetMirror ?? global.amonetMirrorBase ?? defaultAmonetMirror(query.mirror ?? global.mirrorBase)).replace(/\/+$/, ""),
     releaseTag: query.release ?? global.releaseTag ?? "",
     bootstrapBase: typeof window !== 'undefined' && window.location.href
       ? new URL('./releases', window.location.href).href.replace(/\/+$/, '') : '',

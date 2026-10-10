@@ -33,10 +33,15 @@ concurrency:
 env:
   SOURCE_REPO: aslater3/LibreEcho
   BUCKET: libreecho-releases
-  KEEP_RELEASES: '3'          # newest N non-draft releases stay mirrored
-  KEEP_STABLE: '1'            # plus the newest N stable vX.Y.Z releases
+  KEEP_RELEASES: '3'          # newest N 0.14 development builds stay mirrored
+  KEEP_STABLE: '0'            # newest N stable vX.Y.Z (0 while 0.13 is the only stable line)
+  MIN_STABLE: '0.14.0'        # never mirror stable releases older than this
   MAX_BUCKET_GIB: '9'         # refuse to exceed the 10 GB free tier (prune runs after upload,
                               # so keep (KEEP_RELEASES+KEEP_STABLE+1) x ~1.5 GB under 10 GB)
+  # Prefixes in the bucket that are not release tags and must never be pruned.
+  # amonet/ holds the two pinned community Amonet ZIPs (uploaded by hand;
+  # names, sizes and SHA-256 are pinned in js/profiles.js).
+  PROTECTED_PREFIXES: 'amonet'
   AWS_DEFAULT_REGION: auto
   AWS_REQUEST_CHECKSUM_CALCULATION: when_required
   AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
@@ -60,8 +65,12 @@ jobs:
                  if not r["draft"] and r["assets"]
                  and re.fullmatch(r"radar-puffin-(v\d+\.\d+\.\d+|nightly-[0-9a-f-]+|build-[0-9a-f-]+)", r["tag_name"])]
           rel.sort(key=lambda r: r["published_at"] or "", reverse=True)
-          keep = [r["tag_name"] for r in rel[: int(os.environ["KEEP_RELEASES"])]]
-          stable = [r["tag_name"] for r in rel if re.search(r"-v\d+\.\d+\.\d+$", r["tag_name"])]
+          ver = lambda t: tuple(int(x) for x in re.search(r"-v(\d+)\.(\d+)\.(\d+)$", t).groups())
+          min_stable = tuple(int(x) for x in os.environ["MIN_STABLE"].split("."))
+          dev = [r["tag_name"] for r in rel if not re.search(r"-v\d+\.\d+\.\d+$", r["tag_name"])]
+          stable = [r["tag_name"] for r in rel
+                    if re.search(r"-v\d+\.\d+\.\d+$", r["tag_name"]) and ver(r["tag_name"]) >= min_stable]
+          keep = dev[: int(os.environ["KEEP_RELEASES"])]
           for t in stable[: int(os.environ["KEEP_STABLE"])]:
               if t not in keep:
                   keep.append(t)
@@ -124,6 +133,7 @@ jobs:
           s3() { aws s3 --endpoint-url "$ep" "$@"; }
           s3 ls "s3://$BUCKET/" | awk '$1=="PRE"{sub(/\/$/,"",$2); print $2}' > present.txt
           while read -r tag; do
+            if printf '%s\n' $PROTECTED_PREFIXES | grep -qxF "$tag"; then continue; fi
             if ! grep -qxF "$tag" keep.txt; then
               echo "== pruning $tag"
               s3 rm "s3://$BUCKET/$tag/" --recursive --only-show-errors
