@@ -10,5 +10,8 @@
   "logpush": false,
   // Private bucket, filled by sync-r2-mirror.yml in LibreEcho-Installer-Web.
   // Objects are served from R2 first; GitHub releases are the fallback.
-  "r2_buckets": [{ "binding": "ASSETS", "bucket_name": "libreecho-releases" }]
+  "r2_buckets": [{ "binding": "ASSETS", "bucket_name": "libreecho-releases" }],
+  // GitHub owner/repo for release fallback and device OTA aliases. Changing
+  // owner is a config change; devices only ever see dl.libreecho.org.
+  "vars": { "REPOSITORY": "aslater3/LibreEcho" }
 }

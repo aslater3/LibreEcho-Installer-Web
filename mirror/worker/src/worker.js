@@ -10,8 +10,18 @@
 //
 // Objects are served from the R2 bucket bound as ASSETS first; GitHub is the
 // fallback for release assets. `amonet/<pinned zip>` is served from R2 only.
+//
+// Device OTA transport (stable paths, independent of the GitHub owner):
+//   /latest/download/<asset>         -> GitHub releases/latest/download/<asset>
+//   /download/<tag>/<asset>          -> same as /<tag>/<asset>
+//   /download/<slug>-dev-channel/release-pointer*.txt  (mutable dev pointer)
+// Mutable responses are never cached here. Devices verify signatures and the
+// signed manifest hashes, so this Worker is untrusted transport.
 
-const REPOSITORY = "aslater3/LibreEcho";
+const DEFAULT_REPOSITORY = "aslater3/LibreEcho";
+const REPO = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/;
+const POINTER_TAG = /^(radar-puffin|biscuit)-dev-channel$/;
+const POINTER_NAME = /^release-pointer(-v3)?\.txt$/;
 const TAG = /^radar-puffin-(v\d+\.\d+\.\d+|nightly-[0-9a-f-]{1,80}|build-[0-9a-f-]{1,80})$/;
 const NAME = /^libreecho-[A-Za-z0-9._-]{1,200}$/;
 const RETIRED = /^radar-puffin-v0\.(?:\d|1[0-3])\.\d+$/;
@@ -23,6 +33,7 @@ const ORIGINS = new Set([
   "https://dev.libreecho.org",
   "https://libreecho.org",
   "https://aslater3.github.io",
+  "https://libreecho.github.io",
   "http://localhost:8000",
   "http://127.0.0.1:8000",
 ]);
@@ -48,14 +59,14 @@ function plain(status, text, request) {
   return new Response(request.method === "HEAD" ? null : text + "\n", { status, headers: h });
 }
 
-function finish(upstream, request, source) {
+function finish(upstream, request, source, mutable = false) {
   const h = cors(request);
   for (const k of PASS_HEADERS) {
     const v = upstream.headers.get(k);
     if (v) h.set(k, v);
   }
   h.set("Content-Type", "application/octet-stream");
-  h.set("Cache-Control", "public, max-age=86400");
+  h.set("Cache-Control", mutable ? "no-store" : "public, max-age=86400");
   h.set("X-Content-Type-Options", "nosniff");
   h.set("X-LibreEcho-Source", source);
   return new Response(request.method === "HEAD" ? null : upstream.body, { status: upstream.status, headers: h });
@@ -88,7 +99,28 @@ export default {
     if (request.method !== "GET" && request.method !== "HEAD") return plain(405, "method not allowed", request);
     if (url.pathname === "/" || url.pathname === "/healthz") return plain(200, "libreecho-dl ok", request);
 
-    const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    let parts;
+    try {
+      parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    } catch {
+      return plain(404, "not found", request);
+    }
+    const repository = REPO.test(env.REPOSITORY || "") ? env.REPOSITORY : DEFAULT_REPOSITORY;
+
+    // Device OTA paths. `latest` and the dev pointers are mutable: GitHub only,
+    // never cached, never served from R2.
+    if (parts[0] === "latest" && parts[1] === "download" && parts.length === 3) {
+      if (!NAME.test(parts[2])) return plain(404, "not found", request);
+      return github(`latest/download/${encodeURIComponent(parts[2])}`, repository, request, true);
+    }
+    if (parts[0] === "download" && parts.length === 3) {
+      if (POINTER_TAG.test(parts[1])) {
+        if (!POINTER_NAME.test(parts[2])) return plain(404, "not found", request);
+        return github(`download/${parts[1]}/${parts[2]}`, repository, request, true);
+      }
+      parts = parts.slice(1);
+    }
+
     // Pinned Amonet archives (community ZIPs, not GitHub releases): R2 only.
     // The installer checks each against the SHA-256 pinned in profiles.js.
     if (parts.length === 2 && parts[0] === "amonet") {
@@ -99,25 +131,29 @@ export default {
     const [tag, name] = parts;
     // 0.13 is retired: not mirrored and not proxied.
     if (RETIRED.test(tag)) return plain(410, "release retired", request);
-    const range = request.headers.get("Range");
 
     if (env.ASSETS) {
       const hit = await fromR2(env, `${tag}/${name}`, request);
       if (hit) return hit;
     }
 
-    const upstreamUrl = `https://github.com/${REPOSITORY}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`;
-    const headers = { "User-Agent": "libreecho-dl-mirror" };
-    if (range) headers.Range = range;
-    const upstream = await fetch(upstreamUrl, {
-      method: request.method === "HEAD" ? "HEAD" : "GET",
-      headers,
-      redirect: "follow",
-      // Release assets are immutable per tag; let Cloudflare cache what it can.
-      cf: { cacheEverything: true, cacheTtl: 86400 },
-    });
-    if (upstream.status === 404) return plain(404, "not found", request);
-    if (!upstream.ok && upstream.status !== 206) return plain(502, `upstream HTTP ${upstream.status}`, request);
-    return finish(upstream, request, "github");
+    return github(`download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`, repository, request, false);
   },
 };
+
+// Proxies a GitHub release path. Immutable tagged assets may be edge-cached;
+// mutable aliases (latest, dev pointers) bypass the cache entirely.
+async function github(path, repository, request, mutable) {
+  const headers = { "User-Agent": "libreecho-dl-mirror" };
+  const range = request.headers.get("Range");
+  if (range) headers.Range = range;
+  const upstream = await fetch(`https://github.com/${repository}/releases/${path}`, {
+    method: request.method === "HEAD" ? "HEAD" : "GET",
+    headers,
+    redirect: "follow",
+    cf: mutable ? { cacheTtl: 0, cacheEverything: false } : { cacheEverything: true, cacheTtl: 86400 },
+  });
+  if (upstream.status === 404) return plain(404, "not found", request);
+  if (!upstream.ok && upstream.status !== 206) return plain(502, `upstream HTTP ${upstream.status}`, request);
+  return finish(upstream, request, "github", mutable);
+}
