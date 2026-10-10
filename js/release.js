@@ -27,6 +27,18 @@ import { sha256Blob, sha256Bytes } from "./sha256.js";
 
 export const DEFAULT_REPOSITORY = "aslater3/LibreEcho";
 
+// CORS-enabled read-only mirror of the release assets (Cloudflare Worker in
+// front of the GitHub release download URLs). Untrusted transport: every byte
+// is still checked against the release's own SHA256SUMS and GitHub's asset
+// digests. Not used on loopback origins, so a local dev mirror is still
+// discovered there; `?mirror=` (empty) disables it, `?mirror=<url>` overrides.
+export const DEFAULT_MIRROR = "https://dl.libreecho.org";
+
+function defaultMirror() {
+  if (typeof window === "undefined") return "";
+  return ["localhost", "127.0.0.1"].includes(window.location?.hostname) ? "" : DEFAULT_MIRROR;
+}
+
 const TAG_PATTERN = /^radar-puffin-(?<kind>v\d+\.\d+\.\d+|nightly-[0-9a-f-]+|build-[0-9a-f-]+)$/;
 
 export function installerConfig() {
@@ -42,7 +54,7 @@ export function installerConfig() {
   }
   return {
     repository: query.repository ?? global.repository ?? DEFAULT_REPOSITORY,
-    mirrorBase: (query.mirror ?? global.mirrorBase ?? "").replace(/\/+$/, ""),
+    mirrorBase: (query.mirror ?? global.mirrorBase ?? defaultMirror()).replace(/\/+$/, ""),
     amonetMirrorBase: (query.amonetMirror ?? global.amonetMirrorBase ?? "").replace(/\/+$/, ""),
     releaseTag: query.release ?? global.releaseTag ?? "",
     bootstrapBase: typeof window !== 'undefined' && window.location.href
