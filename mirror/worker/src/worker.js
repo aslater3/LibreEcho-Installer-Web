@@ -13,7 +13,7 @@
 
 const REPOSITORY = "aslater3/LibreEcho";
 const TAG = /^radar-puffin-(v\d+\.\d+\.\d+|nightly-[0-9a-f-]{1,80}|build-[0-9a-f-]{1,80})$/;
-const NAME = /^libreecho-[A-Za-z0-9._-]{1,200}$/;
+const NAME = /^(?:libreecho-[A-Za-z0-9._-]{1,200}|bundle\.manifest)$/;
 const RETIRED = /^radar-puffin-v0\.(?:\d|1[0-3])\.\d+$/;
 // Exact names pinned (with size and SHA-256) in the installer's js/profiles.js.
 const AMONET = new Set(["amonet-radar-v1.0.0.zip", "amonet-biscuit-v2.0.0.zip"]);
