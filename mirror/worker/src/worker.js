@@ -14,6 +14,7 @@
 const REPOSITORY = "aslater3/LibreEcho";
 const TAG = /^radar-puffin-(v\d+\.\d+\.\d+|nightly-[0-9a-f-]{1,80}|build-[0-9a-f-]{1,80})$/;
 const NAME = /^libreecho-[A-Za-z0-9._-]{1,200}$/;
+const RETIRED = /^radar-puffin-v0\.(?:\d|1[0-3])\.\d+$/;
 // Exact names pinned (with size and SHA-256) in the installer's js/profiles.js.
 const AMONET = new Set(["amonet-radar-v1.0.0.zip", "amonet-biscuit-v2.0.0.zip"]);
 const ORIGINS = new Set([
@@ -68,7 +69,9 @@ async function fromR2(env, key, request) {
     : await env.ASSETS.get(key, range ? { range: request.headers } : {});
   if (!obj) return null;
   const h = new Headers();
-  const r = obj.range;
+  // R2 can report a range even for a whole-object read; only answer 206 when
+  // the client actually asked for a range.
+  const r = range ? obj.range : undefined;
   const off = r ? (r.suffix !== undefined ? obj.size - r.suffix : (r.offset ?? 0)) : 0;
   const len = r ? (r.suffix !== undefined ? r.suffix : (r.length ?? obj.size - off)) : obj.size;
   h.set("content-length", String(len));
@@ -94,6 +97,8 @@ export default {
     }
     if (parts.length !== 2 || !TAG.test(parts[0]) || !NAME.test(parts[1])) return plain(404, "not found", request);
     const [tag, name] = parts;
+    // 0.13 is retired: not mirrored and not proxied.
+    if (RETIRED.test(tag)) return plain(410, "release retired", request);
     const range = request.headers.get("Range");
 
     if (env.ASSETS) {
