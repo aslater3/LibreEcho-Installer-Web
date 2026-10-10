@@ -8,12 +8,14 @@
 // installer origins only. It is untrusted transport: the installer verifies
 // every byte against the release's own SHA256SUMS.
 //
-// If an R2 bucket is bound as ASSETS (later, once R2 is enabled), objects are
-// served from R2 first and GitHub is the fallback.
+// Objects are served from the R2 bucket bound as ASSETS first; GitHub is the
+// fallback for release assets. `amonet/<pinned zip>` is served from R2 only.
 
 const REPOSITORY = "aslater3/LibreEcho";
 const TAG = /^radar-puffin-(v\d+\.\d+\.\d+|nightly-[0-9a-f-]{1,80}|build-[0-9a-f-]{1,80})$/;
 const NAME = /^libreecho-[A-Za-z0-9._-]{1,200}$/;
+// Exact names pinned (with size and SHA-256) in the installer's js/profiles.js.
+const AMONET = new Set(["amonet-radar-v1.0.0.zip", "amonet-biscuit-v2.0.0.zip"]);
 const ORIGINS = new Set([
   "https://install.libreecho.org",
   "https://install.dev.libreecho.org",
@@ -58,6 +60,24 @@ function finish(upstream, request, source) {
   return new Response(request.method === "HEAD" ? null : upstream.body, { status: upstream.status, headers: h });
 }
 
+// Serves an R2 object (whole or ranged) with the same headers as the GitHub path.
+async function fromR2(env, key, request) {
+  const range = request.headers.get("Range");
+  const obj = request.method === "HEAD"
+    ? await env.ASSETS.head(key)
+    : await env.ASSETS.get(key, range ? { range: request.headers } : {});
+  if (!obj) return null;
+  const h = new Headers();
+  const r = obj.range;
+  const off = r ? (r.suffix !== undefined ? obj.size - r.suffix : (r.offset ?? 0)) : 0;
+  const len = r ? (r.suffix !== undefined ? r.suffix : (r.length ?? obj.size - off)) : obj.size;
+  h.set("content-length", String(len));
+  h.set("etag", obj.httpEtag);
+  h.set("accept-ranges", "bytes");
+  if (r) h.set("content-range", `bytes ${off}-${off + len - 1}/${obj.size}`);
+  return finish(new Response(obj.body ?? null, { status: r ? 206 : 200, headers: h }), request, "r2");
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -66,27 +86,19 @@ export default {
     if (url.pathname === "/" || url.pathname === "/healthz") return plain(200, "libreecho-dl ok", request);
 
     const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    // Pinned Amonet archives (community ZIPs, not GitHub releases): R2 only.
+    // The installer checks each against the SHA-256 pinned in profiles.js.
+    if (parts.length === 2 && parts[0] === "amonet") {
+      if (!AMONET.has(parts[1]) || !env.ASSETS) return plain(404, "not found", request);
+      return (await fromR2(env, `amonet/${parts[1]}`, request)) ?? plain(404, "not found", request);
+    }
     if (parts.length !== 2 || !TAG.test(parts[0]) || !NAME.test(parts[1])) return plain(404, "not found", request);
     const [tag, name] = parts;
     const range = request.headers.get("Range");
 
     if (env.ASSETS) {
-      const key = `${tag}/${name}`;
-      const obj = request.method === "HEAD"
-        ? await env.ASSETS.head(key)
-        : await env.ASSETS.get(key, range ? { range: request.headers } : {});
-      if (obj) {
-        const h = new Headers();
-        obj.writeHttpMetadata(h);
-        const r = obj.range;
-        const off = r ? (r.suffix !== undefined ? obj.size - r.suffix : (r.offset ?? 0)) : 0;
-        const len = r ? (r.suffix !== undefined ? r.suffix : (r.length ?? obj.size - off)) : obj.size;
-        h.set("content-length", String(len));
-        h.set("etag", obj.httpEtag);
-        h.set("accept-ranges", "bytes");
-        if (r) h.set("content-range", `bytes ${off}-${off + len - 1}/${obj.size}`);
-        return finish(new Response(obj.body ?? null, { status: r ? 206 : 200, headers: h }), request, "r2");
-      }
+      const hit = await fromR2(env, `${tag}/${name}`, request);
+      if (hit) return hit;
     }
 
     const upstreamUrl = `https://github.com/${REPOSITORY}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(name)}`;
