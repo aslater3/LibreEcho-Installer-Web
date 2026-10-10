@@ -1,0 +1,137 @@
+name: Mirror release assets to Cloudflare R2
+
+# Copies GitHub release assets of aslater3/LibreEcho into the R2 bucket behind
+# https://dl.libreecho.org so the browser installer can fetch them in-page
+# (GitHub's release download endpoint sends no CORS headers). Object layout is
+# <tag>/<asset-name>, which is what the installer's `mirrorBase` expects.
+#
+# The mirror is untrusted transport: the installer still verifies every byte
+# against the release's own SHA256SUMS. This job also verifies each download
+# against the same file before uploading.
+#
+# Required repository secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
+# R2_SECRET_ACCESS_KEY (an R2 API token scoped to Object Read & Write on the
+# bucket only).
+
+on:
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Mirror only this release tag (blank = newest releases)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r2-mirror
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: aslater3/LibreEcho
+  BUCKET: libreecho-releases
+  KEEP_RELEASES: '3'          # newest N non-draft releases stay mirrored
+  KEEP_STABLE: '1'            # plus the newest N stable vX.Y.Z releases
+  MAX_BUCKET_GIB: '9'         # refuse to exceed the 10 GB free tier (prune runs after upload,
+                              # so keep (KEEP_RELEASES+KEEP_STABLE+1) x ~1.5 GB under 10 GB)
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Plan which releases to keep
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONLY_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$SOURCE_REPO/releases?per_page=100" > releases.json
+          python3 - <<'PY'
+          import json, os, re
+          rel = [r for r in json.load(open("releases.json"))
+                 if not r["draft"] and r["assets"]
+                 and re.fullmatch(r"radar-puffin-(v\d+\.\d+\.\d+|nightly-[0-9a-f-]+|build-[0-9a-f-]+)", r["tag_name"])]
+          rel.sort(key=lambda r: r["published_at"] or "", reverse=True)
+          keep = [r["tag_name"] for r in rel[: int(os.environ["KEEP_RELEASES"])]]
+          stable = [r["tag_name"] for r in rel if re.search(r"-v\d+\.\d+\.\d+$", r["tag_name"])]
+          for t in stable[: int(os.environ["KEEP_STABLE"])]:
+              if t not in keep:
+                  keep.append(t)
+          only = os.environ.get("ONLY_TAG", "").strip()
+          sync = [only] if only else keep
+          if only and only not in keep:
+              keep.append(only)
+          open("keep.txt", "w").write("\n".join(keep) + "\n")
+          open("sync.txt", "w").write("\n".join(sync) + "\n")
+          print("keep:", keep)
+          print("sync:", sync)
+          PY
+
+      - name: Upload missing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ep="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          s3() { aws s3 --endpoint-url "$ep" "$@"; }
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            # A release is complete in R2 once its .mirror-complete marker exists;
+            # the marker is written last, so a partial upload is retried.
+            if s3 ls "s3://$BUCKET/$tag/.mirror-complete" >/dev/null 2>&1; then
+              echo "== $tag already mirrored"; continue
+            fi
+            echo "== mirroring $tag"
+            rm -rf dl && mkdir dl
+            gh release download "$tag" --repo "$SOURCE_REPO" --dir dl
+            (
+              cd dl
+              found=0
+              for sums in *SHA256SUMS; do
+                [ -f "$sums" ] || continue
+                found=1
+                # Only check files that were actually published with this release.
+                awk '{n=$2; sub(/^\*/,"",n); print $1"  "n}' "$sums" \
+                  | while read -r h n; do [ -f "$n" ] && echo "$h  $n"; done \
+                  | sha256sum -c --strict --quiet -
+              done
+              [ "$found" = 1 ] || { echo "no SHA256SUMS in $tag; refusing to mirror" >&2; exit 1; }
+            )
+            s3 cp dl/ "s3://$BUCKET/$tag/" --recursive --no-progress \
+              --cache-control "public, max-age=31536000, immutable"
+            date -u +%FT%TZ | s3 cp - "s3://$BUCKET/$tag/.mirror-complete" --cache-control "no-store"
+          done < sync.txt
+
+      - name: Prune releases outside the keep set
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ep="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          s3() { aws s3 --endpoint-url "$ep" "$@"; }
+          s3 ls "s3://$BUCKET/" | awk '$1=="PRE"{sub(/\/$/,"",$2); print $2}' > present.txt
+          while read -r tag; do
+            if ! grep -qxF "$tag" keep.txt; then
+              echo "== pruning $tag"
+              s3 rm "s3://$BUCKET/$tag/" --recursive --only-show-errors
+            fi
+          done < present.txt
+          bytes=$(s3 ls "s3://$BUCKET/" --recursive --summarize | awk '/Total Size/{print $3}')
+          echo "bucket size: $((bytes / 1048576)) MiB"
+          if [ "$bytes" -gt $((MAX_BUCKET_GIB * 1073741824)) ]; then
+            echo "::error::bucket is over ${MAX_BUCKET_GIB} GiB; lower KEEP_RELEASES" >&2
+            exit 1
+          fi
