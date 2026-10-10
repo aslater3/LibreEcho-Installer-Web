@@ -44,6 +44,7 @@ function defaultMirror() {
 // the ZIP is still checked against the size and SHA-256 pinned in profiles.js.
 function defaultAmonetMirror(explicitMirror) {
   if (explicitMirror !== undefined) return "";
+  if (typeof window === "undefined" || window.location?.protocol !== "https:") return "";
   const base = defaultMirror();
   return base ? `${base}/amonet` : "";
 }
