@@ -57,8 +57,9 @@ CNAME  install.dev  →  aslater3.github.io
 
 ## Current state
 
-* Preview: the page carries `noindex`, and `robots.txt` denies crawling. Both
-  should be flipped when the installer is announced publicly.
+* Public preview: linked from libreecho.org as not fully tested, and open to
+  search engines (no `noindex`; `robots.txt` allows crawling). The host
+  installer in the release's installation guide remains the recommended route.
 * Image safety is delegated to the release publisher, not an additional
   browser qualification flag. **Run requires** a complete API-digest-anchored
   published bundle matching the identified device's board, hardware-acceptance
