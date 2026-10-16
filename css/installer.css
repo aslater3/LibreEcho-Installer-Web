@@ -73,6 +73,24 @@ button.ghost{background:transparent}
 button:disabled{opacity:.45;cursor:not-allowed}
 input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
 
+/* --- optional one-shot configuration (step 5) ------------------------------
+   Reuses the existing .field styling. The mode choice is always visible, so
+   "skip" is the default and needs no scrolling; the fields only appear once
+   the operator explicitly asks to configure the device from here. */
+.provision-choice{border:1px solid var(--line);border-radius:12px;padding:.8rem .9rem;margin:.9rem 0;display:flex;flex-direction:column;gap:.55rem}
+.provision-choice legend{font-size:.78rem;text-transform:uppercase;letter-spacing:.1em;font-weight:800;color:var(--muted);padding:0 .3rem}
+.radio-row{display:flex;gap:.6rem;align-items:flex-start;font-size:.9rem;color:var(--muted);cursor:pointer}
+.radio-row strong{color:var(--text)}
+.radio-row input[type=radio]{margin-top:.2rem;accent-color:var(--cyan);flex:none}
+#provision-form-wrap h3{font-size:.8rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin:1.1rem 0 .2rem}
+#provision-form-wrap input[type=text],#provision-form-wrap input[type=password]{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:.6rem .7rem;width:100%}
+#provision-form-wrap input[type=range]{width:100%;accent-color:var(--cyan)}
+.field-check label{display:flex;gap:.55rem;align-items:center;text-transform:none;letter-spacing:0;font-size:.92rem;color:var(--text);font-weight:600;cursor:pointer}
+.field-check input[type=checkbox]{accent-color:var(--cyan);width:1.05rem;height:1.05rem;flex:none}
+.field-error{margin:0;font-size:.8rem;color:var(--red);font-weight:700}
+.field-error:empty{display:none}
+#provision-form-wrap[data-invalid=true] input, #provision-form-wrap[data-invalid=true] select{border-color:rgba(255,122,122,.6)}
+
 .status-line{display:flex;gap:.6rem;align-items:baseline;font-size:.86rem;color:var(--muted);margin:.3rem 0}
 .status-line strong{color:var(--text);font-weight:700}
 .pill{font-size:.7rem;font-weight:850;letter-spacing:.08em;text-transform:uppercase;padding:.15rem .5rem;border-radius:999px;border:1px solid var(--line)}

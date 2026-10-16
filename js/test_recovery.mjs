@@ -10,6 +10,7 @@ import { phaseReply, readbackReply } from './direct-test-protocol.mjs';
 import { sha256Blob, sha256Bytes } from './sha256.js';
 import { createHash } from 'node:crypto';
 import * as stages from './stages.js';
+import { installWebLocksFixture, resetWebLocksFixture } from './web-locks-fixture.mjs';
 
 // --- minimal DOM so the real page module imports under node ---------------
 class Element {
@@ -52,7 +53,22 @@ Object.defineProperty(globalThis, 'navigator', {
     requestDevice: async () => { throw new Error('background code opened a permission prompt'); },
   } },
 });
+// --- Web Locks (js/writer-lock.js) ------------------------------------------
+// app.js takes the browser's origin-wide exclusive writer lock before any device
+// command and FAILS CLOSED without it, so under node — which has `navigator` but
+// no `navigator.locks` — every install here would stop at "cannot start the
+// install: this browser does not offer Web Locks" and never reach the behaviour
+// under test. This is a faithful LockManager double, not an allow-anything stub:
+// it excludes a second holder of the same name and holds the grant until the
+// granted callback settles. Installed AFTER the `navigator` redefinition above,
+// which replaces the whole object. See js/test_web_locks_integration.mjs, which
+// drives the real acquireWriterLock against it and would fail if it became one.
+installWebLocksFixture();
+test.beforeEach(() => { resetWebLocksFixture(); });
+
 const app = await import('./app.js');
+// The post-reboot wait for LibreEcho is covered by test_post_install*.mjs.
+app.__setPostInstallHookForTest(async () => {});
 
 const quiet = { line() {}, info() {}, ok() {}, warn() {}, error() {},
   command() {}, endProgress() {}, progress() {}, phase() {} };

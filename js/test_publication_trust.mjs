@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { directFixture, combinedFixture } from './combined-fixture.mjs';
+import { installWebLocksFixture, resetWebLocksFixture } from './web-locks-fixture.mjs';
 
 class Element {
   constructor() {
@@ -28,6 +29,19 @@ globalThis.document = {
   createElement() { return new Element(); },
 };
 globalThis.window = { isSecureContext: false, location: { search: '' } };
+// --- Web Locks (js/writer-lock.js) ------------------------------------------
+// app.js takes the browser's origin-wide exclusive writer lock before any device
+// command and FAILS CLOSED without it, so under node — which has `navigator` but
+// no `navigator.locks` — every install here would stop at "cannot start the
+// install: this browser does not offer Web Locks" and never reach the behaviour
+// under test. This is a faithful LockManager double, not an allow-anything stub:
+// it excludes a second holder of the same name and holds the grant until the
+// granted callback settles. Installed AFTER the `navigator` redefinition above,
+// which replaces the whole object. See js/test_web_locks_integration.mjs, which
+// drives the real acquireWriterLock against it and would fail if it became one.
+installWebLocksFixture();
+test.beforeEach(() => { resetWebLocksFixture(); });
+
 const app = await import('./app.js');
 
 async function verifiedFixture({ board = 'biscuit', accepted = true, protocol2 = true } = {}) {
@@ -43,8 +57,9 @@ async function verifiedFixture({ board = 'biscuit', accepted = true, protocol2 =
   assert.equal(app.state.bundleReady, true, app.terminal.plainText());
   return fixture;
 }
-async function queryFake(board = 'biscuit', { fail = false } = {}) {
+async function queryFake(board = 'biscuit', { fail = false, onRestart = null } = {}) {
   const forbidden = [];
+  const restarts = [];
   const values = { product: board === 'biscuit' ? 'BISCUIT' : 'RADAR', unlock_status: 'true',
     lk_build_desc: '63cb91b-20221007_072309', serialno: 'TEST-PUBLICATION-TRUST',
     pl_build_desc: '531fa14-20170929_175430', secure: 'yes', rpmb_state: '1',
@@ -55,10 +70,17 @@ async function queryFake(board = 'biscuit', { fail = false } = {}) {
       getVar: async key => values[key] ?? '',
       flash: async () => { forbidden.push('flash'); throw Error('physical writes prohibited'); },
       erase: async () => { forbidden.push('erase'); throw Error('physical writes prohibited'); },
-      reboot: async () => { forbidden.push('reboot'); throw Error('physical writes prohibited'); },
+      // The only restart an unlocked device may receive is the one into TWRP.
+      reboot: async (target = null) => {
+        if (target !== 'recovery') { forbidden.push(`reboot:${target}`); throw Error('physical writes prohibited'); }
+        restarts.push(target);
+        if (onRestart) return onRestart();
+        return true;
+      },
     } };
   } });
   assert.deepEqual(forbidden, []);
+  forbidden.restarts = restarts;
   return forbidden;
 }
 function panelNext() {
@@ -87,9 +109,76 @@ test('the actual install advances to same-device recovery without an image quali
     grantedDevices: async () => [{ vendorId: 0x18d1, productId: 0x4ee1 }],
     openSession: async () => { recoveryProbes += 1; return null; } } });
   assert.ok(recoveryProbes > 0, 'verified matching build was rejected before the recovery boundary');
-  assert.deepEqual(forbidden, [], 'unlocked device received a flash, erase or reboot');
-  assert.match(latestLog(before), /already unlocked; skipping|waiting.*TWRP|timed out.*recovery/i);
+  assert.deepEqual([...forbidden], [], 'unlocked device received a flash, erase or non-recovery restart');
+  assert.deepEqual(forbidden.restarts, ['recovery'], 'an unlocked device must be asked for TWRP exactly once');
+  assert.match(latestLog(before), /already unlocked; skipping/i);
+  assert.match(latestLog(before), /fastboot reboot-recovery/);
   assert.doesNotMatch(latestLog(before), /marker.safe|image qualification/i);
+});
+
+// Hardware, 2026-10-04: an already-unlocked Dot skipped the unlock stage and then
+// sat in fastboot while the page said "Your Echo is restarting" — nothing had
+// asked it to restart. The unlock payload is what restarts a locked device.
+test('an already-unlocked Echo is asked for TWRP before the page starts waiting', async () => {
+  await verifiedFixture();
+  let probes = 0;
+  let probesAtRestart = null;
+  const forbidden = await queryFake('biscuit', { onRestart: () => { probesAtRestart = probes; return true; } });
+  const before = app.terminal.lines.length;
+  let bar = null;
+  const peek = () => { if (app.state.recoveryWaiting) bar ??= elements.get('status-bar-message')?.textContent ?? ''; };
+  await app.runInstall({ recovery: { timeoutMs: 100, intervalMs: 1,
+    grantedDevices: async () => { peek(); return []; },
+    openSession: async () => { probes += 1; peek(); return null; } } });
+  assert.notEqual(bar, null, 'the page never entered the TWRP wait');
+  assert.deepEqual(forbidden.restarts, ['recovery']);
+  assert.equal(probesAtRestart, 0, 'the restart must be requested before the TWRP wait begins');
+  assert.equal(app.state.recoveryRestartRequested, true);
+  assert.deepEqual([...forbidden], []);
+  assert.doesNotMatch(latestLog(before), /refused reboot-recovery/);
+  assert.match(bar, /Your Echo is restarting/);
+});
+
+test('a restart that drops the reply is still a requested restart', async () => {
+  await verifiedFixture();
+  const forbidden = await queryFake('biscuit', { onRestart: () => {
+    throw Object.assign(Error('USB transfer failed: device disconnected'), { name: 'FastbootTransportError' });
+  } });
+  const before = app.terminal.lines.length;
+  await app.runInstall({ recovery: { timeoutMs: 50, intervalMs: 1, grantedDevices: async () => [], openSession: async () => null } });
+  assert.deepEqual(forbidden.restarts, ['recovery']);
+  assert.equal(app.state.recoveryRestartRequested, true);
+  assert.match(latestLog(before), /closed while restarting.*expected/i);
+});
+
+test('a refused restart is reported honestly and never retried', async () => {
+  await verifiedFixture();
+  const forbidden = await queryFake('biscuit', { onRestart: () => {
+    throw Object.assign(Error('fastboot: "reboot-recovery" failed: unknown command'), { name: 'FastbootFailError' });
+  } });
+  const before = app.terminal.lines.length;
+  let bar = null;
+  const peek = () => { if (app.state.recoveryWaiting) bar ??= elements.get('status-bar-message')?.textContent ?? ''; };
+  await app.runInstall({ recovery: { timeoutMs: 50, intervalMs: 1,
+    grantedDevices: async () => { peek(); return []; },
+    openSession: async () => { peek(); return null; } } });
+  assert.notEqual(bar, null, 'the page never entered the TWRP wait');
+  assert.deepEqual(forbidden.restarts, ['recovery'], 'a refused restart must not be retried');
+  assert.equal(app.state.recoveryRestartRequested, false);
+  assert.match(latestLog(before), /refused reboot-recovery/);
+  assert.match(latestLog(before), /start TWRP on the Echo yourself/);
+  assert.doesNotMatch(bar, /Your Echo is restarting/);
+  assert.match(bar, /did not accept the restart/);
+});
+
+test('a locked device is never sent the TWRP restart (the unlock payload restarts it)', async () => {
+  const stages = await import('./stages.js');
+  const src = await readFile(new URL('./app.js', import.meta.url), 'utf8');
+  const call = src.indexOf('requestRecoveryReboot({');
+  const skip = src.indexOf('device is already unlocked; skipping the unlock stage');
+  const unlock = src.indexOf('submitUnlockPayload({');
+  assert.ok(call > skip && skip > unlock, 'the TWRP restart must live only in the already-unlocked branch');
+  assert.equal(typeof stages.requestRecoveryReboot, 'function');
 });
 
 test('a verified publication for the wrong board is disabled and refused before recovery', async () => {

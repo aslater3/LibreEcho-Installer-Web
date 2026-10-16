@@ -16,7 +16,7 @@
 <div class="status-bar-shell">
   <div class="status-bar" id="status-bar" data-kind="pending" role="status" aria-live="polite">
     <div class="status-bar-line">
-      <span class="status-bar-stage" id="status-bar-stage">Step 1 of 5</span>
+      <span class="status-bar-stage" id="status-bar-stage">Step 1 of 6</span>
       <span class="status-bar-title" id="status-bar-title">Device &amp; build</span>
     </div>
     <p class="status-bar-message" id="status-bar-message">Choose your device to see the builds made for it.</p>
@@ -49,7 +49,7 @@
   <section class="installer-intro">
     <p class="eyebrow">Browser one-shot installer · preview</p>
     <h1>Install LibreEcho from the browser.</h1>
-    <p class="intro-lead">Five steps, in order, with one thing to do at a time. The status bar above always tells you what is happening now and what to press next.</p>
+    <p class="intro-lead">Six steps, in order, with one thing to do at a time. The status bar above always tells you what is happening now and what to press next.</p>
     <div class="preview-banner">
       <strong>Preview, not a supported install path.</strong>
       Read-only device query tested on hardware; unlock and install writes are not.
@@ -150,20 +150,24 @@
         </header>
         <p class="step-card-summary" id="summary-connect-device">No device queried yet.</p>
         <div class="step-card-body">
-          <p>Query the device in fastboot before any install decision. This reads selected <code>getvar</code> values only; it does not send <code>download</code>, <code>flash</code>, <code>erase</code> or a reboot. The model is inferred from the bootloader-reported product, not independently proven silicon identity.</p>
+          <p>This step only ever READS your Echo. It asks the browser for USB access, identifies the device, and stops. Nothing is unlocked, written or restarted here.</p>
           <p class="fine-print">The full serial appears only in the local panel below so you can verify the target; the terminal and the saved log mask it. If the chooser lists nothing, use the unfiltered chooser — these devices report device class 0, so a class-based filter cannot match them. More in <a href="NOTES.html">the installer notes</a>.</p>
           <div class="actions">
-            <button id="btn-connect" class="primary" type="button">Query device (read-only fastboot)</button>
-            <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
-            <button id="btn-recovery" class="ghost" type="button">Find previously authorised recovery</button>
-            <button id="btn-grant-recovery" class="ghost" type="button">Allow USB access to TWRP</button>
-            <button id="btn-recovery-entry" class="ghost" type="button">My Echo is already in recovery</button>
+            <button id="btn-connect-resume" class="primary" type="button" aria-describedby="connect-hint">Connect to your Echo</button>
           </div>
-          <p id="device-mode-choice"><strong>Which of these two is your Echo in?</strong> They are different USB modes and only one can work at a time — pressing the wrong one cannot answer.</p>
-          <p class="fine-print" id="choice-fastboot"><strong>Echo is in fastboot (first install)</strong> — the black bootloader screen saying “fastboot mode”. Press <strong>Query device (read-only fastboot)</strong> below.</p>
-          <p class="fine-print" id="choice-recovery"><strong>Echo is already in recovery</strong> — the TWRP screen with a big “Reboot” button. Press <strong>My Echo is already in recovery</strong> below. A device in TWRP cannot answer a fastboot query, and this page now says so instead of storing an empty identity.</p>
-          <p class="fine-print" id="device-mode-choice-done" hidden>Your Echo is identified, so step 3 needs nothing more from you. The two choices above apply only until a device is identified.</p>
-          <p class="fine-print">Already unlocked and sitting in TWRP? <strong>My Echo is already in recovery</strong> reads the device's identity from recovery itself, so a reloaded page can still continue. It checks the TWRP version, the board and the Kaeru header in <code>expdb</code> before accepting anything, and it never sends an unlock payload. Choose the USB device named “Echo” in Chrome's list — there is no serial to narrow the list with yet, so every check is done from what the device itself reports.</p>
+          <p class="fine-print" id="connect-hint" role="status" aria-live="polite">Press it, then choose the USB device named “Echo” from Chrome's list. If your Echo is in recovery, choose it here instead — no fastboot is needed.</p>
+          <details id="connect-advanced">
+            <summary>Advanced: if the one button above does not work</summary>
+            <p class="fine-print">These ask for USB access differently. Use them only when the button above cannot reach your Echo — each one reads the device and none of them writes.</p>
+            <div class="actions">
+              <button id="btn-connect" class="ghost" type="button">Read the device in fastboot</button>
+              <button id="btn-connect-any" class="ghost" type="button">Show all USB devices…</button>
+              <button id="btn-recovery" class="ghost" type="button">Find previously authorised recovery</button>
+              <button id="btn-grant-recovery" class="ghost" type="button">Allow USB access to TWRP</button>
+              <button id="btn-recovery-entry" class="ghost" type="button">My Echo is already in recovery</button>
+            </div>
+            <p class="fine-print">Already unlocked and sitting in TWRP? <strong>My Echo is already in recovery</strong> reads the device's identity from recovery itself, so a reloaded page can still continue. It checks the TWRP version, the board and the Kaeru header in <code>expdb</code> before accepting anything, and it never sends an unlock payload. Choose the USB device named “Echo” in Chrome's list — there is no serial to narrow the list with yet, so every check is done from what the device itself reports.</p>
+          </details>
           <p class="status-line">Device state: <span id="status-device" class="pill" data-state="pending">not connected</span></p>
           <div id="device-panel" aria-live="polite"></div>
           <p id="amonet-route" role="status" aria-live="polite">Query the device to determine whether an Amonet unlock ZIP is needed.</p>
@@ -199,9 +203,109 @@
       </section>
 
       <!-- 5 -->
-      <section class="card step-card" id="card-install" data-step-card="install" data-state="waiting">
+      <section class="card step-card" id="card-configure" data-step-card="configure" data-state="waiting">
         <header class="step-card-head">
           <span class="step-card-number" aria-hidden="true">5</span>
+          <h2>Configure your device</h2>
+          <span class="step-badge" id="badge-configure" data-state="waiting">waiting</span>
+        </header>
+        <p class="step-card-summary" id="summary-configure">Skipped — you will set it up on the device.</p>
+        <div class="step-card-body">
+          <p>Optional. Fill this in and your Echo applies these settings itself on first boot. Leave it alone and the device runs its own setup page exactly as usual — installing never depends on this step.</p>
+          <fieldset class="provision-choice">
+            <legend>How do you want to set the Echo up?</legend>
+            <label class="radio-row">
+              <input type="radio" name="provision-mode" id="provision-mode-skip" value="skip" checked>
+              <span><strong>Skip — I'll set it up on the device.</strong> Recommended. Nothing is written; the Echo shows its own setup page on first boot.</span>
+            </label>
+            <label class="radio-row">
+              <input type="radio" name="provision-mode" id="provision-mode-fill" value="fill">
+              <span><strong>Configure it now from this page.</strong> The settings are written to the Echo's userdata and applied by the device's own daemon on first boot.</span>
+            </label>
+          </fieldset>
+          <div id="provision-form-wrap" hidden>
+            <h3>Administrator account</h3>
+            <p class="fine-print">The password is turned into the device's own stored hash in this browser. The plaintext never reaches the device and is not kept anywhere once the install finishes.</p>
+            <div class="field">
+              <label for="provision-username">Admin username</label>
+              <input id="provision-username" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="31" placeholder="lowercase letters, numbers, . _ -">
+              <p class="field-error" id="provision-error-username" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-password">Admin password</label>
+              <input id="provision-password" type="password" autocomplete="off" maxlength="128">
+              <p class="field-error" id="provision-error-password" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-password-confirm">Confirm admin password</label>
+              <input id="provision-password-confirm" type="password" autocomplete="off" maxlength="128">
+              <p class="field-error" id="provision-error-passwordConfirm" role="alert"></p>
+            </div>
+            <h3>Wi-Fi</h3>
+            <p class="fine-print">Leave the network name blank to keep the device's own network setup. This page cannot scan for networks and never stores a Wi-Fi password in the browser.</p>
+            <div class="field">
+              <label for="provision-ssid">Network name (SSID)</label>
+              <input id="provision-ssid" type="text" autocomplete="off" maxlength="32" placeholder="Leave blank to skip">
+              <p class="field-error" id="provision-error-ssid" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-security">Security</label>
+              <select id="provision-security">
+                <option value="wpa2">WPA2</option>
+                <option value="open">Open (no password)</option>
+              </select>
+              <p class="field-error" id="provision-error-security" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-wifi-password">Wi-Fi password</label>
+              <input id="provision-wifi-password" type="password" autocomplete="off" maxlength="63">
+              <p class="field-error" id="provision-error-wifiPassword" role="alert"></p>
+            </div>
+            <h3>Essentials</h3>
+            <div class="field">
+              <label for="provision-hostname">Hostname</label>
+              <input id="provision-hostname" type="text" autocomplete="off" maxlength="63" spellcheck="false" placeholder="libreecho">
+              <p class="fine-print">The Echo answers at <strong id="provision-hostname-preview">libreecho.local</strong></p>
+              <p class="field-error" id="provision-error-hostname" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-volume">Initial volume: <output id="provision-volume-output">64%</output></label>
+              <input id="provision-volume" type="range" min="0" max="100" value="64">
+              <p class="field-error" id="provision-error-volume" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-wake-word">Wake word</label>
+              <select id="provision-wake-word">
+                <option value="Alexa">Alexa</option>
+              </select>
+              <p class="fine-print">This image includes the Alexa wake model.</p>
+              <p class="field-error" id="provision-error-wakeWord" role="alert"></p>
+            </div>
+            <div class="field">
+              <label for="provision-wake-sensitivity">Wake sensitivity: <output id="provision-sensitivity-output">68%</output></label>
+              <input id="provision-wake-sensitivity" type="range" min="0" max="100" value="68">
+              <p class="field-error" id="provision-error-wakeSensitivity" role="alert"></p>
+            </div>
+            <h3>Privacy</h3>
+            <div class="field field-check">
+              <label><input id="provision-local-only" type="checkbox" checked> Keep audio processing on the device only</label>
+              <p class="field-error" id="provision-error-localOnly" role="alert"></p>
+            </div>
+            <div class="field field-check">
+              <label><input id="provision-telemetry" type="checkbox"> Send diagnostic telemetry</label>
+              <p class="field-error" id="provision-error-telemetry" role="alert"></p>
+            </div>
+          </div>
+          <p class="status-line">Configuration: <span id="status-provision" class="pill" data-state="pending">will be set up on the device</span></p>
+          <p class="fine-print">Nothing here is written until the install finishes installing, and it is written as a single one-shot file that the device reads once on first boot. This page never writes the device's own config, user or Wi-Fi files, and it cannot mark setup complete — only the device does that after it has actually joined your network.</p>
+        </div>
+        <div class="operator-callout" id="callout-configure" hidden></div>
+      </section>
+
+      <!-- 6 -->
+      <section class="card step-card" id="card-install" data-step-card="install" data-state="waiting">
+        <header class="step-card-head">
+          <span class="step-card-number" aria-hidden="true">6</span>
           <h2>Install</h2>
           <span class="step-badge" id="badge-install" data-state="waiting">waiting</span>
         </header>
@@ -219,7 +323,7 @@
             <ul id="install-prereqs" class="prereq-list"></ul>
           </div>
           <details id="stage-list-details">
-            <summary>The 11 install stages and what each one verifies</summary>
+            <summary>The 12 install stages and what each one verifies</summary>
             <ol id="step-list" class="step-list"></ol>
             <ul>
               <li><strong>Release</strong> — both checksum inventories and the recovery ZIP/manifest are verified against the release API's digests before any write.</li>
@@ -229,6 +333,7 @@
               <li><strong>Recovery</strong> — TWRP's ADB serial must match the fastboot serial, and the Kaeru header in <code>expdb</code> must be intact before staging files.</li>
               <li><strong>Stage</strong> — only files that matched the API-anchored normal and TWRP checksum inventories are pushed and re-hashed on the device.</li>
               <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>
+              <li><strong>Configure</strong> — only if you filled in step 5: one <code>provision.json</code> is written to userdata atomically (owner-only, then renamed) after the install is complete and before the reboot. Nothing is logged and no password is stored in the browser.</li>
             </ul>
           </details>
         </div>
