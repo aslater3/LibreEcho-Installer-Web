@@ -34,7 +34,7 @@ env:
   SOURCE_REPO: aslater3/LibreEcho
   BUCKET: libreecho-releases
   KEEP_RELEASES: '3'          # newest N 0.14 development builds stay mirrored
-  KEEP_STABLE: '0'            # newest N stable vX.Y.Z (0 while 0.13 is the only stable line)
+  KEEP_STABLE: '1'            # newest N stable vX.Y.Z (0.14.0 is the first stable on this line)
   MIN_STABLE: '0.14.0'        # never mirror stable releases older than this
   MAX_BUCKET_GIB: '9'         # refuse to exceed the 10 GB free tier (prune runs after upload,
                               # so keep (KEEP_RELEASES+KEEP_STABLE+1) x ~1.5 GB under 10 GB)
