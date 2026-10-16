@@ -142,6 +142,7 @@ input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events
 .terminal-head button{margin-left:auto;font-size:.75rem;padding:.35rem .7rem}
 .terminal-head #download-log{margin-left:auto}
 .terminal-head #btn-log-toggle{margin-left:auto}
+.terminal-head #btn-report{margin-left:0}
 /* The log is secondary: collapsible, and out of the way on a narrow page. */
 #terminal[hidden]{display:none}
 .terminal-card[data-collapsed=true]{opacity:.9}
@@ -181,3 +182,9 @@ input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events
 .download-error{margin:.6rem 0;padding:.6rem .8rem;border:1px solid rgba(255,122,122,.5);border-radius:12px;color:var(--red);font-size:.9rem}
 .download-panel[data-state=ok] .download-bar{background:var(--green)}
 body.waiting button,body.waiting select{cursor:progress}
+#report-dialog{max-width:36rem;width:calc(100% - 2rem);border:1px solid var(--line);border-radius:18px;background:var(--panel);color:var(--text);padding:1.4rem 1.5rem}
+#report-dialog::backdrop{background:rgba(4,10,16,.7)}
+#report-dialog h2{margin:0 0 .5rem;font-size:1.2rem}
+#report-dialog p{color:var(--muted);font-size:.9rem;margin:.4rem 0}
+#report-dialog input[type=text],#report-dialog textarea{font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;padding:.6rem .7rem;width:100%;box-sizing:border-box;resize:vertical}
+#report-dialog .check{display:flex;gap:.5rem;align-items:center;font-size:.9rem;margin:.6rem 0}

@@ -38,6 +38,7 @@ import {
 import { discoverMirror, fetchReleaseBundle, fetchTargetsJson, createBundleStore } from "./auto-fetch.js";
 import { extractRecoveryMetadata } from "./recovery-metadata.js";
 import { formatSize, formatDuration, computeEta } from "./progress.js";
+import { buildIssueReport } from "./report.js";
 
 const config = installerConfig();
 
@@ -2866,6 +2867,80 @@ document.getElementById("download-log")?.addEventListener("click", () => {
   link.download = `libreecho-browser-install-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
   link.click();
   URL.revokeObjectURL(link.href);
+});
+
+// "Report a problem": the user's description plus the log, prefilled into a
+// GitHub bug report that they review and submit themselves.
+function reportContext() {
+  const identity = state.identity;
+  const device = identity ? (identity.profile?.marketing ?? identity.product ?? "") : "";
+  const stepDef = WIZARD_STEPS.find((entry) => entry.id === lastStatusBar.step);
+  const stepText = stepDef ? `${stepDef.title}${lastStatusBar.kind === "error" ? " (failed)" : ""}` : "";
+  return {
+    device: device || (state.board ? `${boardLabel(state.board)} (chosen, not identified)` : ""),
+    release: state.release?.tag ?? "",
+    step: [stepText, lastStatusBar.message].filter(Boolean).join(" — "),
+  };
+}
+
+const reportDom = {
+  dialog: document.getElementById("report-dialog"),
+  form: document.getElementById("report-form"),
+  summary: document.getElementById("report-summary"),
+  what: document.getElementById("report-what"),
+  expected: document.getElementById("report-expected"),
+  includeLog: document.getElementById("report-include-log"),
+  status: document.getElementById("report-status"),
+};
+
+export function openReportDialog() {
+  if (reportDom.status) reportDom.status.textContent = "";
+  if (typeof reportDom.dialog?.showModal === "function") {
+    reportDom.dialog.showModal();
+    reportDom.summary?.focus?.();
+  } else {
+    // No <dialog> support: fall back to the blank bug form.
+    window.open?.(buildIssueReport({ includeLog: false, context: reportContext() }).url, "_blank", "noopener");
+  }
+}
+
+export async function submitReport() {
+  const report = buildIssueReport({
+    summary: reportDom.summary?.value,
+    whatHappened: reportDom.what?.value,
+    expected: reportDom.expected?.value,
+    includeLog: reportDom.includeLog?.checked !== false,
+    log: terminal.plainText(),
+    context: reportContext(),
+    userAgent: globalThis.navigator?.userAgent ?? "",
+  });
+  let copied = false;
+  if (report.truncated || (report.totalLines && report.shownLines === 0)) {
+    try {
+      await globalThis.navigator?.clipboard?.writeText(report.fullLog);
+      copied = true;
+    } catch { /* clipboard refused; the Save log button still works */ }
+  }
+  const opened = window.open?.(report.url, "_blank", "noopener");
+  terminal.info(`opened a GitHub bug report with ${report.shownLines} of ${report.totalLines} log lines`
+    + (copied ? "; the full log is on your clipboard" : report.truncated ? "; use Save log to attach the full log" : ""));
+  if (opened === null && reportDom.status) {
+    reportDom.status.textContent = "Your browser blocked the new tab. Allow pop-ups for this page and try again.";
+    return report;
+  }
+  reportDom.dialog?.close?.();
+  return report;
+}
+
+document.getElementById("btn-report")?.addEventListener("click", openReportDialog);
+document.getElementById("footer-report")?.addEventListener("click", (event) => {
+  event.preventDefault?.();
+  openReportDialog();
+});
+document.getElementById("report-cancel")?.addEventListener("click", () => reportDom.dialog?.close?.());
+reportDom.form?.addEventListener("submit", (event) => {
+  event.preventDefault?.();
+  submitReport();
 });
 
 terminal.info("LibreEcho browser installer — preview");

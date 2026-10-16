@@ -242,6 +242,7 @@
           <strong>install progress</strong>
           <button id="btn-log-toggle" class="ghost" type="button" aria-expanded="true" aria-controls="terminal">Hide log</button>
           <button id="download-log" class="ghost" type="button">Save log</button>
+          <button id="btn-report" class="ghost" type="button" aria-haspopup="dialog">Report a problem</button>
         </div>
         <ol id="terminal" aria-live="polite" aria-label="Install progress log"></ol>
       </section>
@@ -262,10 +263,36 @@
 <footer class="installer-footer">
   <div class="wrap">
     <p>An independent open-source project. Not affiliated with, authorised by, or endorsed by Amazon. Reading, writing or reflashing a device can make it unrecoverable; keep a recovery route.</p>
-    <p><a href="NOTES.html">Installer notes and limitations</a> · <a href="https://github.com/aslater3/LibreEcho/issues">Report a problem</a></p>
+    <p><a href="NOTES.html">Installer notes and limitations</a> · <a href="#report" id="footer-report">Report a problem</a></p>
   </div>
 </footer>
 
-<script type="module" src="js/app.js?v=published-target-3"></script>
+<dialog id="report-dialog" aria-labelledby="report-title">
+  <form id="report-form" method="dialog">
+    <h2 id="report-title">Report a problem</h2>
+    <p>This opens a new bug report on GitHub with what you write here and the installer log filled in. Nothing is sent until you check it and press <strong>Create</strong> on GitHub, which needs a GitHub account.</p>
+    <div class="field">
+      <label for="report-summary">Short summary</label>
+      <input id="report-summary" type="text" maxlength="120" required placeholder="For example: stuck waiting for recovery">
+    </div>
+    <div class="field">
+      <label for="report-what">What happened?</label>
+      <textarea id="report-what" rows="4" required placeholder="What you did, and what the installer did or showed"></textarea>
+    </div>
+    <div class="field">
+      <label for="report-expected">What did you expect?</label>
+      <textarea id="report-expected" rows="2" placeholder="Optional"></textarea>
+    </div>
+    <label class="check"><input id="report-include-log" type="checkbox" checked> Include the installer log</label>
+    <p class="fine-print">The log masks your device serial. MAC addresses, local IP addresses and anything that looks like a password are removed too, but please read the report before you submit it. GitHub limits how much a link can carry, so a long log is shortened to its last lines and the full log is copied to your clipboard to paste in.</p>
+    <p class="fine-print" id="report-status" role="status" aria-live="polite"></p>
+    <div class="actions">
+      <button id="report-submit" class="primary" type="submit" value="open">Open the report on GitHub</button>
+      <button id="report-cancel" class="ghost" type="button">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="module" src="js/app.js?v=published-target-4"></script>
 </body>
 </html>
