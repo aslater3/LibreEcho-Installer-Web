@@ -1,4 +1,2 @@
-# Preview site: not announced yet. Remove this file's Disallow and the
-# noindex meta tag in index.html when the installer is announced publicly.
 User-agent: *
-Disallow: /
+Allow: /
