@@ -50,6 +50,29 @@ function defaultAmonetMirror(explicitMirror) {
 }
 
 const TAG_PATTERN = /^radar-puffin-(?<kind>v\d+\.\d+\.\d+|nightly-[0-9a-f-]+|build-[0-9a-f-]+)$/;
+// Retired release line (0.0.x to 0.13.x), as in the dl.libreecho.org Worker's
+// RETIRED: not mirrored, refused with 410, and never offered here. The 0.13.21
+// bridge is published as GitHub "Latest" for 0.13 devices; it must never be
+// picked for a fresh install.
+const RETIRED_TAG = /^radar-puffin-v0\.(?:\d|1[0-3])\.\d+$/;
+
+export function isRetiredTag(tag) {
+  return RETIRED_TAG.test(String(tag ?? ""));
+}
+
+/** [major, minor, patch] of a stable `radar-puffin-vX.Y.Z` tag, else null. */
+export function stableVersion(tag) {
+  const match = /^radar-puffin-v(\d+)\.(\d+)\.(\d+)$/.exec(String(tag ?? ""));
+  return match ? match.slice(1).map(Number) : null;
+}
+
+/** Orders stable releases highest version first (publication date breaks no ties). */
+export function compareStableDescending(a, b) {
+  const va = stableVersion(a.tag) ?? [-1, -1, -1];
+  const vb = stableVersion(b.tag) ?? [-1, -1, -1];
+  for (let i = 0; i < 3; i += 1) if (va[i] !== vb[i]) return vb[i] - va[i];
+  return 0;
+}
 
 export function installerConfig() {
   const global = typeof window !== "undefined" ? window.LIBREECHO_INSTALLER_CONFIG ?? {} : {};
@@ -124,12 +147,18 @@ export async function fetchReleaseIndex(repository = DEFAULT_REPOSITORY) {
         })),
       };
     })
-    .filter((release) => release.tag && !release.draft);
+    .filter((release) => release.tag && !release.draft && !isRetiredTag(release.tag));
 }
 
+/**
+ * The highest-versioned eligible stable release. Never a retired (0.13.x or
+ * older) release, and chosen by version rather than publication date, so a
+ * 0.13.x bridge published after 0.14.0 cannot win.
+ */
 export function pickLatestStable(releases) {
-  const stable = releases.filter((release) => release.kind === "stable" && !release.prerelease);
-  stable.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+  const stable = releases.filter((release) => release.kind === "stable" && !release.prerelease
+    && stableVersion(release.tag) && !isRetiredTag(release.tag));
+  stable.sort(compareStableDescending);
   return stable[0] ?? null;
 }
 

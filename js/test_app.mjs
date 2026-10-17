@@ -280,6 +280,26 @@ test('refreshing the release list invalidates assets from the previous selection
   } finally { globalThis.fetch = previousFetch; }
 });
 
+test('a 0.13.x bridge made GitHub Latest is never the default or a listed build', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousBoard = app.state.board;
+  globalThis.fetch = async () => ({ ok: true, json: async () => [
+    { tag_name: 'radar-puffin-v0.13.21', published_at: '2026-10-20T00:00:00Z', assets: [], prerelease: false, draft: false },
+    { tag_name: 'radar-puffin-v0.14.0', published_at: '2026-10-16T00:00:00Z', assets: [], prerelease: false, draft: false },
+  ] });
+  try {
+    for (const board of [null, 'radar_puffin']) {
+      app.state.board = board;
+      await app.loadReleases();
+      assert.equal(app.state.release.tag, 'radar-puffin-v0.14.0', String(board));
+      assert.ok(app.state.releases.every((r) => r.tag !== 'radar-puffin-v0.13.21'), String(board));
+    }
+  } finally {
+    globalThis.fetch = previousFetch;
+    app.state.board = previousBoard;
+  }
+});
+
 test('first-use recovery permission is explicitly requested and serial-checked', async () => {
   assert.equal(typeof app.grantRecovery, 'function');
   setup([]);

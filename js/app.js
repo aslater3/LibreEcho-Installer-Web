@@ -11,6 +11,8 @@ import { protocolSupport, openFastboot, openAdb, grantedAdbDevices } from "./tra
 import {
   installerConfig,
   fetchReleaseIndex,
+  isRetiredTag,
+  pickLatestStable,
   verifyBundleFiles,
   sha256OfBlob,
   parseSums,
@@ -535,8 +537,9 @@ function renderBoardOptions() {
 }
 
 function pickDefaultRelease() {
-  const candidates = [...releasesForBoard()].sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-  return candidates.find(release => release.kind === "stable") ?? candidates[0] ?? null;
+  const candidates = releasesForBoard().filter(release => !isRetiredTag(release.tag));
+  return pickLatestStable(candidates)
+    ?? [...candidates].sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt))[0] ?? null;
 }
 
 function renderReleaseOptions() {
