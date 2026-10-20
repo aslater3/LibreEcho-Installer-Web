@@ -77,7 +77,7 @@ export const FEATURES = ["airplay2", "assistant", "stt", "tts", "wakeword"];
  * Shared by the legacy compatibility list and the combined-release target
  * resolution so the two can never drift apart.
  */
-export function normalBundleMembers(prefix) {
+export function normalBundleMembers(prefix, { verification = true } = {}) {
   const members = [
     `${prefix}-boot.img`,
     `${prefix}-build.json`,
@@ -88,9 +88,12 @@ export function normalBundleMembers(prefix) {
     `${prefix}-ota-public-key.hex`,
     `${prefix}-release-notes.md`,
     `${prefix}-run-one-shot.sh`,
-    `${prefix}-verification.txt`,
     `${prefix}.ota.tar`,
   ];
+  // Product CI publishes the image-verification report only with development
+  // builds; stable releases (radar-puffin-vX.Y.Z) never carry it, and the
+  // Python installer accepts it only for dev/nightly tags.
+  if (verification) members.push(`${prefix}-verification.txt`);
   for (const feature of FEATURES) {
     members.push(`${prefix}-${feature}.squashfs`, `${prefix}-${feature}.manifest.json`);
   }
@@ -112,7 +115,7 @@ export function recoveryBundleMembers({ legacy = false, slug = "radar-puffin" } 
 export function requiredBundleMembers(tag) {
   const prefix = `libreecho-${tag}`;
   return [
-    ...normalBundleMembers(prefix),
+    ...normalBundleMembers(prefix, { verification: !/^radar-puffin-v\d+\.\d+\.\d+$/.test(String(tag)) }),
     `${prefix}-SHA256SUMS`,
     `${prefix}-TWRPINSTALL-SHA256SUMS`,
     ...recoveryBundleMembers({ legacy: true }),

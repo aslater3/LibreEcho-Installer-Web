@@ -131,6 +131,11 @@ export function parseTargetsJson(text) {
   return { release: data.release, targets };
 }
 
+/** A stable release tag (radar-puffin-vX.Y.Z) rather than a dev/nightly build. */
+export function isStableReleaseTag(tag) {
+  return /^radar-puffin-v\d+\.\d+\.\d+$/.test(String(tag ?? ""));
+}
+
 /**
  * The targets a release offers. A combined release is driven entirely by its
  * targets.json (its `release` must match the tag); a release without one offers
@@ -143,7 +148,8 @@ export function targetsForRelease({ tag, targetsJson = null } = {}) {
     if (parsed.release !== tag) {
       throw new Error("the release's targets.json names a different release than the one selected");
     }
-    return parsed.targets;
+    const stable = isStableReleaseTag(tag);
+    return parsed.targets.map((target) => ({ ...target, stable }));
   }
   const radar = profileForBoard("radar_puffin");
   return [{
@@ -154,6 +160,7 @@ export function targetsForRelease({ tag, targetsJson = null } = {}) {
     profileId: radar.id,
     descriptorSha256: null,
     legacy: true,
+    stable: isStableReleaseTag(tag),
   }];
 }
 
@@ -193,7 +200,7 @@ export function recoveryManifestNameForTarget(target) {
 
 /** The normal (non-recovery) members a target's normal inventory must list. */
 export function normalMembersForTarget(target) {
-  return normalBundleMembers(target.prefix);
+  return normalBundleMembers(target.prefix, { verification: !target.stable });
 }
 
 /** Every member a target needs, grouped by the inventory that must list it. */

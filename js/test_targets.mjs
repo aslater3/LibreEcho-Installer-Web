@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import {
   targetsForRelease, targetForBoard, parseTargetsJson, inventoryNamesForTarget,
   requiredMembersForTarget, nameBelongsToTarget, parseBundleManifest, offeredBoards,
-  releaseDeclaresTargets, targetsAssetName,
+  releaseDeclaresTargets, targetsAssetName, isStableReleaseTag,
 } from './targets.js';
 import { fetchReleaseBundle, fetchTargetsJson } from './auto-fetch.js';
 import { sha256Blob } from './sha256.js';
@@ -264,4 +264,51 @@ test('hashing streams a Blob in bounded chunks and never calls whole-blob arrayB
   assert.equal(rootText, 0);
   assert.ok(slices >= 3, `expected chunked slices, got ${slices}`);
   assert.equal(digest, createHash('sha256').update(Buffer.alloc(size)).digest('hex'));
+});
+
+// --- stable releases do not publish the dev-only verification report --------
+
+// Member names (no hashes) of the published radar-puffin-v0.14.2 inventories.
+const STABLE_0142_RADAR_NORMAL = ["libreecho-radar-puffin-base-airplay2-3583f5346d44bad33e1747020f75bdc86582deb0c55e1526b7269a097a67ed8a.payload.squashfs", "libreecho-radar-puffin-base-airplay2-dde7fa448e1bee553f06a05a624415d40d03775e28048b5cdfc91be595ad9cc0.manifest.json", "libreecho-radar-puffin-base-assistant-133101d270bcda2cd8332b4cb8d229a5562dff6f1179ea2b091c18732277bc80.payload.squashfs", "libreecho-radar-puffin-base-assistant-d6f45c424b326dd87ac4d24fefe9c2e46252e25d5bc350626802261520af79d6.manifest.json", "libreecho-radar-puffin-base-stt-21820516c0dc831f24037f982ea73e09344e738aaa6c8ec2ea19f994ebc7178f.manifest.json", "libreecho-radar-puffin-base-stt-6c1e866b364f1c06548ace326d8748d1a7f28a7488669627019bf99f9137e856.payload.squashfs", "libreecho-radar-puffin-base-tts-66022599c1a695bddce2ad4ebe812ec2185bd9589ca9a6f37577eccc59379252.manifest.json", "libreecho-radar-puffin-base-tts-a9defee502d10da24144407a23acbd3ba3db6e323823922cbf34eb32f802cabc.payload.squashfs", "libreecho-radar-puffin-base-wakeword-8f4e6318d683316266e238bef51ebb820722a25494297548817c97fb6a402ef8.payload.squashfs", "libreecho-radar-puffin-base-wakeword-affd75af145391cfcc883445185ead96cb429b0299dd1c5e0b89894d9271411a.manifest.json", "libreecho-radar-puffin-release-completeness.json", "libreecho-radar-puffin-stable.ota.tar", "libreecho-radar-puffin-v0.14.2-airplay2.manifest.json", "libreecho-radar-puffin-v0.14.2-airplay2.squashfs", "libreecho-radar-puffin-v0.14.2-assistant.manifest.json", "libreecho-radar-puffin-v0.14.2-assistant.squashfs", "libreecho-radar-puffin-v0.14.2-boot.img", "libreecho-radar-puffin-v0.14.2-build.json", "libreecho-radar-puffin-v0.14.2-feature-assets.json", "libreecho-radar-puffin-v0.14.2-feature-plan.json", "libreecho-radar-puffin-v0.14.2-initial-install.tar", "libreecho-radar-puffin-v0.14.2-installer.py", "libreecho-radar-puffin-v0.14.2-ota-public-key.hex", "libreecho-radar-puffin-v0.14.2-release-notes.md", "libreecho-radar-puffin-v0.14.2-run-one-shot.sh", "libreecho-radar-puffin-v0.14.2-stt.manifest.json", "libreecho-radar-puffin-v0.14.2-stt.squashfs", "libreecho-radar-puffin-v0.14.2-tts.manifest.json", "libreecho-radar-puffin-v0.14.2-tts.squashfs", "libreecho-radar-puffin-v0.14.2-wakeword.manifest.json", "libreecho-radar-puffin-v0.14.2-wakeword.squashfs", "libreecho-radar-puffin-v0.14.2.ota.tar"];
+const STABLE_0142_BISCUIT_NORMAL = ["libreecho-biscuit-base-airplay2-3583f5346d44bad33e1747020f75bdc86582deb0c55e1526b7269a097a67ed8a.payload.squashfs", "libreecho-biscuit-base-airplay2-dde7fa448e1bee553f06a05a624415d40d03775e28048b5cdfc91be595ad9cc0.manifest.json", "libreecho-biscuit-base-assistant-133101d270bcda2cd8332b4cb8d229a5562dff6f1179ea2b091c18732277bc80.payload.squashfs", "libreecho-biscuit-base-assistant-d6f45c424b326dd87ac4d24fefe9c2e46252e25d5bc350626802261520af79d6.manifest.json", "libreecho-biscuit-base-stt-21820516c0dc831f24037f982ea73e09344e738aaa6c8ec2ea19f994ebc7178f.manifest.json", "libreecho-biscuit-base-stt-6c1e866b364f1c06548ace326d8748d1a7f28a7488669627019bf99f9137e856.payload.squashfs", "libreecho-biscuit-base-tts-66022599c1a695bddce2ad4ebe812ec2185bd9589ca9a6f37577eccc59379252.manifest.json", "libreecho-biscuit-base-tts-a9defee502d10da24144407a23acbd3ba3db6e323823922cbf34eb32f802cabc.payload.squashfs", "libreecho-biscuit-base-wakeword-8f4e6318d683316266e238bef51ebb820722a25494297548817c97fb6a402ef8.payload.squashfs", "libreecho-biscuit-base-wakeword-affd75af145391cfcc883445185ead96cb429b0299dd1c5e0b89894d9271411a.manifest.json", "libreecho-biscuit-release-completeness.json", "libreecho-biscuit-stable.ota.tar", "libreecho-biscuit-v0.14.2-airplay2.manifest.json", "libreecho-biscuit-v0.14.2-airplay2.squashfs", "libreecho-biscuit-v0.14.2-assistant.manifest.json", "libreecho-biscuit-v0.14.2-assistant.squashfs", "libreecho-biscuit-v0.14.2-boot.img", "libreecho-biscuit-v0.14.2-build.json", "libreecho-biscuit-v0.14.2-feature-assets.json", "libreecho-biscuit-v0.14.2-feature-plan.json", "libreecho-biscuit-v0.14.2-initial-install.tar", "libreecho-biscuit-v0.14.2-installer.py", "libreecho-biscuit-v0.14.2-ota-public-key.hex", "libreecho-biscuit-v0.14.2-release-notes.md", "libreecho-biscuit-v0.14.2-run-one-shot.sh", "libreecho-biscuit-v0.14.2-stt.manifest.json", "libreecho-biscuit-v0.14.2-stt.squashfs", "libreecho-biscuit-v0.14.2-tts.manifest.json", "libreecho-biscuit-v0.14.2-tts.squashfs", "libreecho-biscuit-v0.14.2-wakeword.manifest.json", "libreecho-biscuit-v0.14.2-wakeword.squashfs", "libreecho-biscuit-v0.14.2.ota.tar"];
+const STABLE_0142_TARGETS = JSON.stringify({
+  schema: 'libreecho-combined-release-v1',
+  release: 'radar-puffin-v0.14.2',
+  targets: [
+    { board: 'radar_puffin', prefix: 'libreecho-radar-puffin-v0.14.2', target_descriptor_sha256: 'a'.repeat(64) },
+    { board: 'biscuit', prefix: 'libreecho-biscuit-v0.14.2', target_descriptor_sha256: 'b'.repeat(64) },
+  ],
+});
+
+test('stable releases do not require the dev-only verification report', () => {
+  assert.equal(isStableReleaseTag('radar-puffin-v0.14.2'), true);
+  assert.equal(isStableReleaseTag(REAL_TAG), false);
+  assert.equal(isStableReleaseTag('radar-puffin-nightly-20261020'), false);
+  const [radar, biscuit] = targetsForRelease({ tag: 'radar-puffin-v0.14.2', targetsJson: STABLE_0142_TARGETS });
+  for (const target of [radar, biscuit]) {
+    assert.equal(target.stable, true);
+    assert.ok(!requiredMembersForTarget(target).normal.some(n => n.endsWith('-verification.txt')),
+      `${target.board} stable target must not require verification.txt`);
+  }
+  // Regression: every required member is listed by the real 0.14.2 inventories
+  // (the browser installer refused 0.14.2 with "missing from the normal
+  // checksum inventory" for -verification.txt).
+  const radarListed = new Set(STABLE_0142_RADAR_NORMAL);
+  for (const name of requiredMembersForTarget(radar).normal) assert.ok(radarListed.has(name), `${name} listed in 0.14.2 radar inventory`);
+  const biscuitListed = new Set(STABLE_0142_BISCUIT_NORMAL);
+  for (const name of requiredMembersForTarget(biscuit).normal) assert.ok(biscuitListed.has(name), `${name} listed in 0.14.2 biscuit inventory`);
+  // Legacy (no targets.json) stable resolution follows the same rule.
+  const legacy = targetsForRelease({ tag: 'radar-puffin-v0.14.2' })[0];
+  assert.equal(legacy.stable, true);
+  assert.ok(!requiredMembersForTarget(legacy).normal.some(n => n.endsWith('-verification.txt')));
+});
+
+test('development builds still require the verification report', () => {
+  const f = combinedFixture();
+  for (const target of targetsForRelease({ tag: f.tag, targetsJson: f.targetsJson })) {
+    assert.equal(target.stable, false);
+    assert.ok(requiredMembersForTarget(target).normal.includes(`${target.prefix}-verification.txt`));
+  }
+  const legacy = targetsForRelease({ tag: REAL_TAG })[0];
+  assert.ok(requiredMembersForTarget(legacy).normal.includes(`libreecho-${REAL_TAG}-verification.txt`));
 });
