@@ -19,7 +19,7 @@ import {
 } from "./release.js";
 import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
 import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
-import { PROFILES, payloadForProfile } from "./profiles.js";
+import { PROFILES, payloadForProfile, isBuildDescription } from "./profiles.js";
 import {
   installableBoards,
   profileForBoard,
@@ -62,6 +62,8 @@ const dom = {
   archiveInput: document.getElementById("amonet-archive-input"),
   amonetPanel: document.getElementById("amonet-panel"),
   amonetRoute: document.getElementById("amonet-route"),
+  allowUnpinnedWrap: document.getElementById("allow-unpinned-wrap"),
+  allowUnpinnedInput: document.getElementById("allow-unpinned-lk"),
   statusRelease: document.getElementById("status-release"),
   statusBundle: document.getElementById("status-bundle"),
   statusDevice: document.getElementById("status-device"),
@@ -123,6 +125,9 @@ export const state = {
   files: new Map(),
   payloadBytes: null,
   payloadName: "",
+  // Operator opt-in for an LK build with no pinned payload. Never implied,
+  // never persisted, and cleared whenever the device no longer needs it.
+  allowUnpinnedLk: false,
   fastboot: null,
   identity: null,
   deviceQueryEpoch: 0,
@@ -2139,14 +2144,38 @@ function amonetRequirement() {
   // page never put into recovery, so it is a hard skip, not a preference.
   if (identity.source === "recovery") return { mode: "skip", message: "Your Echo was found already in recovery, so it is already unlocked — no Amonet unlock ZIP is needed and none will be sent." };
   if (assessment.unlocked) return { mode: "skip", message: "Already unlocked — no Amonet unlock ZIP needed. Same-device TWRP and the Kaeru boot chain must still be verified before installation." };
-  if (!payloadForProfile(identity.profile, identity.lkBuild)) return { mode: "blocked", message: "Install blocked: this locked LK build is not supported by a pinned unlock payload." };
+  const selection = payloadForProfile(identity.profile, identity.lkBuild, { allowUnpinned: state.allowUnpinnedLk });
+  if (!selection) {
+    if (!isBuildDescription(identity.lkBuild)) {
+      return { mode: "blocked", message: `Install blocked: the LK build description “${identity.lkBuild}” is not a recognisable build, so no unlock payload can be chosen for it.` };
+    }
+    return { mode: "blocked", code: "lk-unpinned",
+      message: `Install blocked: LK build ${identity.lkBuild} is not pinned to a tested unlock payload. `
+        + "Tick “Allow untested LK build” in step 4 to send the archive default instead — that combination is untested." };
+  }
+  if (selection.matched === "fallback") {
+    return { mode: "required", code: "lk-unpinned",
+      message: `Locked device — LK build ${identity.lkBuild} is not pinned; the archive default ${selection.payload} will be used because you allowed an untested LK build.` };
+  }
   return { mode: "required", message: "Locked device — the matching pinned Amonet ZIP is required for the unlock phase." };
 }
 
 function refreshAmonetControls() {
   const requirement = amonetRequirement();
   const enabled = requirement.mode === "required" && !state.running;
-  if (dom.amonetPanel) dom.amonetPanel.hidden = requirement.mode !== "required";
+  // The panel also opens for the unpinned-LK case, because the opt-in lives
+  // inside it: a hidden panel would hide the only control that can unblock it.
+  const unpinnedOffer = requirement.code === "lk-unpinned";
+  if (dom.amonetPanel) dom.amonetPanel.hidden = requirement.mode !== "required" && !unpinnedOffer;
+  if (dom.allowUnpinnedWrap) dom.allowUnpinnedWrap.hidden = !unpinnedOffer;
+  if (dom.allowUnpinnedInput) {
+    dom.allowUnpinnedInput.checked = state.allowUnpinnedLk === true;
+    dom.allowUnpinnedInput.disabled = state.running;
+  }
+  // A tick can only ever apply to the device whose LK build produced it. When
+  // the offer disappears (device changed, build became pinned, device unlocked)
+  // the permission goes with it rather than silently following the operator.
+  if (!unpinnedOffer && state.allowUnpinnedLk) state.allowUnpinnedLk = false;
   if (dom.amonetRoute) dom.amonetRoute.textContent = requirement.message;
   dom.payloadInput.disabled = !enabled;
   dom.archiveInput.disabled = !enabled;
@@ -2198,8 +2227,12 @@ export function unmetPrerequisites() {
   if (state.bundleReady && state.installProtocol !== DIRECT_PROTOCOL) {
     unmet.push("This release does not publish direct-userdata protocol v2 metadata, which the browser install requires.");
   }
-  if (amonetRequirement().mode === "required" && !state.payloadBytes) {
+  const amonet = amonetRequirement();
+  if (amonet.mode === "required" && !state.payloadBytes) {
     unmet.push("Select the pinned Amonet unlock ZIP for this device's LK build (step 4).");
+  }
+  if (amonet.code === "lk-unpinned" && !state.allowUnpinnedLk) {
+    unmet.push("This device's LK build is not pinned. Tick “Allow untested LK build” in step 4 to send the archive's default fastbrick payload — untested on this build, and no automatic retry.");
   }
   if (state.running) unmet.push("Wait for the current run to finish.");
   if (state.fetchingBundle) unmet.push("Wait for the download to finish.");
@@ -2330,9 +2363,13 @@ export async function loadAmonetArchive({ file = null, url = null, acquire = nul
   const identity = state.identity;
   const profile = identity?.profile;
   const archive = profile?.archive;
-  const selection = payloadForProfile(profile, identity?.lkBuild);
+  const selection = payloadForProfile(profile, identity?.lkBuild, { allowUnpinned: state.allowUnpinnedLk });
   if (!archive || !selection?.sha256 || !Number.isSafeInteger(selection.size)) {
     throw new StageError("unlock", "query a supported device and exact LK build before selecting Amonet");
+  }
+  if (selection.matched === "fallback") {
+    terminal.warn(`LK build ${identity.lkBuild} is not pinned: verifying the archive default ${selection.payload}, `
+      + "which is untested on this build.");
   }
   if ((file && url) || (!file && !url)) throw new StageError("unlock", "select one pinned ZIP or one configured mirror URL");
   if (file && (file.name !== archive.name || file.size !== archive.size)) {
@@ -2371,7 +2408,7 @@ export async function loadPayload(file) {
   state.payloadBytes = null;
   state.payloadName = "";
   if (!file) return;
-  const selection = payloadForProfile(identity?.profile, identity?.lkBuild);
+  const selection = payloadForProfile(identity?.profile, identity?.lkBuild, { allowUnpinned: state.allowUnpinnedLk });
   if (!selection || file.name !== selection.payload || file.size !== selection.size) {
     setStatus(dom.statusPayload, "raw payload not pinned for this device", "bad");
     throw new StageError("unlock", "raw payload name or size does not match the pinned LK build");
@@ -2603,6 +2640,7 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
           lkBuild: state.identity.lkBuild,
           payloadBytes: state.payloadBytes,
           payloadName: state.payloadName,
+          allowUnpinned: state.allowUnpinnedLk === true,
           serialRaw: state.identity.serialRaw,
           terminal,
           // Set the latch immediately before flash:brick leaves the host. It is
@@ -2815,6 +2853,18 @@ dom.archiveInput?.addEventListener("change", (event) => {
 });
 dom.buttons.fetchArchive?.addEventListener("click", () => {
   fetchPinnedAmonetArchive().catch((error) => terminal.error(`Amonet archive fetch failed: ${error.message}`));
+});
+dom.allowUnpinnedInput?.addEventListener("change", (event) => {
+  state.allowUnpinnedLk = event.target.checked === true;
+  // A payload verified under one selection is not evidence for another.
+  state.payloadBytes = null;
+  state.payloadName = "";
+  if (state.allowUnpinnedLk) {
+    terminal.warn("untested LK build allowed: the archive default fastbrick payload may be sent to a build nobody has pinned");
+  } else {
+    setStatus(dom.statusPayload, "none selected", "pending");
+  }
+  refreshControls();
 });
 dom.payloadInput?.addEventListener("change", (event) => {
   loadPayload(event.target.files?.[0]).catch((error) => terminal.error(`payload read failed: ${error.message}`));

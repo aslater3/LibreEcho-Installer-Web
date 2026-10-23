@@ -192,6 +192,13 @@
             <input id="payload-input" type="file" aria-label="Pinned fastbrick payload image">
             <button class="ghost" type="button" onclick="document.getElementById('payload-input').click()">Select pinned fastbrick image…</button>
           </details>
+          <div id="allow-unpinned-wrap" class="unpinned-lk" hidden>
+            <input id="allow-unpinned-lk" type="checkbox">
+            <label for="allow-unpinned-lk">
+              <strong>Allow untested LK build</strong> — send the archive's default fastbrick payload to this device even though its LK build is not pinned.
+              <span class="fine-print">This is the community scripts' fallback behaviour, not a supported combination: the unlock can fail, time out, or leave early boot-chain storage changed, and it is never retried automatically. Only tick this if you can recover the device another way.</span>
+            </label>
+          </div>
           <p class="status-line">Payload state: <span id="status-payload" class="pill" data-state="pending">none selected</span></p>
         </div>
         <div class="operator-callout" id="callout-unlock-payload" hidden></div>
@@ -224,7 +231,7 @@
               <li><strong>Release</strong> — both checksum inventories and the recovery ZIP/manifest are verified against the release API's digests before any write.</li>
               <li><strong>Bundle</strong> — every selected file is hashed in the browser and compared with the release digest.</li>
               <li><strong>Device</strong> — <code>getvar product</code>, <code>unlock_status</code> and the LK build description are read from the device itself; an unknown target stops the run.</li>
-              <li><strong>Unlock</strong> — the pinned build-specific payload is checked locally; fastbrick itself changes early boot-chain storage. A timeout is not accepted as proof of success and is never auto-retried.</li>
+              <li><strong>Unlock</strong> — the pinned build-specific payload is checked locally; an unpinned LK build is refused unless the operator ticks “Allow untested LK build”, which sends the archive's default image and says so before the write. fastbrick itself changes early boot-chain storage. A timeout is not accepted as proof of success and is never auto-retried.</li>
               <li><strong>Recovery</strong> — TWRP's ADB serial must match the fastboot serial, and the Kaeru header in <code>expdb</code> must be intact before staging files.</li>
               <li><strong>Stage</strong> — only files that matched the API-anchored normal and TWRP checksum inventories are pushed and re-hashed on the device.</li>
               <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>

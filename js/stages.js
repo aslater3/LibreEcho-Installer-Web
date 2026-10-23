@@ -245,11 +245,12 @@ export function assessIdentity(identity, terminal, { selectedBoard = null } = {}
  * while the payload runs. That ambiguity is surfaced, never retried silently:
  * a timeout is reported as an unknown outcome, which is a stop condition.
  */
-export async function submitUnlockPayload({ client, profile, lkBuild, payloadBytes, payloadName, serialRaw, terminal, onSubmit = null }) {
+export async function submitUnlockPayload({ client, profile, lkBuild, payloadBytes, payloadName, serialRaw, terminal, onSubmit = null, allowUnpinned = false }) {
   if (!profile) throw new StageError("unlock", "device is not a recognised LibreEcho target");
-  const selection = payloadForProfile(profile, lkBuild);
+  const selection = payloadForProfile(profile, lkBuild, { allowUnpinned });
   if (!selection || !selection.sha256 || !Number.isSafeInteger(selection.size)) {
-    throw new StageError("unlock", `no pinned unlock payload is declared for LK build description "${lkBuild}"`);
+    throw new StageError("unlock", `no pinned unlock payload is declared for LK build description "${lkBuild}"`
+      + (profile.fallbackPayload ? "; tick \"allow untested LK build\" to send the archive default instead" : ""));
   }
   if (!(payloadBytes instanceof Uint8Array) || payloadName !== selection.payload || payloadBytes.length !== selection.size) {
     throw new StageError("unlock", `unlock payload must be ${selection.payload} with pinned size ${selection.size}`);
@@ -257,6 +258,12 @@ export async function submitUnlockPayload({ client, profile, lkBuild, payloadByt
   const digest = await sha256Bytes(payloadBytes);
   if (digest !== selection.sha256) {
     throw new StageError("unlock", `unlock payload digest mismatch for ${selection.payload}`);
+  }
+  // The operator opted in to a build nobody pinned; say exactly what is being
+  // sent and that the outcome is unverified, before any byte leaves the host.
+  if (selection.matched === "fallback") {
+    terminal?.warn(`LK build ${selection.build} is not pinned: sending ${selection.payload}, the archive default. `
+      + "This combination is untested and may leave the device in an unknown unlock state.");
   }
   if (!serialRaw || typeof localStorage === "undefined") {
     throw new StageError("unlock", "persistent device-bound unlock attempt storage is unavailable");
