@@ -59,6 +59,35 @@ test('serials, MACs, private addresses and secrets are removed', () => {
   assert.doesNotMatch(decodeURIComponent(report.url), /G090L90964010665|00:11:22:aa|x1/);
 });
 
+test('the cap stays below the length GitHub actually rejects', () => {
+  // Measured on github.com/aslater3/LibreEcho/issues/new: 6,973 bytes is
+  // served, 7,184 bytes returns HTTP 500. The cap must keep real headroom.
+  assert.ok(MAX_URL_LENGTH <= 6300, `cap ${MAX_URL_LENGTH} leaves too little headroom`);
+  assert.ok(MAX_URL_LENGTH < 6973);
+});
+
+test('a report the field hit — long log plus a long description — still fits', () => {
+  const log = Array.from({ length: 240 }, (_, i) => `[${i}] stage progress line with some device detail`).join('\n');
+  const whatHappened = 'x'.repeat(4200);
+  const report = buildIssueReport({ summary: 'unlock stage failed', whatHappened, expected: 'y'.repeat(2000), log });
+  assert.ok(report.url.length <= MAX_URL_LENGTH, `url is ${report.url.length}`);
+  const { params } = fields(report.url);
+  assert.equal(params.title, '[Bug]: Browser installer: unlock stage failed');
+  assert.ok(params.steps.length > 100, 'the report still carries the description');
+  assert.ok(params.observed.length > 100, 'and still points at the log');
+});
+
+test('a description too long to prefill is cut, flagged, and the report stays usable', () => {
+  const huge = 'y'.repeat(40000);
+  const report = buildIssueReport({ summary: 's', whatHappened: huge, log: 'line' });
+  assert.ok(report.url.length <= MAX_URL_LENGTH, `url is ${report.url.length}`);
+  assert.equal(report.textTruncated, true);
+  const { params } = fields(report.url);
+  assert.match(params.steps, /shortened to fit the link/);
+  assert.equal(params.title, '[Bug]: Browser installer: s');
+  assert.match(params.observed, /log/i);
+});
+
 test('backticks in the log cannot close the code block early', () => {
   const report = buildIssueReport({ summary: 'x', whatHappened: 'y', log: 'before\n```\nafter' });
   const { params } = fields(report.url);

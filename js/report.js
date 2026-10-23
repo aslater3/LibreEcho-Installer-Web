@@ -3,15 +3,26 @@
 //
 // Nothing is sent anywhere from here. The page opens github.com/.../issues/new
 // with the fields filled in, and the user reviews and submits it themselves
-// while signed in to GitHub. A GitHub URL is limited to about 8 KB, so the
-// issue carries the end of the log and the full log is copied to the clipboard
-// (and can be saved) for the user to paste or attach.
+// while signed in to GitHub. GitHub answers 500 above roughly 7.1 kB of query
+// string (measured: 6,973 bytes is served, 7,184 is not), and edge proxies drop
+// longer request lines outright, so the budget below stays well under that
+// ceiling. The log is the first thing to give way: the description the user
+// typed is worth more than the tail of a log they can paste anyway, and the
+// full log is copied to the clipboard (and can be saved) when anything is cut.
 
 // Fixed on purpose: the ?repository= override chooses where releases come
 // from, and must not also redirect bug reports somewhere else.
 export const ISSUE_REPOSITORY = "aslater3/LibreEcho";
 export const ISSUE_TEMPLATE = "bug.yml";
-export const MAX_URL_LENGTH = 7500;
+// Measured against github.com/<repo>/issues/new: 6,973 bytes returns the form,
+// 7,184 returns HTTP 500, and ~8 kB fails at the edge. One kilobyte of headroom
+// also absorbs template and query-parameter growth.
+export const MAX_URL_LENGTH = 6000;
+// Bounds for what the reporter typed. A pasted 30 kB stack trace otherwise
+// consumes the whole budget before a single log line can fit.
+const MAX_STEPS = 1600;
+const MAX_EXPECTED = 600;
+const TEXT_CUT_NOTE = "\n\nThe description was shortened to fit the link; the full text is on your clipboard.";
 
 const REDACTIONS = [
   // MAC addresses.
@@ -58,52 +69,82 @@ function issueUrl(fields) {
 }
 
 /**
- * Build the prefilled issue. `log` is the plain-text install log. Returns the
- * URL, the redacted full log (for the clipboard), and how many log lines made
- * it into the URL.
+ * Build the prefilled issue. `log` is the plain-text install log.
+ *
+ * Returns the URL, the redacted full log (for the clipboard), how many log
+ * lines made it into the URL, and whether the user's own text had to be cut.
+ * `url.length` is always at most MAX_URL_LENGTH, which is why callers can open
+ * it without risking the HTTP 500 GitHub returns for oversized prefill links.
  */
 export function buildIssueReport({ summary, whatHappened, expected, includeLog = true, log = "", context = {}, userAgent = "" } = {}) {
   const title = `[Bug]: Browser installer: ${clean(summary, 120) || "install problem"}`;
   const fullLog = redact(log);
   const environment = describeEnvironment({ userAgent, context });
-  const base = {
-    title,
-    component: "browser installer",
-    version: redact(context.release || "unknown"),
-    steps: `${clean(whatHappened) || "(not given)"}\n\n${environment}`,
-    expected: clean(expected) || "The install completes.",
-  };
+  const whatFull = String(whatHappened ?? "");
+  const expectedText = clean(expected, MAX_EXPECTED) || "The install completes.";
   const lines = includeLog ? fullLog.split("\n").filter((line) => line.length) : [];
-  const note = (shown) => (shown < lines.length
-    ? `Last ${shown} of ${lines.length} log lines. The full log was copied to the clipboard when this issue was opened — please paste or attach it below.`
-    : `Full log (${lines.length} lines).`);
+
   const observed = (shown) => {
     if (!includeLog) return "(The reporter chose not to include the installer log.)";
     if (!lines.length) return "(The log was empty.)";
-    return `${note(shown)}\n\n${fence(lines.slice(lines.length - shown).join("\n"))}`;
+    if (shown === 0) {
+      return "The log was too long to include here. It was copied to the clipboard when this issue was opened — please paste or attach it below.";
+    }
+    return (shown < lines.length
+      ? `Last ${shown} of ${lines.length} log lines. The full log was copied to the clipboard when this issue was opened — please paste or attach it below.`
+      : `Full log (${lines.length} lines).`)
+      + `\n\n${fence(lines.slice(lines.length - shown).join("\n"))}`;
   };
 
-  // Keep as much of the end of the log as fits under the URL limit.
+  const compose = (whatText, shown, cut = false) => issueUrl({
+    title,
+    component: "browser installer",
+    version: redact(context.release || "unknown"),
+    steps: `${whatText}${cut ? TEXT_CUT_NOTE : ""}\n\n${environment}`,
+    expected: expectedText,
+    observed: observed(shown),
+  });
+
+  let whatText = clean(whatFull, MAX_STEPS) || "(not given)";
+  let textTruncated = redact(whatFull).trim().length > whatText.length;
   let shown = lines.length;
-  let url = issueUrl({ ...base, observed: observed(shown) });
+  let url = compose(whatText, shown, textTruncated);
+
+  // Keep as much of the end of the log as fits: the log yields first.
   if (url.length > MAX_URL_LENGTH) {
     let low = 0;
     let high = lines.length;
     while (low < high) {
       const mid = Math.ceil((low + high) / 2);
-      if (issueUrl({ ...base, observed: observed(mid) }).length <= MAX_URL_LENGTH) low = mid;
+      if (compose(whatText, mid, textTruncated).length <= MAX_URL_LENGTH) low = mid;
       else high = mid - 1;
     }
     shown = low;
-    url = issueUrl({ ...base, observed: observed(shown) });
+    url = compose(whatText, shown, textTruncated);
   }
-  // If not even one line fits (very long user text or a huge line), send the
-  // user's text only and rely on the clipboard copy.
-  if (url.length > MAX_URL_LENGTH || (includeLog && lines.length && shown === 0)) {
+
+  // A very long description can overflow the budget on its own; shorten it in
+  // steps rather than ship a link GitHub will reject.
+  for (const limit of [700, 240]) {
+    if (url.length <= MAX_URL_LENGTH) break;
+    const shorter = clean(whatFull, limit) || "(not given)";
+    if (shorter.length < whatText.length) textTruncated = true;
+    whatText = shorter;
     shown = 0;
-    url = issueUrl({ ...base, observed: includeLog
-      ? "The log was too long to include here. It was copied to the clipboard when this issue was opened — please paste or attach it below."
-      : observed(0) });
+    url = compose(whatText, shown, true);
   }
-  return { url, title, fullLog, shownLines: shown, totalLines: lines.length, truncated: includeLog && shown < lines.length };
+
+  if (url.length > MAX_URL_LENGTH) {
+    // Last resort: the template's required fields only, nothing of our own.
+    url = issueUrl({
+      title,
+      component: "browser installer",
+      version: redact(context.release || "unknown"),
+      steps: "(The description was too long to prefill. It was copied to the clipboard — please paste it below.)",
+      expected: expectedText,
+      observed: observed(0),
+    });
+  }
+  return { url, title, fullLog, shownLines: shown, totalLines: lines.length,
+    truncated: includeLog && shown < lines.length, textTruncated };
 }

@@ -38,7 +38,7 @@ import {
 import { discoverMirror, fetchReleaseBundle, fetchTargetsJson, createBundleStore } from "./auto-fetch.js";
 import { extractRecoveryMetadata } from "./recovery-metadata.js";
 import { formatSize, formatDuration, computeEta } from "./progress.js";
-import { buildIssueReport } from "./report.js";
+import { buildIssueReport, redact } from "./report.js";
 
 const config = installerConfig();
 
@@ -2964,16 +2964,24 @@ export async function submitReport() {
     context: reportContext(),
     userAgent: globalThis.navigator?.userAgent ?? "",
   });
+  // The link is deliberately capped well under GitHub's limit, so whenever
+  // anything was cut the clipboard holds what the link cannot carry: the log,
+  // and the reporter's own text when that had to be shortened too.
+  const needsClipboard = report.truncated || report.textTruncated
+    || (report.totalLines > 0 && report.shownLines === 0);
   let copied = false;
-  if (report.truncated || (report.totalLines && report.shownLines === 0)) {
+  if (needsClipboard) {
+    const typed = redact(`${reportDom.what?.value ?? ""}\n\n${reportDom.expected?.value ?? ""}`.trim());
+    const payload = report.textTruncated ? `${typed}\n\n--- installer log ---\n${report.fullLog}` : report.fullLog;
     try {
-      await globalThis.navigator?.clipboard?.writeText(report.fullLog);
+      await globalThis.navigator?.clipboard?.writeText(payload);
       copied = true;
     } catch { /* clipboard refused; the Save log button still works */ }
   }
   const opened = window.open?.(report.url, "_blank", "noopener");
-  terminal.info(`opened a GitHub bug report with ${report.shownLines} of ${report.totalLines} log lines`
-    + (copied ? "; the full log is on your clipboard" : report.truncated ? "; use Save log to attach the full log" : ""));
+  terminal.info(`opened a GitHub bug report (${(report.url.length / 1024).toFixed(1)} kB link) with `
+    + `${report.shownLines} of ${report.totalLines} log lines`
+    + (copied ? "; the full log is on your clipboard" : needsClipboard ? "; use Save log to attach the full log" : ""));
   if (opened === null && reportDom.status) {
     reportDom.status.textContent = "Your browser blocked the new tab. Allow pop-ups for this page and try again.";
     return report;
