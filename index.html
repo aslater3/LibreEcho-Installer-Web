@@ -291,7 +291,7 @@
       <textarea id="report-expected" rows="2" placeholder="Optional"></textarea>
     </div>
     <label class="check"><input id="report-include-log" type="checkbox" checked> Include the installer log</label>
-    <p class="fine-print">The log masks your device serial. MAC addresses, local IP addresses and anything that looks like a password are removed too, but please read the report before you submit it. GitHub limits how much a link can carry, so a long log is shortened to its last lines and the full log is copied to your clipboard to paste in.</p>
+    <p class="fine-print">The log masks your device serial. MAC addresses, local IP addresses and anything that looks like a password are removed too, but please read the report before you submit it. GitHub rejects prefill links over about 7 kB (the installer keeps them under 6 kB), so in a long report the log — or, if you pasted a lot of text, the description — is shortened to fit, and whatever was cut is copied to your clipboard to paste in.</p>
     <p class="fine-print" id="report-status" role="status" aria-live="polite"></p>
     <div class="actions">
       <button id="report-submit" class="primary" type="submit" value="open">Open the report on GitHub</button>
