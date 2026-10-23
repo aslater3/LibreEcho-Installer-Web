@@ -104,6 +104,23 @@ test('a supported locked device restores the pinned archive controls', async () 
   assert.match(node('amonet-route')?.textContent ?? '', /locked.*pinned/i);
 });
 
+test('an unpinned LK build offers only the opt-in, and the tick is what unblocks it', async () => {
+  await query({ product: 'RADAR', unlock_status: 'false', lk_build_desc: '3c6be74-20210822_210647', serialno: 'TEST-RADAR' });
+  assert.equal(node('amonet-panel').hidden, false, 'the opt-in lives in the panel, so the panel must be reachable');
+  assert.equal(node('allow-unpinned-wrap').hidden, false);
+  assert.equal(node('allow-unpinned-lk').checked, false, 'the opt-in is never pre-ticked');
+  assert.match(node('amonet-route').textContent, /not pinned.*untested/i);
+  assert.equal(node('btn-amonet-archive').disabled, true, 'nothing may be prepared before the tick');
+
+  const change = node('allow-unpinned-lk').listeners.get('change');
+  assert.ok(change, 'the opt-in must be wired to page state');
+  change({ target: { checked: true } });
+  assert.equal(app.state.allowUnpinnedLk, true);
+  assert.equal(node('allow-unpinned-lk').checked, true);
+  assert.equal(node('btn-amonet-archive').disabled, false);
+  assert.match(node('amonet-route').textContent, /archive default.*allowed an untested/i);
+});
+
 test('unknown lock state, unknown target or missing serial cannot silently choose an install route', async () => {
   for (const overrides of [{ unlock_status: '' }, { unlock_status: 'unknown' },
     { product: 'OTHER', unlock_status: 'true' }, { serialno: '', unlock_status: 'true' },

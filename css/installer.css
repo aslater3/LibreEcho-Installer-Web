@@ -170,6 +170,13 @@ input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events
 .installer-footer{border-top:1px solid var(--line);padding:1.5rem 0 3rem;color:var(--muted);font-size:.84rem}
 
 .fine-print{font-size:.82rem;color:var(--muted)}
+/* Operator opt-in for an unpinned LK build. It is rendered only when the
+   device's build has no pinned payload, so it can never look like a default. */
+.unpinned-lk{display:flex;gap:.6rem;align-items:flex-start;margin:.9rem 0 .3rem;padding:.75rem .9rem;border:1px solid rgba(255,190,120,.4);border-radius:14px;background:rgba(255,190,120,.06);font-size:.86rem}
+.unpinned-lk[hidden]{display:none}
+.unpinned-lk input{margin-top:.25rem;flex:0 0 auto}
+.unpinned-lk strong{color:#ffd9ac}
+.unpinned-lk .fine-print{display:block;margin-top:.3rem}
 .card summary{cursor:pointer;font-size:.86rem;font-weight:750;color:var(--text);padding:.4rem 0}
 .card details[open] summary{color:var(--cyan)}
 .download-panel{margin:.9rem 0;padding:.85rem .95rem;border:1px solid var(--line);border-radius:14px;background:rgba(8,22,34,.5)}
