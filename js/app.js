@@ -39,6 +39,7 @@ import { discoverMirror, fetchReleaseBundle, fetchTargetsJson, createBundleStore
 import { extractRecoveryMetadata } from "./recovery-metadata.js";
 import { formatSize, formatDuration, computeEta } from "./progress.js";
 import { buildIssueReport, redact } from "./report.js";
+import { RUNNING_ADB_FILTERS, pollRunningEcho, SETUP_COMMANDS, SETUP_URL, SETUP_GUIDE_URL } from "./post-install.js";
 
 const config = installerConfig();
 
@@ -171,6 +172,13 @@ export const state = {
   // the run would otherwise submit `brick` a second time against a device whose
   // unlock outcome is unknown. Never cleared by a run's `finally`.
   unlockSubmitted: null,
+  // After a finished install: what the running Echo reported (see
+  // post-install.js) — null, "booting", "checking", "needs-setup", "done",
+  // "offline", "no-permission" or "timeout".
+  postInstall: null,
+  postInstallIp: null,
+  postInstallSerial: "",
+  postInstallGeneration: 0,
 };
 
 function setStatus(node, text, kind = "pending") {
@@ -1052,6 +1060,7 @@ async function runDeviceQuery({ any, open }) {
   // Never carry a previous unlock decision into a failed or superseded query.
   // This function also serves the run-owned query when no device is selected.
   const epoch = ++state.deviceQueryEpoch;
+  endPostInstall();
   state.fastboot = null;
   state.identity = null;
   state.payloadBytes = null;
@@ -2267,6 +2276,10 @@ function renderPrerequisites() {
  * and finally the install itself.
  */
 function primaryAction() {
+  if (!state.running) {
+    const post = postInstallAction();
+    if (post) return post;
+  }
   if (state.running) {
     if (state.recoveryWaiting) {
       const wide = state.recoveryChooserWide;
@@ -2561,9 +2574,11 @@ function assertNotAborted(stage) {
 
 export async function runInstall({ dryRun = false, recovery = {} } = {}) {
   if (state.running || state.fetchingBundle) return;
+  let afterInstall = null;
   state.abort = false;
   state.stageProgress = {};
   state.receipts = [];
+  endPostInstall();
   setRunning(true);
   terminal.phase(1, STAGES.length, dryRun ? "rehearsal: no writes" : "browser one-shot install");
   terminal.info(`release ${state.release?.tag ?? "(none)"} · repository ${config.repository}`);
@@ -2782,14 +2797,11 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     terminal.phase(STAGES.length, STAGES.length, "verify and reboot");
     assertNotAborted("verify");
     await rebootAndWait({ adb: state.adb, target: "", terminal });
-    terminal.warn("reboot requested; installed OS boot, userdata preservation and service readiness are NOT verified by this page");
-    terminal.info("confirm the same device and its marker-free running image before calling the installation complete");
+    terminal.info("reboot requested; waiting for LibreEcho to start on the same Echo");
     state.stageProgress.verify = "done";
-    // Success is republished to the bar too; the run is over and nothing is
-    // pending, so no primary action is offered.
-    setStatusBar({ step: "install", kind: "ok", action: null,
-      message: "Install finished and a reboot was requested. The running OS is not verified by this page — confirm the device itself before calling it complete.",
-      secondary: "The full log is beside the steps; use Save log to keep it." });
+    // The run is over; the bar now follows the post-install check (published by
+    // the repaint in `finally`).
+    afterInstall = { serial: state.identity?.serialRaw ?? "" };
   } catch (error) {
     const stage = error instanceof StageError ? error.stage : "unknown";
     terminal.error(`${stage} stage failed: ${error.message}`);
@@ -2815,6 +2827,166 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     // unrelated later repaint. The resume affordance depends on the
     // post-invalidate state.
     refreshControls();
+  }
+  if (afterInstall && !dryRun) {
+    await (postInstallHook ?? waitForLibreEcho)(afterInstall)
+      .catch((error) => terminal.warn(`checking LibreEcho failed: ${error.message}`));
+  }
+}
+
+// --- after the install: did LibreEcho actually start? ----------------------
+//
+// The run ends by rebooting out of TWRP. LibreEcho's own adbd then enumerates
+// as a NEW USB device (18d1:d001), which this origin has no permission for
+// unless the operator grants it. So: watch the granted devices in the
+// background, offer "Check my Echo" (a user gesture with the running-image
+// filter) meanwhile, confirm the same serial, startup-ready and the web
+// service, then hand over to setup. A browser cannot create the host port
+// forward the setup page needs, so that step is a terminal command; the USB
+// session is closed first so the host's adb can claim the interface.
+
+const POST_INSTALL_ATTACH_MS = 240000;
+// Test seam: replaces the real wait, so host suites never sit on a timer.
+let postInstallHook = null;
+export function __setPostInstallHookForTest(hook) { postInstallHook = hook; }
+
+/** Forgets any post-install state; a new run or device query starts afresh. */
+function endPostInstall() {
+  state.postInstallGeneration += 1;
+  state.postInstall = null;
+  state.postInstallIp = null;
+}
+
+async function findGrantedRunningEcho({ serial, deadline, generation }) {
+  if (!globalThis.navigator?.usb) return null;
+  const support = await protocolSupport();
+  if (!support.adbTransport.ok) return null;
+  while (Date.now() < deadline) {
+    if (generation !== state.postInstallGeneration) return null;
+    const devices = await support.adbTransport.value.getDevices({ filters: RUNNING_ADB_FILTERS }).catch(() => []);
+    const match = devices.find((device) => !serial || !device.serialNumber || device.serialNumber === serial);
+    if (match) return match;
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  return null;
+}
+
+/**
+ * Waits for the installed Echo to come up and records what it reported. Also
+ * the body of "Check my Echo" (`request: true`), which may open Chrome's
+ * chooser and supersedes a background wait.
+ */
+export async function waitForLibreEcho({ serial = state.postInstallSerial || state.identity?.serialRaw || "",
+  request = false, chooser = (filters) => navigator.usb.requestDevice({ filters }), open = openAdb,
+  pollOptions = {} } = {}) {
+  state.postInstallGeneration += 1;
+  const generation = state.postInstallGeneration;
+  const superseded = () => generation !== state.postInstallGeneration;
+  state.postInstallSerial = serial;
+  state.postInstall = "booting";
+  refreshStatusBar();
+  let device = null;
+  try {
+    // The chooser first, while the click's user activation is still fresh.
+    device = request ? await chooser(RUNNING_ADB_FILTERS)
+      : await findGrantedRunningEcho({ serial, deadline: Date.now() + POST_INSTALL_ATTACH_MS, generation });
+  } catch (error) {
+    if (superseded()) return state.postInstall;
+    if (isChooserCancel(error)) terminal.info("no device was chosen");
+    else terminal.warn(`could not reach the running Echo: ${error.message}`);
+    state.postInstall = "no-permission";
+    refreshControls();
+    return state.postInstall;
+  }
+  if (superseded()) return state.postInstall;
+  if (!device) {
+    state.postInstall = "no-permission";
+    terminal.warn("LibreEcho's own USB connection did not appear with a permission this page already has");
+    refreshControls();
+    return state.postInstall;
+  }
+  const releaseOperation = beginDeviceOperation("post-install", { shareWith: ["post-install"] });
+  if (!releaseOperation) { state.postInstall = "no-permission"; refreshControls(); return state.postInstall; }
+  let session = null;
+  try {
+    session = await open({ device, onLog: (line) => terminal.line(line) });
+    terminal.ok("connected to your Echo on LibreEcho's own ADB");
+    state.postInstall = "checking";
+    refreshStatusBar();
+    const { probe, verdict } = await pollRunningEcho({ client: session.client, expectedSerial: serial,
+      isCancelled: superseded, ...pollOptions });
+    if (superseded()) return state.postInstall;
+    state.postInstall = verdict.state;
+    state.postInstallIp = verdict.ip ?? probe.ip ?? null;
+    if (verdict.state === "needs-setup") {
+      terminal.ok("LibreEcho started on the same Echo (serial checked, startup-ready, web service up)");
+      terminal.info("finish setup from a terminal on this computer:");
+      for (const command of SETUP_COMMANDS) terminal.command(command);
+      terminal.info(`then open ${SETUP_URL}`);
+    } else if (verdict.state === "done") {
+      terminal.ok(`LibreEcho started, is already set up, and is on the network at ${state.postInstallIp}`);
+    } else if (verdict.state === "offline") {
+      terminal.warn("LibreEcho started and is set up, but it is not on Wi-Fi");
+    } else {
+      terminal.warn(`LibreEcho did not report ready in time (last state: ${verdict.last})`);
+    }
+  } catch (error) {
+    if (superseded()) return state.postInstall;
+    terminal.warn(`checking LibreEcho failed: ${error.message}`);
+    state.postInstall = "timeout";
+  } finally {
+    // Always let go: the host's adb needs this interface for the setup forward.
+    if (session) {
+      try { await session.client?.close?.(); } catch {
+        try { await session.transport?.close?.(); } catch { /* gone */ }
+      }
+    }
+    releaseOperation();
+  }
+  refreshControls();
+  return state.postInstall;
+}
+
+/** The bar's post-install action, or null when no install has just finished. */
+function postInstallAction() {
+  const s = state.postInstall;
+  if (!s) return null;
+  const check = () => waitForLibreEcho({ request: true }).catch((error) => terminal.error(error.message));
+  const openSetupGuide = () => window.open(SETUP_GUIDE_URL, "_blank", "noopener");
+  const setupSteps = `run \`${SETUP_COMMANDS.join("\` then \`")}\`, then open ${SETUP_URL}`;
+  switch (s) {
+    case "booting":
+      return { step: "install", label: "Check my Echo", kind: "pending",
+        message: "Installed. Your Echo is restarting into LibreEcho; keep it plugged in while this page checks that it started.",
+        hint: "This usually takes one to two minutes. If nothing happens, press Check my Echo and choose your Echo's ADB device in Chrome's list (the only one the list offers).",
+        secondary: "Checking only reads; nothing is reinstalled.", run: check };
+    case "checking":
+      return { step: "install", label: "Check my Echo", kind: "pending", suppressed: true,
+        message: "Connected to LibreEcho on your Echo; waiting for it to finish starting.",
+        hint: "This usually takes one to two minutes.", run: check };
+    case "needs-setup":
+      return { step: "install", label: "Open the setup instructions", kind: "ok", focus: true,
+        message: `LibreEcho is running on your Echo. Finish setup from a terminal on this computer: ${setupSteps}.`,
+        hint: "A browser cannot create that USB port forward itself, so this one step needs a terminal. This page has already let go of the USB connection.",
+        secondary: "Keep the Echo plugged in. Nothing needs reinstalling.", run: openSetupGuide };
+    case "done": {
+      const url = `http://${state.postInstallIp}:8080/`;
+      return { step: "install", label: "Open your Echo's page", kind: "ok", focus: true,
+        message: `Done. Your Echo is running LibreEcho, is already set up, and is on your network at ${state.postInstallIp}.`,
+        hint: "Press the button to open its page.", secondary: "",
+        run: () => window.open(url, "_blank", "noopener") };
+    }
+    case "offline":
+      return { step: "install", label: "Open the setup instructions", kind: "warn", focus: true,
+        message: `LibreEcho is running and set up, but your Echo is not on Wi-Fi. Reach it over USB: ${setupSteps}.`,
+        hint: "This page has already let go of the USB connection.", secondary: "", run: openSetupGuide };
+    default:
+      return { step: "install", label: "Check my Echo", kind: "warn", focus: true,
+        message: s === "no-permission"
+          ? "Installed, but this page cannot see your Echo since it restarted. Press Check my Echo and choose your Echo's ADB device in Chrome's list (the only one the list offers)."
+          : "Installed, but your Echo has not reported that it finished starting. Leave it plugged in and press Check my Echo.",
+        hint: `Checking only reads; nothing is reinstalled. You can also finish from a terminal: ${setupSteps}.`,
+        secondary: "", run: check };
   }
 }
 

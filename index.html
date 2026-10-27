@@ -235,6 +235,7 @@
               <li><strong>Recovery</strong> — TWRP's ADB serial must match the fastboot serial, and the Kaeru header in <code>expdb</code> must be intact before staging files.</li>
               <li><strong>Stage</strong> — only files that matched the API-anchored normal and TWRP checksum inventories are pushed and re-hashed on the device.</li>
               <li><strong>Install</strong> — the recovery installer's machine-readable receipt is read back after each run; the installer reshapes userdata first when the layout does not match the image contract, and asks for a reboot in between.</li>
+              <li><strong>Verify</strong> — after the final reboot the page re-attaches to the running image over USB, checks the same serial came back and that LibreEcho reports ready, then closes the connection and shows how to open setup.</li>
             </ul>
           </details>
         </div>

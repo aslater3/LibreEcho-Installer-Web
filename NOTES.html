@@ -47,7 +47,7 @@
         <tr><td>Recovery</td><td>ADB connects to TWRP.</td><td>The ADB serial must match the earlier fastboot serial, and <code>expdb</code> must contain an intact Kaeru header before staging or running the ZIP. When the page has no fastboot identity (a reload while already in TWRP), the serial instead comes from <code>ro.serialno</code> read back from the recovery device, together with its board, TWRP version and Kaeru header.</td></tr>
         <tr><td>Stage</td><td>The verified files are pushed to <code>/cache/libreecho-bundle</code>.</td><td>Every pushed file is re-hashed with the device's own <code>sha256sum</code>.</td></tr>
         <tr><td>Prepare / Install</td><td>The recovery installer zip is run over ADB, twice if a reboot is required.</td><td>The installer's own receipt at <code>/cache/libreecho-install-receipt</code> is read back after each run.</td></tr>
-        <tr><td>Verify</td><td>The device is rebooted.</td><td>A successful receipt is required; nothing is claimed about runtime behaviour.</td></tr>
+        <tr><td>Verify</td><td>The device is rebooted. The page then re-attaches to the running image's ADB (<code>18d1:d001</code>), from permission it already holds or after <strong>Check my Echo</strong>, and runs one read-only shell probe.</td><td>The serial from <code>/proc/cmdline</code> must match the install's serial; <code>/run/libreecho/startup-ready</code>, the web service and the setup-complete marker are presence tests. The page then closes the USB session and hands over to setup: a browser cannot create the host port forward the setup page needs, so that step is the guide's terminal command.</td></tr>
       </tbody>
     </table>
 
