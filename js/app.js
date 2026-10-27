@@ -1298,7 +1298,14 @@ function beginDeviceOperation(kind, { shareWith = [] } = {}) {
   }
   const token = { kind };
   deviceOperation = token;
-  return () => { if (deviceOperation === token) deviceOperation = null; };
+  return () => {
+    if (deviceOperation !== token) return;
+    deviceOperation = null;
+    // The holder repainted the controls while it still held the slot, so the USB
+    // buttons are still disabled. Re-enable only those: a full repaint here would
+    // overwrite a failure message the holder just put in the status bar.
+    refreshUsbButtons();
+  };
 }
 
 /**
@@ -2448,6 +2455,20 @@ function installReadinessReason() {
   return null;
 }
 
+/** The controls that open a USB connection; see refreshControls. */
+function refreshUsbButtons() {
+  const running = state.running;
+  const busy = running || state.fetchingBundle;
+  const operationBusy = deviceOperationBusy();
+  dom.buttons.connect.disabled = running || operationBusy;
+  dom.buttons.connectAny.disabled = running || operationBusy;
+  dom.buttons.grantRecovery.disabled = (busy && !state.recoveryWaiting) || operationBusy;
+  // The recovery entry is only ever the answer to "no fastboot identity exists".
+  // Once a device is identified it must be closed, so this can never replace or
+  // race a fastboot query or an in-progress run.
+  dom.buttons.recoveryEntry.disabled = busy || state.identity !== null || operationBusy;
+}
+
 /**
  * Re-evaluates every control's enabled/hidden state from `state`.
  *
@@ -2483,14 +2504,7 @@ export function refreshControls() {
   // While any device operation is in flight, every control that would open a USB
   // connection is disabled: the page owns one interface at a time, and a live
   // button here is the affordance that produced the interleaved-handshake failure.
-  const operationBusy = deviceOperationBusy();
-  dom.buttons.connect.disabled = running || operationBusy;
-  dom.buttons.connectAny.disabled = running || operationBusy;
-  dom.buttons.grantRecovery.disabled = (busy && !state.recoveryWaiting) || operationBusy;
-  // The recovery entry is only ever the answer to "no fastboot identity exists".
-  // Once a device is identified it must be closed, so this can never replace or
-  // race a fastboot query or an in-progress run.
-  dom.buttons.recoveryEntry.disabled = busy || state.identity !== null || operationBusy;
+  refreshUsbButtons();
   // R4: with no identity there are exactly TWO possible states of the Echo —
   // fastboot or recovery — and the operator could not tell which button to press.
   // Two labelled choices say it plainly, and they retire once a device is
