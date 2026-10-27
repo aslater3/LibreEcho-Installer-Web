@@ -53,6 +53,8 @@ Object.defineProperty(globalThis, 'navigator', {
   } },
 });
 const app = await import('./app.js');
+// These suites cover the install itself; the post-install check has its own suite.
+app.__setPostInstallHookForTest(async () => {});
 
 const quiet = { line() {}, info() {}, ok() {}, warn() {}, error() {},
   command() {}, endProgress() {}, progress() {}, phase() {} };

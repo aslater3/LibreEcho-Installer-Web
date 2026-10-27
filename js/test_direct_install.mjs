@@ -56,6 +56,8 @@ Object.defineProperty(globalThis, 'navigator', {
   value: { usb: { getDevices: async () => [], requestDevice: async () => { throw new Error('background code opened a permission prompt'); } } },
 });
 const app = await import('./app.js');
+// These suites cover the install itself; the post-install check has its own suite.
+app.__setPostInstallHookForTest(async () => {});
 
 const quiet = { line() {}, info() {}, ok() {}, warn() {}, error() {}, command() {}, endProgress() {}, progress() {}, phase() {} };
 const HEADER_HEX = '8816885870b203004c4b000000000000';
@@ -331,6 +333,19 @@ async function primeDirectRun({ adb = null, overrides = {} } = {}) {
   Object.assign(app.state, overrides);
   return app.state;
 }
+
+test('a finished install hands over to the post-install check for the same serial', withLocalStorage(async () => {
+  const calls = [];
+  app.__setPostInstallHookForTest(async (args) => { calls.push(args); });
+  try {
+    await primeDirectRun({ adb: directAdb() });
+    await app.runInstall({ dryRun: false });
+    assert.deepEqual(calls, [{ serial: app.state.identity?.serialRaw ?? '' }]);
+    assert.equal(app.state.running, false, 'the run must be over before the post-install wait starts');
+  } finally {
+    app.__setPostInstallHookForTest(async () => {});
+  }
+}));
 
 test('a v2 install runs control push, prepare, initialize, transfer, bulk push, finalize dry-run then finalize — and never formats', withLocalStorage(async () => {
   const adb = directAdb();
