@@ -247,3 +247,30 @@ test('every USB-opening control is disabled while one operation is in flight', a
 });
 
 const tick = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
+// ---------------------------------------------------------------------------
+// C. releasing the slot re-enables the USB buttons (LibreEcho #304)
+// ---------------------------------------------------------------------------
+
+test('a cancelled query leaves the USB buttons enabled again', async () => {
+  blankPage();
+  await assert.rejects(
+    app.queryDevice({ open: async () => { throw new Error('No device selected.'); } }),
+    /No device selected/,
+  );
+  // The query repainted the controls while it still held the slot; the release
+  // must repaint them again, or every USB button stays disabled until reload.
+  for (const id of ['btn-connect', 'btn-connect-any', 'btn-recovery-entry']) {
+    assert.equal(document.getElementById(id).disabled, false, `${id} stayed disabled after the query ended`);
+  }
+});
+
+test('a successful query leaves Query device enabled again', async () => {
+  blankPage();
+  const values = { product: 'RADAR', unlock_status: 'true', serialno: 'AGAIN' };
+  await app.queryDevice({
+    open: async () => ({ device: { vendorId: 0x0bb4, productId: 0x0c01 },
+      client: { getVar: async (key) => values[key] ?? '' } }),
+  });
+  assert.equal(document.getElementById('btn-connect').disabled, false);
+  assert.equal(document.getElementById('btn-connect-any').disabled, false);
+});
