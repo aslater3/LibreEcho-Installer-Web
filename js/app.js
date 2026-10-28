@@ -17,7 +17,7 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
+import { STAGES, StageError, RecoveryStopped, RecoverySerialMismatch, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
 import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
 import { PROFILES, payloadForProfile, isBuildDescription } from "./profiles.js";
 import {
@@ -156,10 +156,10 @@ export const state = {
   recoveryDeadline: null,
   recoveryAbort: null,
   recoveryGrantInFlight: false,
-  // True only after a narrow chooser produced a device that failed acceptance.
-  // The next press then offers the wider VID:PID-only list — an explicit second
-  // choice, never an automatic fallback, and never the unfiltered chooser.
-  recoveryChooserWide: false,
+  // Masked serial of an Echo in TWRP whose ADB serial is not the fastboot
+  // serial, seen during the current or last recovery wait. It is never used
+  // automatically; it points the operator at "My Echo is already in recovery".
+  recoveryOtherSerial: null,
   // Set by the silent already-granted probe; suppresses the permission button
   // entirely when this page already holds access for the selected device.
   recoveryAlreadyGranted: false,
@@ -1466,7 +1466,7 @@ function enterRecoveryWaitingUI(deadline = null) {
   // A new wait must re-earn its prompt: a grant probe from an earlier wait must
   // not silently suppress a click this run genuinely needs.
   state.recoveryAlreadyGranted = false;
-  state.recoveryChooserWide = false;
+  state.recoveryOtherSerial = null;
   if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Allow USB access to TWRP…";
   if (dom.recoveryWait) {
     dom.recoveryWait.style.display = "";
@@ -1489,13 +1489,14 @@ function enterRecoveryWaitingUI(deadline = null) {
  * recovery identity. Read-only: getDevices never opens an interface, so this
  * cannot race the poller or the single-ownership rule.
  */
-async function checkAlreadyGranted({ grantedDevices = grantedAdbDevices, serial = null } = {}) {
+export async function checkAlreadyGranted({ grantedDevices = grantedAdbDevices, serial = null } = {}) {
   const expected = String(serial ?? state.identity?.serialRaw ?? "").trim();
   if (!expected) return false;
   const devices = await grantedDevices();
   if (!Array.isArray(devices)) return false;
-  const found = devices.some((device) => String(device?.serialNumber ?? "").trim() === expected
-    || device?.vendorId === 0x18d1 && device?.productId === 0x4ee2);
+  // Only a granted device whose USB serial is this Echo's counts. Any other
+  // granted TWRP device (a phone, another Echo) must not hide the button.
+  const found = devices.some((device) => deviceSerialVerdict(device, expected) === "match");
   if (found) {
     state.recoveryAlreadyGranted = true;
     terminal.line("this page already holds USB access for your Echo; no permission click is needed");
@@ -1523,9 +1524,16 @@ function renderRecoveryCallout() {
   const body = document.createElement("span");
   const countdown = document.createElement("span");
   countdown.id = "recovery-callout-countdown";
-  body.textContent = " Press the button below, then choose the USB device named “Echo” in Chrome’s list. "
-    + "It can take about 15 seconds to appear while your Echo restarts, and the list updates by itself. "
-    + "The install then continues automatically.";
+  if (state.recoveryOtherSerial) {
+    title.textContent = "An Echo in recovery reports a different serial";
+    body.textContent = ` It reports ${state.recoveryOtherSerial}, not ${state.identity?.serialMasked ?? "the fastboot serial"}, so this page will not use it by itself. `
+      + "If it is the Echo you just unlocked, stop waiting, then press “My Echo is already in recovery”. "
+      + "Its identity is then read from recovery, and the unlock is not sent again.";
+  } else {
+    body.textContent = " Press the button below, then choose the USB device named “Echo” in Chrome’s list. "
+      + "It can take about 15 seconds to appear while your Echo restarts, and the list updates by itself. "
+      + "The install then continues automatically.";
+  }
   node.append(title, body);
   const tail = document.createElement("div");
   tail.id = "recovery-callout-tail";
@@ -1825,22 +1833,15 @@ function recoveryEntryIdentity(probe) {
 
 /**
  * What a granted USBDevice's USB descriptor serial says about it being the
- * selected device. The descriptor serial is a *narrowing hint*, never the
- * acceptance gate — `validateRecoverySession`'s ADB-reported serial check
- * (ro.serialno) stays authoritative, because the two values come from different
- * sources.
+ * selected device. It only orders the candidates: matching first, then blank,
+ * then a different serial. It never excludes one. The acceptance gate is the
+ * ADB-reported `ro.serialno` in `validateRecoverySession`.
  *
- * On this hardware the exclusion IS trusted: the TWRP USB descriptor's iSerial
- * equals the fastboot `getvar serialno` value, both `G090L90964010665` for the
- * same physical Echo (USB timeline 18d1:4ee2 / G090L90964010665). So a granted
- * Radar on the same origin is skipped without ever being opened, which is what
- * keeps a second ADB open off an unrelated device during a Biscuit's wait — two
- * opens on one USB interface is exactly the interleaved-CNXN failure this filter
- * prevents. Matching is trimmed and case-insensitive because iSerial formatting
- * is not guaranteed to match fastboot's byte-for-byte.
- *
- * A blank or absent serialNumber cannot exclude anything, so it stays a
- * candidate and falls back to open-and-probe.
+ * The descriptor serial cannot be the gate because TWRP does not always present
+ * the bootloader's serial. On one unit the descriptor serial matched the
+ * fastboot `getvar serialno`; on a new Echo the page skipped its own TWRP device
+ * for the whole wait because they differed. Matching is trimmed and
+ * case-insensitive; a blank or absent serial is "unknown".
  */
 function deviceSerialVerdict(device, expectedSerial) {
   const declared = String(device?.serialNumber ?? "").trim();
@@ -1850,21 +1851,104 @@ function deviceSerialVerdict(device, expectedSerial) {
   return declared.toUpperCase() === expected.toUpperCase() ? "match" : "mismatch";
 }
 
+const SERIAL_ORDER = { match: 0, unknown: 1, mismatch: 2 };
+
+/**
+ * How often one wait re-probes a granted device whose descriptor serial differs
+ * and whose ADB serial is not known yet (TWRP's adbd may still be starting).
+ * Once ADB has reported its serial the device is not opened again in that wait.
+ */
+const MISMATCH_RETRY_MS = 8000;
+
+/**
+ * Per-wait bookkeeping for granted devices whose descriptor serial differs from
+ * the fastboot serial. Each is logged once, probed only in a round where no
+ * matching or blank candidate is present, at most every MISMATCH_RETRY_MS, and
+ * never again once ADB has identified it as a different serial.
+ */
+function createMismatchTracker({ now = () => Date.now(), retryMs = MISMATCH_RETRY_MS } = {}) {
+  const seen = new Map();
+  const entry = (device) => {
+    const key = claimKey(device);
+    if (!seen.has(key)) seen.set(key, { lastProbe: -Infinity, identified: false, logged: false });
+    return seen.get(key);
+  };
+  return {
+    shouldProbe(device, roundHasPreferred) {
+      const item = entry(device);
+      if (!item.logged) {
+        item.logged = true;
+        terminal.line(`a granted Echo in recovery (${device.vendorId}:${device.productId}) reports USB serial `
+          + `${maskSerial(device.serialNumber)}, not the fastboot serial; its ADB serial decides whether it is yours`);
+      }
+      if (item.identified || roundHasPreferred) return false;
+      if (now() - item.lastProbe < retryMs) return false;
+      item.lastProbe = now();
+      return true;
+    },
+    identified(device) { entry(device).identified = true; },
+  };
+}
+
+/**
+ * True when the browser refused to open the USB interface because another
+ * program (or another tab) already has it. Chrome reports this as
+ * "Unable to claim interface"; other USB errors (a transfer error, a device
+ * that went away) are not this and keep their own message.
+ */
+export function isUsbInterfaceBusy(error) {
+  const text = `${error?.name ?? ""} ${error?.message ?? ""}`;
+  return /claim ?interface/i.test(text);
+}
+
+/** The operator-facing fix for `isUsbInterfaceBusy`. Never names a serial. */
+export const USB_BUSY_HINT = "Another program on this computer is using your Echo's USB connection. "
+  + "Close adb (run `adb kill-server`), Android Studio, scrcpy and any other tab with this installer, "
+  + "then press the button again. If it still fails, reload this page and press “My Echo is already in recovery” — "
+  + "the unlock is never sent again from there.";
+
+/**
+ * Records what a refused recovery candidate means for the operator: an Echo in
+ * TWRP whose ADB serial is not the fastboot serial (shown in the wait UI with
+ * the way forward), or a USB interface held by another program. Each kind is
+ * logged once per wait so the log stays readable.
+ */
+function noteRecoveryRefusal(error, logged) {
+  if (error instanceof RecoverySerialMismatch) {
+    const masked = maskSerial(error.observedSerial);
+    if (state.recoveryOtherSerial !== masked) {
+      state.recoveryOtherSerial = masked;
+      renderRecoveryCallout();
+      refreshControls();
+    }
+    if (!logged.has(`serial:${masked}`)) {
+      logged.add(`serial:${masked}`);
+      terminal.warn(`an Echo in recovery reports serial ${masked}, not ${state.identity?.serialMasked ?? "the fastboot serial"}, `
+        + "so it is not used automatically. If it is the Echo you just unlocked, press Stop, then "
+        + "“My Echo is already in recovery”; the unlock is not sent again.");
+    }
+    return true;
+  }
+  if (isUsbInterfaceBusy(error)) {
+    if (!logged.has("busy")) {
+      logged.add("busy");
+      terminal.warn(USB_BUSY_HINT);
+    }
+    return true;
+  }
+  return false;
+}
+
 /**
  * Tries every already-granted device without ever opening a chooser.
  *
- * `mismatchProbe(device)` is the bounded escape hatch. Matching and blank-serial
- * candidates are always probed; a descriptor-serial mismatch is not, because on
- * this hardware the exclusion is sound (see deviceSerialVerdict). But if a whole
- * wait has reached half its deadline without a single matching/blank candidate
- * appearing, while a mismatching granted candidate exists, the descriptor serial
- * is no longer allowed to decide the outcome on its own: that candidate is probed
- * ONCE, with a masked warning, and the ADB-reported serial still decides whether
- * it is accepted. This turns "silently skip the right device for the full
- * countdown" into a bounded, logged probe.
+ * Candidates are tried in descriptor-serial order (matching, blank, different).
+ * A different-serial candidate goes through `mismatch.shouldProbe`, which only
+ * lets it be opened in a round with no better candidate and never after ADB has
+ * identified it, so an unrelated granted device is not reopened every round.
  */
 async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch,
-  grantedDevices, open, openSession, signal, mismatchProbe = null }) {
+  grantedDevices, open, openSession, signal, mismatch = null, refusals = new Set() }) {
   // While the operator's permission chooser is open, the page owns the device
   // search. Polling in parallel is what produced two interleaved CNXN handshakes
   // on one interface; skip the whole round and let the grant resolve.
@@ -1880,14 +1964,13 @@ async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, ep
     return null;
   }
   if (!Array.isArray(devices) || devices.length === 0) return null;
-  for (const device of devices) {
+  const ordered = devices
+    .map((device) => ({ device, verdict: deviceSerialVerdict(device, expectedSerial) }))
+    .sort((a, b) => SERIAL_ORDER[a.verdict] - SERIAL_ORDER[b.verdict]);
+  const roundHasPreferred = ordered.some(({ verdict }) => verdict !== "mismatch");
+  for (const { device, verdict } of ordered) {
     if (signal?.aborted || isStopped() || isEpochStale(epoch)) throw new RecoveryStopped();
-    if (deviceSerialVerdict(device, expectedSerial) === "mismatch" && !mismatchProbe?.(device)) {
-      // Descriptor-level mismatch: skip without opening, so an unrelated granted
-      // device is never claimed and never disrupts the selected one's transport.
-      terminal.line(`skipping a granted USB device that is not the selected serial (${device.vendorId}:${device.productId})`);
-      continue;
-    }
+    if (verdict === "mismatch" && !(mismatch?.shouldProbe(device, roundHasPreferred) ?? true)) continue;
     try {
       return await claimRecoveryDevice(device, { expectedSerial, expectedBoard, identity, epoch, open, openSession, signal });
     } catch (error) {
@@ -1898,7 +1981,9 @@ async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, ep
         terminal.line(`skipping a recovery candidate another owner is already opening (${device.vendorId}:${device.productId})`);
         continue;
       }
-      terminal.line(`ignoring a granted recovery candidate: ${error.message}`);
+      // ADB has answered with a serial: this device is settled for the wait.
+      if (error instanceof RecoverySerialMismatch) mismatch?.identified(device);
+      if (!noteRecoveryRefusal(error, refusals)) terminal.line(`ignoring a granted recovery candidate: ${error.message}`);
     }
   }
   return null;
@@ -1935,23 +2020,10 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
   // to the poll interval.
   const countdownTimer = setInterval(() => paintRecoveryCountdown(deadline), 1000);
   let accepted = false;
-  // Bounded escape hatch for the descriptor-serial pre-filter. If the wait has
-  // burned half its deadline and no matching/blank-serial candidate has ever
-  // appeared, a mismatching granted candidate gets probed exactly once — per
-  // wait — with a masked warning. The ADB-reported serial remains the acceptance
-  // gate, so this can never accept a foreign device; it only stops a descriptor
-  // mismatch from skipping the RIGHT device silently for the whole countdown.
-  let sawProbeableCandidate = false;
-  let mismatchProbed = false;
-  const mismatchProbe = (device) => {
-    if (mismatchProbed || sawProbeableCandidate) return false;
-    if (Date.now() - (deadline - timeoutMs) < timeoutMs / 2) return false;
-    mismatchProbed = true;
-    terminal.warn(`the granted USB device ${device.vendorId}:${device.productId} reports serial ${maskSerial(device.serialNumber)}, `
-      + `not ${maskSerial(expectedSerial)}; probing it once anyway because the USB descriptor serial may not match the fastboot serialno. `
-      + `Only a matching ADB-reported serial is accepted.`);
-    return true;
-  };
+  // Different-descriptor-serial candidates and refusals already reported, both
+  // scoped to this wait so a new wait starts clean.
+  const mismatch = createMismatchTracker();
+  const refusals = new Set();
   try {
     for (;;) {
       if (isStopped() || controller.signal.aborted || isEpochStale(epoch)) throw new RecoveryStopped();
@@ -1962,13 +2034,7 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
       }
       let claimed = null;
       try {
-        // Listed once here so the escape hatch can see the whole candidate set
-        // before the round decides what to open.
         const devices = await grantedDevices();
-        if (Array.isArray(devices)) {
-          sawProbeableCandidate = sawProbeableCandidate
-            || devices.some((device) => deviceSerialVerdict(device, expectedSerial) !== "mismatch");
-        }
         // One page-wide USB owner, per round. The claim is taken around the
         // open+validate only and released every round, and it may coexist with a
         // grant: the grant button is the operator's way INTO this wait, and the
@@ -1986,7 +2052,7 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
         try {
           claimed = await abortable(pollGrantedRecovery({ expectedSerial, expectedBoard, identity, epoch,
             grantedDevices: async () => devices, open, openSession, signal: controller.signal,
-            mismatchProbe }), controller.signal);
+            mismatch, refusals }), controller.signal);
         } finally {
           releaseOperation();
         }
@@ -2046,7 +2112,7 @@ export async function grantRecovery(options = {}) {
 }
 
 /** The body of `grantRecovery`, with the page-wide USB slot already claimed. */
-async function runRecoveryGrant({ request = null, requestWide = null, open = openAdb,
+async function runRecoveryGrant({ request = null, open = openAdb,
   openSession = null, signal = null } = {}) {
   const identity = state.identity;
   const expectedSerial = identity.serialRaw;
@@ -2058,19 +2124,16 @@ async function runRecoveryGrant({ request = null, requestWide = null, open = ope
     return null;
   }
   state.recoveryGrantInFlight = true;
-  // The narrow chooser names the exact device: VID:PID plus the serial this run
-  // is about, so the operator's list cannot contain an unrelated granted device.
-  // The wider VID:PID-only list is used ONLY after a narrow attempt was already
-  // made and its device was not accepted — never automatically.
+  // The chooser lists the TWRP VID:PID only. It is not narrowed by serial: TWRP's
+  // USB serial does not always equal the fastboot serial, and a serial-narrowed
+  // list then shows nothing at all. The ADB-reported serial checked below is
+  // what decides whether the chosen device is accepted.
   // requestDevice must be the first device action, so the browser's user
   // activation from the button click is still valid: no await precedes it.
-  const useWide = state.recoveryChooserWide;
-  const narrow = request ?? ((options) => requestRecoveryDevice(options));
-  const wide = requestWide ?? ((options) => requestRecoveryDevice({ ...options, wide: true }));
-  const openChooser = useWide ? wide : narrow;
+  const choose = request ?? ((options) => requestRecoveryDevice(options));
   let pending;
   try {
-    pending = openChooser({ serial: expectedSerial });
+    pending = choose({ serial: expectedSerial });
   } catch (error) {
     state.recoveryGrantInFlight = false;
     throw new StageError("recovery", `could not open the browser device chooser: ${error.message}`);
@@ -2082,28 +2145,22 @@ async function runRecoveryGrant({ request = null, requestWide = null, open = ope
     if (isChooserCancel(error)) {
       state.recoveryGrantInFlight = false;
       terminal.warn("no USB device was chosen; still waiting for TWRP — you can try again");
-      state.recoveryChooserWide = false;
       refreshControls();
       return null;
     }
+    state.recoveryGrantInFlight = false;
     throw new StageError("recovery", `the browser device chooser failed: ${error.message}`);
   }
-  // The narrow chooser can legitimately list nothing when the descriptor omits
-  // serialNumber. Offer the VID:PID-only list as an explicit second choice — it
-  // is never taken automatically, and the ADB-reported serial check below
-  // remains the gate that decides which device is accepted.
   try {
     device = await claimRecoveryDevice(device, { expectedSerial, expectedBoard, identity, epoch,
       open, openSession, signal: capturedSignal });
-    state.recoveryChooserWide = false;
     terminal.ok("USB access granted to the selected TWRP device; Kaeru header intact");
     return device;
   } catch (error) {
-    if (error instanceof RecoveryStopped) { state.recoveryChooserWide = false; return null; }
+    if (error instanceof RecoveryStopped) return null;
     // A poll already owns this device: it will bind the same interface, so the
     // grant simply steps aside rather than opening a second one.
     if (error instanceof RecoveryDeviceBusy) {
-      state.recoveryChooserWide = false;
       // The wait is not stuck and no second connection was opened, so say both
       // plainly: the operator's click did nothing harmful, the existing attempt
       // is still running, and a second click is the right recovery if the wait
@@ -2113,15 +2170,9 @@ async function runRecoveryGrant({ request = null, requestWide = null, open = ope
       refreshControls();
       return null;
     }
-    if (!state.recoveryChooserWide) {
-      // Offer the wider (still VID:PID-scoped) list once, and say plainly why.
-      state.recoveryChooserWide = true;
-      terminal.warn(`the chosen device was not accepted: ${error.message}. If Chrome's list showed a device with no serial number, press the button again to list every Echo in recovery.`);
-      refreshControls();
-      return null;
-    }
-    state.recoveryChooserWide = false;
-    terminal.warn(`the chosen device was not accepted: ${error.message}`);
+    // A serial mismatch or a busy interface gets its own explanation; anything
+    // else is reported as it is.
+    if (!noteRecoveryRefusal(error, new Set())) terminal.warn(`the chosen device was not accepted: ${error.message}`);
     refreshControls();
     return null;
   } finally {
@@ -2282,7 +2333,6 @@ function primaryAction() {
   }
   if (state.running) {
     if (state.recoveryWaiting) {
-      const wide = state.recoveryChooserWide;
       if (state.recoveryAlreadyGranted) {
         // This origin already holds permission for the device and the poller is
         // binding it: no button at all, because there is nothing to press.
@@ -2291,22 +2341,36 @@ function primaryAction() {
           hint: "Still nothing after about 15 seconds? Press Stop, then press Connect to choose it in Chrome’s list.",
           secondary: "Recovery here is TWRP.", kind: "pending", suppressed: true };
       }
+      if (state.recoveryOtherSerial) {
+        return {
+          step: "connect-device",
+          label: "Stop waiting",
+          message: `An Echo in recovery is connected, but it reports serial ${state.recoveryOtherSerial}, not ${state.identity?.serialMasked ?? "the one fastboot reported"}, so it is not used automatically.`,
+          hint: "If it is the Echo you just unlocked, stop waiting, then press “My Echo is already in recovery”. The unlock is not sent again.",
+          secondary: "If you have more than one Echo connected, unplug the others first.",
+          kind: "action",
+          run: () => requestStop(),
+        };
+      }
       return {
         step: "connect-device",
-        label: wide ? "Connect to your Echo (showing all)" : "Connect to your Echo in recovery",
-        message: wide
-          ? "Press this, then choose your Echo from the list. Chrome shows every Echo in recovery on this machine."
-          : "Your Echo is restarting. Press this once, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
+        label: "Connect to your Echo in recovery",
+        message: "Your Echo is restarting. Press this once, then choose the USB device named “Echo” in Chrome’s list. The install continues by itself.",
         hint: "It can take about 15 seconds to appear while it restarts — the list updates by itself, so wait if it is not there yet.",
-        secondary: wide
-          ? "Chrome asks for permission once per USB device. If this is not your Echo, press Stop."
-          : "Chrome asks for permission once per USB device. Recovery here is TWRP.",
+        secondary: "Chrome asks for permission once per USB device. Recovery here is TWRP.",
         kind: "action",
         focus: true,
         run: () => grantRecovery().catch((error) => terminal.error(`recovery USB permission failed: ${error.message}`)),
       };
     }
     return null;
+  }
+  if (recoveryEntrySwitchAvailable() && state.recoveryOtherSerial) {
+    return { step: "connect-device", label: "My Echo is already in recovery",
+      message: `The Echo in recovery reports serial ${state.recoveryOtherSerial}, not the one fastboot reported. If it is the Echo you just unlocked, press this and choose it in Chrome’s list.`,
+      hint: "Its identity is read from recovery itself: TWRP, the board and the Kaeru header are checked, and the unlock is not sent again.",
+      kind: "action", focus: true,
+      run: () => switchToRecoveryEntry().catch((error) => terminal.error(`starting from recovery failed: ${error.message}`)) };
   }
   if (continueFromTwrpAvailable()) {
     return {
@@ -2476,10 +2540,12 @@ function refreshUsbButtons() {
   dom.buttons.connect.disabled = running || operationBusy;
   dom.buttons.connectAny.disabled = running || operationBusy;
   dom.buttons.grantRecovery.disabled = (busy && !state.recoveryWaiting) || operationBusy;
-  // The recovery entry is only ever the answer to "no fastboot identity exists".
-  // Once a device is identified it must be closed, so this can never replace or
-  // race a fastboot query or an in-progress run.
-  dom.buttons.recoveryEntry.disabled = busy || state.identity !== null || operationBusy;
+  // The recovery entry answers "no fastboot identity exists". It can never race
+  // a fastboot query or an in-progress run.
+  // After the unlock was sent (or a different-serial Echo was seen in TWRP) it
+  // may also replace the fastboot identity; see recoveryEntrySwitchAvailable.
+  dom.buttons.recoveryEntry.disabled = busy || operationBusy
+    || (state.identity !== null && !recoveryEntrySwitchAvailable());
 }
 
 /**
@@ -2536,6 +2602,45 @@ export function refreshControls() {
   dom.buttons.abort.disabled = !running;
   refreshContinueFromTwrp();
   refreshStatusBar();
+}
+
+/**
+ * True when "My Echo is already in recovery" may replace the fastboot identity:
+ * nothing is running, the identity came from fastboot, and this page has either
+ * sent the unlock to it or seen an Echo in TWRP that reports another serial. In
+ * both cases the device can no longer answer fastboot, so a reload used to be
+ * the only way to reach the recovery entry. The entry re-checks TWRP, the board
+ * and the Kaeru header, and never sends the unlock, so it is no less strict than
+ * that reload.
+ */
+function recoveryEntrySwitchAvailable() {
+  return Boolean(state.identity && state.identity.source !== "recovery"
+    && !state.running && !state.fetchingBundle && !deviceOperationBusy()
+    && (state.unlockSubmitted === state.identity.serialRaw || state.recoveryOtherSerial));
+}
+
+/**
+ * Drops the fastboot identity and starts the recovery entry, as a reload would
+ * but keeping the verified bundle. Everything before `startFromRecovery` is
+ * synchronous so the click's user activation still reaches Chrome's chooser.
+ */
+export function switchToRecoveryEntry(options = {}) {
+  if (state.identity && !recoveryEntrySwitchAvailable()) {
+    const reason = state.running || state.fetchingBundle || deviceOperationBusy()
+      ? "wait until the current operation has finished, then press it again"
+      : "the identified device is still answering fastboot; use it from step 3";
+    return Promise.reject(new StageError("recovery", reason));
+  }
+  if (state.identity) {
+    terminal.info(`switching from the fastboot identity ${state.identity.serialMasked} to the Echo in recovery; the unlock is not sent again`);
+    invalidateRecovery({ close: true });
+    state.fastboot = null;
+    state.identity = null;
+    state.payloadBytes = null;
+    state.payloadName = "";
+    state.recoveryOtherSerial = null;
+  }
+  return startFromRecovery(options);
 }
 
 /**
@@ -3070,7 +3175,7 @@ dom.buttons.grantRecovery?.addEventListener("click", () => {
   grantRecovery().catch((error) => terminal.error(`recovery USB permission failed: ${error.message}`));
 });
 dom.buttons.recoveryEntry?.addEventListener("click", () => {
-  startFromRecovery().catch((error) => terminal.error(`starting from recovery failed: ${error.message}`));
+  switchToRecoveryEntry().catch((error) => terminal.error(`starting from recovery failed: ${error.message}`));
 });
 dom.buttons.dryRun?.addEventListener("click", () => runInstall({ dryRun: true }));
 dom.buttons.run?.addEventListener("click", () => runInstall({ dryRun: false }));

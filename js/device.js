@@ -141,33 +141,24 @@ export async function requestDevice(mode) {
 export const RECOVERY_USB_IDS = Object.freeze([{ vendorId: 0x18d1, productId: 0x4ee2 }]);
 
 /**
- * WebUSB filter list for the recovery permission prompt.
+ * WebUSB filter list for the recovery permission prompt: the TWRP VID:PID and
+ * nothing else, never unfiltered and never class-based.
  *
- * The operator has to press one button and then pick their Echo out of Chrome's
- * list, so the list must be as short as possible — but it must not be able to
- * match a DIFFERENT device, and it must never become unfiltered. `serialNumber`
- * is a supported WebUSB filter key, so the narrow list names the exact device
- * this run is about. `wide` drops only the serial (not the VID:PID) and is used
- * when the narrow chooser is cancelled, because a device whose USB descriptor
- * omits serialNumber can never match the narrow filter. It is never automatic:
- * the caller must have seen a cancellation first, and the UI says so.
+ * It is not narrowed by serial. TWRP's USB descriptor serial does not always
+ * equal the fastboot serial, and a serial-narrowed chooser then lists nothing,
+ * leaving the operator no device to pick. The ADB-reported serial, read after
+ * the device is opened, decides whether the chosen device is accepted.
  *
  * Pure: no navigator access, no state. This decides what the operator sees.
  */
-export function recoveryChooserFilters({ serial = null, wide = false } = {}) {
-  const declared = String(serial ?? "").trim();
-  if (!wide) {
-    return RECOVERY_USB_IDS.map(({ vendorId, productId }) => (
-      declared ? { vendorId, productId, serialNumber: declared } : { vendorId, productId }
-    ));
-  }
+export function recoveryChooserFilters() {
   return RECOVERY_USB_IDS.map(({ vendorId, productId }) => ({ vendorId, productId }));
 }
 
-export async function requestRecoveryDevice({ serial = null, wide = false } = {}) {
+export async function requestRecoveryDevice() {
   const support = webusbSupport();
   if (!support.ok) throw new Error(support.reason);
-  return navigator.usb.requestDevice({ filters: recoveryChooserFilters({ serial, wide }) });
+  return navigator.usb.requestDevice({ filters: recoveryChooserFilters() });
 }
 
 export async function pairedDevices() {

@@ -81,7 +81,7 @@ function blankPage({ identity = null, recoveryWaiting = false } = {}) {
     bundleReady: false, bundleBoard: null, bundleHardwareAccepted: false, installProtocol: null,
     running: false, abort: false, fetchingBundle: false, downloadedBundle: null,
     recoveryWaiting, recoveryDeadline: null, recoveryAbort: null,
-    recoveryGrantInFlight: false, recoveryChooserWide: false, recoveryAlreadyGranted: false,
+    recoveryGrantInFlight: false, recoveryOtherSerial: null, recoveryAlreadyGranted: false,
     recoverySession: null, recoveryAcceptedEpoch: 0, recoveryEpoch: 0,
     unlockSubmitted: null, stageProgress: {},
   });
