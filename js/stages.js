@@ -65,6 +65,22 @@ export class RecoveryStopped extends StageError {
 }
 
 /**
+ * Raised when ADB answers, TWRP is running, but `ro.serialno` is not the serial
+ * fastboot reported. That is either a different Echo or the same Echo with a
+ * recovery that reports another serial than its bootloader, and the page cannot
+ * tell which, so it is never accepted automatically. The page tells the operator, who can choose
+ * "My Echo is already in recovery", which identifies the device from recovery
+ * itself.
+ */
+export class RecoverySerialMismatch extends StageError {
+  constructor(observedSerial) {
+    super("recovery", `recovery serial ${maskSerial(observedSerial)} does not match the selected fastboot device`);
+    this.name = "RecoverySerialMismatch";
+    this.observedSerial = String(observedSerial ?? "");
+  }
+}
+
+/**
  * How long a recovery wait tolerates TWRP not appearing, in milliseconds.
  *
  * Ten minutes, not three: the operator may have to reboot the device by hand and
@@ -361,9 +377,10 @@ export async function validateRecoverySession({ client, expectedSerial, expected
   if (!/^\d/.test(twrpVersion)) {
     throw new StageError("recovery", "ADB answered but TWRP is not running on the selected device");
   }
-  if (!expectedSerial || serial !== expectedSerial) {
+  if (!expectedSerial) {
     throw new StageError("recovery", `recovery serial ${maskSerial(serial)} does not match the selected fastboot device`);
   }
+  if (serial !== expectedSerial) throw new RecoverySerialMismatch(serial);
   if (expectedBoard && !boardMatches(device, expectedBoard)) {
     throw new StageError("recovery", `recovery board ${device || "(none)"} does not match the selected ${expectedBoard}`);
   }
@@ -391,7 +408,7 @@ export function boardMatches(observed, expected) {
 /**
  * @deprecated Not used by the page. The install's recovery wait is
  * `awaitRecovery` in app.js, which polls already-granted devices through
- * `pollGrantedRecovery` with the descriptor-serial pre-filter, the single-owner
+ * `pollGrantedRecovery` with descriptor-serial ordering, the single-owner
  * claim registry and the 10-minute `RECOVERY_TIMEOUT_MS` deadline. This helper
  * has none of those: it calls `reattachAdb`, which opens EVERY granted device and
  * shells `getprop ro.serialno` — reintroducing verbatim the defect the page's

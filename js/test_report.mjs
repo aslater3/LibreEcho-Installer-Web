@@ -53,10 +53,10 @@ test('the log can be left out', () => {
 });
 
 test('serials, MACs, private addresses and secrets are removed', () => {
-  const text = redact('serial G090L90964010665 mac 00:11:22:aa:bb:cc ip 192.168.1.20 and 10.0.0.5 psk=hunter2 token: abc');
-  assert.doesNotMatch(text, /G090L90964010665|00:11:22|192\.168|10\.0\.0\.5|hunter2|abc/);
-  const report = buildIssueReport({ summary: 'G090L90964010665', whatHappened: 'mac 00:11:22:aa:bb:cc', log: 'password=x1' });
-  assert.doesNotMatch(decodeURIComponent(report.url), /G090L90964010665|00:11:22:aa|x1/);
+  const text = redact('serial G0TESTSERIAL0001 mac 00:11:22:aa:bb:cc ip 192.168.1.20 and 10.0.0.5 psk=hunter2 token: abc');
+  assert.doesNotMatch(text, /G0TESTSERIAL0001|00:11:22|192\.168|10\.0\.0\.5|hunter2|abc/);
+  const report = buildIssueReport({ summary: 'G0TESTSERIAL0001', whatHappened: 'mac 00:11:22:aa:bb:cc', log: 'password=x1' });
+  assert.doesNotMatch(decodeURIComponent(report.url), /G0TESTSERIAL0001|00:11:22:aa|x1/);
 });
 
 test('the cap stays below the length GitHub actually rejects', () => {

@@ -1,5 +1,5 @@
-// Guided one-click recovery permission: filter construction, the never-automatic
-// wider fallback, the silent already-granted probe, and the status-bar copy the
+// Guided one-click recovery permission: filter construction, the
+// VID:PID-only chooser, the silent already-granted probe, and the status-bar copy the
 // operator actually reads. Deterministic fakes only — no device, no USB, no
 // chooser is ever opened against a real browser.
 
@@ -66,7 +66,7 @@ const PROFILE = {
   lkBuildMap: { '63cb91b-20221007_072309': { payload: 'test.img', size: 3, sha256: 'a'.repeat(64) } },
 };
 
-function setup({ alreadyGranted = [] } = {}) {
+function setup() {
   app.state.release = { tag: 'radar-puffin-v0.14.0', assets: [], board: 'radar_puffin' };
   app.state.board = 'biscuit';
   app.state.identity = { product: 'BISCUIT', unlockStatus: 'false', profile: PROFILE,
@@ -86,7 +86,7 @@ function setup({ alreadyGranted = [] } = {}) {
   app.state.recoveryDeadline = Date.now() + 600000;
   app.state.recoveryAbort = null;
   app.state.recoveryGrantInFlight = false;
-  app.state.recoveryChooserWide = false;
+  app.state.recoveryOtherSerial = null;
   app.state.recoveryAlreadyGranted = false;
   app.state.recoverySession = null;
   app.state.recoveryEpoch = 0;
@@ -106,9 +106,11 @@ function twrpSession({ serial = 'TEST-DOT', board = 'biscuit' } = {}) {
 
 // --- filter construction ---------------------------------------------------
 
-test('the recovery chooser filter names the exact device: VID:PID plus serial', () => {
+test('the recovery chooser filter is the TWRP VID:PID only, never narrowed by serial', () => {
+  // TWRP's USB serial can differ from the fastboot serial; a serial-narrowed
+  // chooser then lists nothing and the operator has no device to pick.
   assert.deepEqual(recoveryChooserFilters({ serial: 'TEST-DOT' }),
-    [{ vendorId: 0x18d1, productId: 0x4ee2, serialNumber: 'TEST-DOT' }]);
+    [{ vendorId: 0x18d1, productId: 0x4ee2 }]);
 });
 
 test('the recovery chooser is never unfiltered and never class-filtered', () => {
@@ -123,64 +125,63 @@ test('the recovery chooser is never unfiltered and never class-filtered', () => 
       // deviceClass is never usable: these devices report class 0.
       assert.equal('deviceClass' in filter, false);
       assert.equal('classCode' in filter, false);
+      assert.equal('serialNumber' in filter, false);
     }
   }
 });
 
-test('the wider fallback keeps VID:PID and drops only the serial', () => {
-  assert.deepEqual(recoveryChooserFilters({ serial: 'TEST-DOT', wide: true }),
-    [{ vendorId: 0x18d1, productId: 0x4ee2 }]);
-  // Widening must not widen into "every USB device on this machine".
-  assert.equal(recoveryChooserFilters({ serial: null, wide: true }).length, 1);
-});
+// --- the grant path -------------------------------------------------------
 
-// --- the grant path uses the narrow filter first --------------------------
-
-test('the first grant asks for the narrow serial filter', async () => {
+test('one grant click opens the chooser once and binds a device whose ADB serial matches', async () => {
   setup();
   const seen = [];
   await app.grantRecovery({
     request: (options) => { seen.push(options); return Promise.resolve(TWRP); },
-    requestWide: (options) => { seen.push({ ...options, wide: true }); return Promise.resolve(TWRP); },
     open: async () => twrpSession(),
   });
   assert.equal(seen.length, 1, 'the chooser was opened more than once for one click');
-  assert.deepEqual(seen[0], { serial: 'TEST-DOT' });
   assert.equal(app.state.recoverySerial, 'TEST-DOT');
 });
 
-test('a refused narrow device offers the wider list, and only the next press uses it', async () => {
+test('a chosen Echo whose ADB serial differs is refused and the operator is told what to do', async () => {
   setup();
-  const seen = [];
-  // First press: a device that is not this one. The wide list is OFFERED, not used.
-  const first = await app.grantRecovery({
-    request: (options) => { seen.push({ wide: false, ...options }); return Promise.resolve(TWRP); },
-    requestWide: (options) => { seen.push({ wide: true, ...options }); return Promise.resolve(TWRP); },
-    // A wrong ADB serial is refused by the authoritative gate.
-    open: async () => twrpSession({ serial: 'SOME-OTHER-DOT' }),
+  const refused = await app.grantRecovery({
+    request: () => Promise.resolve({ ...TWRP, serialNumber: 'OTHER-SERIAL-0001' }),
+    open: async () => twrpSession({ serial: 'OTHER-SERIAL-0001' }),
   });
-  assert.equal(first, null, 'a wrong-serial recovery device was accepted');
-  assert.equal(seen.length, 1, 'the wider chooser was opened without a second click');
-  assert.equal(app.state.recoveryChooserWide, true, 'the wider list was not offered after a refusal');
+  assert.equal(refused, null, 'a wrong-serial recovery device was accepted');
+  assert.equal(app.state.recoverySerial, null);
+  assert.equal(app.state.recoveryOtherSerial, '••••0001');
+  const log = app.terminal.plainText();
+  assert.match(log, /reports serial ••••0001/);
+  assert.match(log, /My Echo is already in recovery/);
+  assert.doesNotMatch(log, /OTHER-SERIAL-0001/, 'the full serial reached the log');
 
-  // Second press: now the wider list is used, and it still only carries VID:PID.
-  const second = await app.grantRecovery({
-    request: (options) => { seen.push({ wide: false, ...options }); return Promise.resolve(TWRP); },
-    requestWide: (options) => { seen.push({ wide: true, ...options }); return Promise.resolve(TWRP); },
-    open: async () => twrpSession(),
-  });
+  // A second press on the right device still binds it.
+  const second = await app.grantRecovery({ request: () => Promise.resolve(TWRP), open: async () => twrpSession() });
   assert.equal(second.client !== undefined, true, 'the retry did not bind the chosen device');
-  assert.deepEqual(seen[1], { wide: true, serial: 'TEST-DOT' });
 });
 
-test('cancelling the chooser leaves the wait intact and does not widen the next list', async () => {
+test('a claimInterface failure explains that another program holds the USB connection', async () => {
+  setup();
+  const busy = Object.assign(new Error("Failed to execute 'claimInterface' on 'USBDevice': Unable to claim interface."),
+    { name: 'NetworkError' });
+  const refused = await app.grantRecovery({ request: () => Promise.resolve(TWRP), open: async () => { throw busy; } });
+  assert.equal(refused, null);
+  assert.equal(app.state.recoveryGrantInFlight, false, 'a failed open left the grant flag set');
+  const log = app.terminal.plainText();
+  assert.match(log, /adb kill-server/);
+  assert.match(log, /My Echo is already in recovery/);
+  assert.equal(app.isUsbInterfaceBusy(busy), true);
+  assert.equal(app.isUsbInterfaceBusy(new Error('A transfer error has occurred.')), false);
+});
+
+test('cancelling the chooser leaves the wait intact', async () => {
   setup();
   const cancel = Object.assign(new Error('no device selected'), { name: 'NotFoundError' });
   const refused = await app.grantRecovery({ request: () => Promise.reject(cancel) });
   assert.equal(refused, null);
   assert.equal(app.state.recoveryGrantInFlight, false, 'a cancelled chooser left the grant flag set');
-  assert.equal(app.state.recoveryChooserWide, false,
-    'a cancellation silently widened the chooser');
   assert.equal(app.state.adb, null);
 
   const session = twrpSession();
@@ -211,8 +212,21 @@ test('an already-granted device needs no click at all', async () => {
   assert.match(elements.get('status-bar-message').textContent, /already has USB access/i);
 });
 
+test('only a granted device with this Echo\'s serial counts as already granted', async () => {
+  setup();
+  // A phone with USB debugging, or another Echo in TWRP, shares 18d1:4ee2. It
+  // must not hide the button behind "no permission click is needed".
+  const other = { ...TWRP, serialNumber: 'PHONE-SERIAL-1234' };
+  app.state.recoveryAlreadyGranted = false;
+  assert.equal(await app.checkAlreadyGranted({ grantedDevices: async () => [other] }), false);
+  assert.equal(app.state.recoveryAlreadyGranted, false, 'a foreign 18d1:4ee2 device suppressed the prompt');
+  assert.equal(await app.checkAlreadyGranted({ grantedDevices: async () => [{ ...TWRP, serialNumber: '' }] }), false);
+  assert.equal(await app.checkAlreadyGranted({ grantedDevices: async () => [other, TWRP] }), true);
+  assert.equal(app.state.recoveryAlreadyGranted, true);
+});
+
 test('a new recovery wait re-earns its prompt instead of trusting an old grant', async () => {
-  setup({ alreadyGranted: [TWRP] });
+  setup();
   // Simulate the probe having succeeded on an earlier wait…
   app.state.recoveryAlreadyGranted = true;
   // …then a new wait begins: the prompt must come back.
@@ -251,4 +265,29 @@ test('the recovery button takes focus, because the gesture needs a fresh click',
   button.focused = 0;
   app.refreshControls();
   assert.ok(button.focused > 0, 'the recovery button was not focused for the required gesture');
+});
+// --- an Echo in TWRP that reports another serial ----------------------------
+
+test('a different-serial Echo turns the wait action into Stop, then offers the recovery entry', () => {
+  setup();
+  app.state.running = true;
+  app.state.recoveryOtherSerial = '••••0001';
+  app.refreshControls();
+  assert.equal(elements.get('status-bar-action').dataset.actionLabel, 'Stop waiting');
+  assert.match(elements.get('status-bar-message').textContent, /reports serial ••••0001/);
+  assert.match(elements.get('status-bar-hint').textContent, /My Echo is already in recovery/);
+
+  // After the stop: the one action that can work is the recovery entry.
+  app.state.running = false;
+  app.state.recoveryWaiting = false;
+  app.refreshControls();
+  assert.equal(elements.get('status-bar-action').dataset.actionLabel, 'My Echo is already in recovery');
+  assert.match(elements.get('status-bar-message').textContent, /unlocked/);
+  app.state.recoveryOtherSerial = null;
+});
+
+test('only a claimInterface failure is treated as a USB connection held elsewhere', () => {
+  assert.equal(app.isUsbInterfaceBusy(Object.assign(new Error('A transfer error has occurred.'), { name: 'NetworkError' })), false);
+  assert.equal(app.isUsbInterfaceBusy(Object.assign(new Error('The device was disconnected.'), { name: 'NotFoundError' })), false);
+  assert.equal(app.isUsbInterfaceBusy(new Error("Failed to execute 'claimInterface' on 'USBDevice': Unable to claim interface.")), true);
 });

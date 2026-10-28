@@ -67,8 +67,8 @@ const { phaseReply, readbackReply } = await import('./direct-test-protocol.mjs')
 
 const HEADER = '88 16 88 58 70 b2 03 00 4c 4b 00 00 00 00 00 00';
 const HEADER_HEX = '8816885870b203004c4b000000000000';
-const DEVICE = { vendorId: 0x18d1, productId: 0x4ee2, serialNumber: 'G090L90964010665' };
-const SERIAL = 'G090L90964010665';
+const DEVICE = { vendorId: 0x18d1, productId: 0x4ee2, serialNumber: 'TEST-RADAR-0001' };
+const SERIAL = 'TEST-RADAR-0001';
 
 const withLocalStorage = (fn) => async () => {
   const prior = globalThis.localStorage;
@@ -142,7 +142,7 @@ function blankPage({ board = 'radar_puffin', buildReady = false } = {}) {
     identity: null, fastboot: null, payloadBytes: null, payloadName: '',
     running: false, abort: false, fetchingBundle: false, downloadedBundle: null,
     recoveryWaiting: false, recoveryDeadline: null, recoveryAbort: null,
-    recoveryGrantInFlight: false, recoveryChooserWide: false, recoveryAlreadyGranted: false,
+    recoveryGrantInFlight: false, recoveryOtherSerial: null, recoveryAlreadyGranted: false,
     recoverySession: null, recoverySerial: null, recoveryAcceptedEpoch: 0, recoveryEpoch: 0,
     kaeruHeader: null, adb: null, unlockSubmitted: null, receipts: [], stageProgress: {},
   });
@@ -413,4 +413,55 @@ test('the device panel says found in recovery and masks the serial in the log', 
   assert.ok(!log.includes(SERIAL), 'the full serial leaked into the log');
   assert.match(log, /••••/);
   assert.match(log, /found in recovery/i);
+});
+// ---------------------------------------------------------------------------
+// The switch from a fastboot identity to the recovery entry, without a reload.
+// After the unlock was sent the Echo cannot answer fastboot any more; reloading
+// the page used to be the only way to reach "My Echo is already in recovery".
+// ---------------------------------------------------------------------------
+
+function fastbootIdentityAfterUnlock({ serial = 'FASTBOOT-SERIAL-0298' } = {}) {
+  blankPage();
+  const PROFILE = { id: 'radar', product: 'RADAR', marketing: 'Echo', board: 'radar_puffin' };
+  app.state.identity = { product: 'RADAR', unlockStatus: 'false', profile: PROFILE, lkBuild: '63cb91b-20221007_073612',
+    serialRaw: serial, serialMasked: '••••' + serial.slice(-4), source: 'fastboot' };
+  app.state.fastboot = { client: {} };
+}
+
+test('after the unlock was sent, the recovery entry replaces the fastboot identity and never flashes', async () => {
+  fastbootIdentityAfterUnlock();
+  app.state.unlockSubmitted = 'FASTBOOT-SERIAL-0298';
+  const session = twrpDevice();
+  const identity = await app.switchToRecoveryEntry(chooserFor(session));
+  assert.equal(identity.source, 'recovery');
+  assert.equal(identity.serialRaw, SERIAL, 'the identity was not read from recovery');
+  assert.equal(app.state.fastboot, null, 'the stale fastboot session survived the switch');
+  assert.equal(app.state.recoverySerial, SERIAL);
+  assert.deepEqual(session.records.flashes, [], 'the switch flashed anything');
+  assert.match(app.terminal.plainText(), /switching from the fastboot identity ••••0298/);
+});
+
+test('a different-serial Echo seen in TWRP also allows the switch', async () => {
+  fastbootIdentityAfterUnlock();
+  app.state.recoveryOtherSerial = '••••0001';
+  const identity = await app.switchToRecoveryEntry(chooserFor(twrpDevice()));
+  assert.equal(identity.source, 'recovery');
+  assert.equal(app.state.recoveryOtherSerial, null);
+});
+
+test('a fastboot identity that never had the unlock sent cannot be replaced', async () => {
+  fastbootIdentityAfterUnlock();
+  const before = app.state.identity;
+  await assert.rejects(app.switchToRecoveryEntry(chooserFor(twrpDevice())), /still answering fastboot/);
+  assert.equal(app.state.identity, before, 'the identity was dropped although the switch was refused');
+});
+
+test('the switch is refused while a run is in progress', async () => {
+  fastbootIdentityAfterUnlock();
+  app.state.unlockSubmitted = 'FASTBOOT-SERIAL-0298';
+  app.state.running = true;
+  const before = app.state.identity;
+  await assert.rejects(app.switchToRecoveryEntry(chooserFor(twrpDevice())), /current operation has finished/);
+  assert.equal(app.state.identity, before);
+  app.state.running = false;
 });

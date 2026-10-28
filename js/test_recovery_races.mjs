@@ -647,71 +647,52 @@ test('the poller skips every granted device while a permission chooser is open',
   await raceSettle(waiting, 400);
 });
 
-test('a granted device with a different descriptor serial is never opened in the first half of a wait', async () => {
+// The USB descriptor serial orders candidates; it never excludes one. A new
+// Echo presented a TWRP USB serial that differed from its fastboot serial, and
+// the old pre-filter skipped it for the whole wait.
+test('a different descriptor serial is probed, and once ADB names it foreign it is not reopened in that wait', async () => {
   setup();
   const before = { ...app.state.identity };
-  const TIMEOUT = 300;
-  const openedAt = [];
-  const startedAt = Date.now();
-  // An already-granted, healthy-looking Radar on the same origin: same vendor,
-  // same product, healthy TWRP answers — but it is NOT the selected device. The
-  // descriptor exclusion is kept (it is sound on this hardware: the TWRP iSerial
-  // equals the fastboot serialno), but only for the first half of the wait —
-  // after that the bounded escape hatch below may probe it exactly once.
+  let opened = 0;
   const foreign = { ...DEVICE, serialNumber: 'RADAR-OTHER-0001' };
-  const promise = app.awaitRecovery({ timeoutMs: TIMEOUT, intervalMs: 10,
+  const promise = app.awaitRecovery({ timeoutMs: 300, intervalMs: 10,
     grantedDevices: async () => [foreign],
-    open: async () => { openedAt.push(Date.now() - startedAt); return twrpSession({ serial: 'RADAR-OTHER-0001' }); } });
+    open: async () => { opened += 1; return twrpSession({ serial: 'RADAR-OTHER-0001' }); } });
   await assert.rejects(promise, /timed out|TWRP/i);
-  const firstHalf = openedAt.filter((at) => at < TIMEOUT / 2);
-  assert.equal(firstHalf.length, 0,
-    `the foreign device was opened ${firstHalf.length}x in the first half of the wait`);
-  // Bounded: at most one probe for the whole wait, however long it runs.
-  assert.ok(openedAt.length <= 1, `the escape hatch probed ${openedAt.length} times; it must probe at most once per wait`);
+  assert.equal(opened, 1, `the foreign device was opened ${opened} times; ADB identified it after the first`);
   assert.equal(app.state.adb, null, 'a foreign-serial device was bound to the run');
   assert.equal(app.state.recoverySerial, null);
   assert.deepEqual(app.state.identity, before, 'the frozen identity changed');
-  assert.match(app.terminal.plainText(), /not the selected serial/i);
-});
-
-// F3 escape hatch: a descriptor serial that merely *looks* different must not
-// cost the operator the whole countdown. Once the wait has burned half its
-// deadline with no matching/blank candidate ever appearing, one mismatching
-// candidate is probed — and the ADB-reported serial still decides.
-test('a mismatching descriptor serial is probed once after half the deadline, and the ADB serial still decides', async () => {
-  setup();
-  const twrp = { ...DEVICE, serialNumber: 'G090L90964010665' };
-  let openedFor = 0;
-  // The correct device, whose TWRP iSerial differs from the fastboot serialno in
-  // case only. The ADB-reported serial matches, so the probe must be accepted.
-  const promise = app.awaitRecovery({ timeoutMs: 1200, intervalMs: 20,
-    grantedDevices: async () => [twrp],
-    open: async () => { openedFor += 1; return twrpSession(); } });
-  const result = await promise;
-  assert.ok(openedFor >= 1, 'the mismatching device was never probed, so the wait could only time out');
-  assert.equal(result.client.client ? true : true, true);
-  assert.equal(app.state.recoverySerial, 'TEST-DOT', 'the escape-hatch probe did not accept the correct device');
+  assert.equal(app.state.recoveryOtherSerial, '••••0001');
   const log = app.terminal.plainText();
-  assert.match(log, /descriptor serial may not match the fastboot serialno/i,
-    'the escape hatch probed without logging why');
-  // The warning is masked: no full serial reaches the log.
-  assert.ok(!/G090L90964010665/.test(log), 'the full serial was written to the log');
-  assert.match(log, /probing it once anyway/i);
+  assert.match(log, /reports USB serial ••••0001, not the fastboot serial/);
+  assert.match(log, /reports serial ••••0001/);
+  assert.equal(log.match(/an Echo in recovery reports serial/g)?.length, 1, 'the refusal was logged every round');
+  assert.ok(!/RADAR-OTHER-0001/.test(log), 'the full serial was written to the log');
 });
 
-test('the escape hatch never accepts a foreign device: the ADB serial check stays authoritative', async () => {
+test('a different descriptor serial whose ADB serial matches is accepted straight away', async () => {
   setup();
-  let openedFor = 0;
+  const twrp = { ...DEVICE, serialNumber: 'TEST-USB-SERIAL-0002' };
+  const startedAt = Date.now();
+  const result = await app.awaitRecovery({ timeoutMs: 60000, intervalMs: 20,
+    grantedDevices: async () => [twrp],
+    open: async () => twrpSession() });
+  assert.ok(result.client, 'the right device was not bound');
+  assert.equal(app.state.recoverySerial, 'TEST-DOT');
+  assert.ok(Date.now() - startedAt < 5000, 'the right device waited for a deadline-based escape hatch');
+});
+
+test('a matching descriptor serial is tried before a different one, which is then not opened', async () => {
+  setup();
+  const openedSerials = [];
   const foreign = { ...DEVICE, serialNumber: 'RADAR-OTHER-0001' };
-  // Probed once, ADB says a different serial, so the claim is refused every time.
-  const promise = app.awaitRecovery({ timeoutMs: 800, intervalMs: 20,
-    grantedDevices: async () => [foreign],
-    open: async () => { openedFor += 1; return twrpSession({ serial: 'RADAR-OTHER-0001' }); } });
-  await assert.rejects(promise, /timed out|TWRP/i);
-  assert.ok(openedFor >= 1, 'the escape hatch never fired, so this proves nothing');
-  assert.ok(openedFor <= 2, `the escape hatch probed ${openedFor} times; it must probe at most once per wait`);
-  assert.equal(app.state.adb, null, 'a foreign device was bound to the run');
-  assert.equal(app.state.recoverySerial, null);
+  const mine = { ...DEVICE, serialNumber: 'TEST-DOT' };
+  const result = await app.awaitRecovery({ timeoutMs: 1000, intervalMs: 10,
+    grantedDevices: async () => [foreign, mine],
+    open: async ({ device }) => { openedSerials.push(device.serialNumber); return twrpSession(); } });
+  assert.ok(result.client);
+  assert.deepEqual(openedSerials, ['TEST-DOT'], 'the different-serial device was opened although a matching one was present');
 });
 
 test('a matching descriptor serial is opened, and a blank one still falls back to probing', async () => {
