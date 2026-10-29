@@ -110,18 +110,19 @@ test('the recovery chooser filter is the TWRP VID:PID only, never narrowed by se
   // TWRP's USB serial can differ from the fastboot serial; a serial-narrowed
   // chooser then lists nothing and the operator has no device to pick.
   assert.deepEqual(recoveryChooserFilters({ serial: 'TEST-DOT' }),
-    [{ vendorId: 0x18d1, productId: 0x4ee2 }]);
+    [{ vendorId: 0x18d1, productId: 0x4ee2 }, { vendorId: 0x18d1, productId: 0xd001 }]);
 });
 
 test('the recovery chooser is never unfiltered and never class-filtered', () => {
   for (const serial of ['TEST-DOT', '', '   ', null, undefined]) {
     const filters = recoveryChooserFilters({ serial });
-    assert.equal(filters.length, 1, 'the chooser must list exactly one USB identity');
+    // Radar's TWRP (4ee2) and the Echo Dot TWRP identity from issue #322 (d001).
+    assert.equal(filters.length, 2, 'the chooser must list exactly the two recovery USB identities');
     for (const filter of filters) {
       assert.ok(Number.isInteger(filter.vendorId) && Number.isInteger(filter.productId),
         'the filter must stay scoped to recovery VID:PID');
       assert.equal(filter.vendorId, 0x18d1);
-      assert.equal(filter.productId, 0x4ee2);
+      assert.ok([0x4ee2, 0xd001].includes(filter.productId), 'a non-recovery product id is listed');
       // deviceClass is never usable: these devices report class 0.
       assert.equal('deviceClass' in filter, false);
       assert.equal('classCode' in filter, false);

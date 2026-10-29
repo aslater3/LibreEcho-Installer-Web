@@ -133,6 +133,13 @@ export const RECOVERY_NOT_FASTBOOT_MESSAGE =
   "this Echo is in recovery (ADB), not fastboot — use “My Echo is already in recovery”";
 
 /**
+ * The refusal's machine-readable code. The error also carries the released
+ * USBDevice as `recoveryDevice`, so the page can hand the same device (and the
+ * permission already granted for it) straight to the recovery entry.
+ */
+export const RECOVERY_NOT_FASTBOOT_CODE = "recovery-not-fastboot";
+
+/**
  * Opens a fastboot session. Without a device the transport prompts the operator
  * through the browser's own device chooser; with one it attaches directly.
  * `any: true` uses an unfiltered chooser, for an identity not in the table.
@@ -170,7 +177,10 @@ export async function openFastboot({ device = null, onLog, any = false } = {}) {
     // recovery interface claimed is what would break the recovery entry the
     // message points the operator at.
     await releaseUsbInterface(transport, handle);
-    throw stageError("device", RECOVERY_NOT_FASTBOOT_MESSAGE);
+    const error = stageError("device", RECOVERY_NOT_FASTBOOT_MESSAGE);
+    error.code = RECOVERY_NOT_FASTBOOT_CODE;
+    error.recoveryDevice = handle;
+    throw error;
   }
   const client = new support.fastboot.value(transport, {
     onInfo: (line) => onLog && onLog(`fastboot: ${line}`),
