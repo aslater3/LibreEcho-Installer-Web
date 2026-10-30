@@ -15,6 +15,8 @@
 //   /latest/download/<asset>         -> GitHub releases/latest/download/<asset>
 //   /download/<tag>/<asset>          -> same as /<tag>/<asset>
 //   /download/<slug>-dev-channel/release-pointer*.txt  (mutable dev pointer)
+//   /news/news-v1.json               -> GitHub releases/download/news-feed/news-v1.json
+//                                       (the dashboard News feed; mutable)
 // Mutable responses are never cached here. Devices verify signatures and the
 // signed manifest hashes, so this Worker is untrusted transport.
 
@@ -59,13 +61,13 @@ function plain(status, text, request) {
   return new Response(request.method === "HEAD" ? null : text + "\n", { status, headers: h });
 }
 
-function finish(upstream, request, source, mutable = false) {
+function finish(upstream, request, source, mutable = false, type = "application/octet-stream") {
   const h = cors(request);
   for (const k of PASS_HEADERS) {
     const v = upstream.headers.get(k);
     if (v) h.set(k, v);
   }
-  h.set("Content-Type", "application/octet-stream");
+  h.set("Content-Type", type);
   h.set("Cache-Control", mutable ? "no-store" : "public, max-age=86400");
   h.set("X-Content-Type-Options", "nosniff");
   h.set("X-LibreEcho-Source", source);
@@ -107,6 +109,12 @@ export default {
     }
     const repository = REPO.test(env.REPOSITORY || "") ? env.REPOSITORY : DEFAULT_REPOSITORY;
 
+    // LibreEcho News feed for the dashboard: one mutable file on the news-feed
+    // release, GitHub only, never cached. Devices validate it strictly.
+    if (parts.length === 2 && parts[0] === "news" && parts[1] === "news-v1.json") {
+      return github("download/news-feed/news-v1.json", repository, request, true, "application/json; charset=utf-8");
+    }
+
     // Device OTA paths. `latest` and the dev pointers are mutable: GitHub only,
     // never cached, never served from R2.
     if (parts[0] === "latest" && parts[1] === "download" && parts.length === 3) {
@@ -143,7 +151,7 @@ export default {
 
 // Proxies a GitHub release path. Immutable tagged assets may be edge-cached;
 // mutable aliases (latest, dev pointers) bypass the cache entirely.
-async function github(path, repository, request, mutable) {
+async function github(path, repository, request, mutable, type) {
   const headers = { "User-Agent": "libreecho-dl-mirror" };
   const range = request.headers.get("Range");
   if (range) headers.Range = range;
@@ -155,5 +163,5 @@ async function github(path, repository, request, mutable) {
   });
   if (upstream.status === 404) return plain(404, "not found", request);
   if (!upstream.ok && upstream.status !== 206) return plain(502, `upstream HTTP ${upstream.status}`, request);
-  return finish(upstream, request, "github", mutable);
+  return finish(upstream, request, "github", mutable, type);
 }

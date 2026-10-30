@@ -15,6 +15,11 @@ and otherwise passes the request through to the GitHub release
 accepts GET/HEAD/OPTIONS for `radar-puffin-*` tags and `libreecho-*` names only,
 and has logs disabled.
 
+It also serves the dashboard's LibreEcho News feed: `/news/news-v1.json` proxies
+the `news-v1.json` asset of the `news-feed` release on GitHub (published by
+LibreEcho's **Publish LibreEcho News feed** workflow), uncached and never from
+R2, like the mutable `latest` and dev-pointer paths.
+
 The mirror is untrusted transport: the installer checks every file against the
 release's `SHA256SUMS` and GitHub's asset digests, and the sync job checks each
 download against `SHA256SUMS` before upload.
