@@ -64,6 +64,7 @@ Object.defineProperty(globalThis, 'navigator', {
 const app = await import('./app.js');
 const { recoveryChooserFilters } = await import('./device.js');
 const { phaseReply, readbackReply } = await import('./direct-test-protocol.mjs');
+const { expdbChainReply, expdbImage } = await import('./kaeru-chain-fixture.mjs');
 
 const HEADER = '88 16 88 58 70 b2 03 00 4c 4b 00 00 00 00 00 00';
 const HEADER_HEX = '8816885870b203004c4b000000000000';
@@ -92,6 +93,7 @@ function twrpDevice({
   header = HEADER,
   expdb = 'PARTNAME=expdb',
   sectors = '20480',
+  chain = expdbImage(),
 } = {}) {
   const records = { flashes: [], shell: [], pushes: [], closed: 0 };
   const landed = new Map();
@@ -103,6 +105,8 @@ function twrpDevice({
     records,
     shell: async (command) => {
       records.shell.push(command);
+      const chainReply = expdbChainReply(command, { image: chain });
+      if (chainReply) return chainReply;
       if (command.includes('ro.twrp.version')) {
         return { stdout: [twrp, board, serial].join('\n') + '\n' };
       }
@@ -252,8 +256,10 @@ test('a cancelled chooser changes nothing', async () => {
 });
 
 test('the chooser is VID:PID-only, never unfiltered, when there is no serial yet', () => {
+  // 18d1:4ee2 is Radar's TWRP; 18d1:d001 is what an Echo Dot's TWRP presented in
+  // issue #322. Neither decides acceptance: the ADB-read checks do.
   assert.deepEqual(recoveryChooserFilters({ serial: null }),
-    [{ vendorId: 0x18d1, productId: 0x4ee2 }]);
+    [{ vendorId: 0x18d1, productId: 0x4ee2 }, { vendorId: 0x18d1, productId: 0xd001 }]);
 });
 
 // ---------------------------------------------------------------------------

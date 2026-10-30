@@ -362,6 +362,77 @@ export async function readKaeruHeader(adb) {
   return hex;
 }
 
+// The expdb header chain, as upstream stage1/lkloader.c lays it out and as the
+// command-line installer's `_expdb_kaeru_chain_ok` checks it: every expdb
+// sub-partition starts with a header whose magic is LK_MAGIC, data size at +4,
+// name at +8 and extended magic at +48. LK sits at offset 0 with a plain header;
+// Kaeru follows at round8(512 + LK data size) with the extended magic.
+const LK_MAGIC = 0x58881688;
+const LK_EXT_MAGIC = 0x58891689;
+const LK_HEADER_MIN = 80;
+const LK_HEADER_DEFAULT = 512;
+const LK_ALIGNMENT = 8;
+
+function parseLkHeader(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length !== LK_HEADER_MIN) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(0, true) !== LK_MAGIC) return null;
+  const nameBytes = bytes.subarray(8, 48);
+  const end = nameBytes.indexOf(0);
+  const name = String.fromCharCode(...(end === -1 ? nameBytes : nameBytes.subarray(0, end)));
+  return { dataSize: view.getUint32(4, true), name, ext: view.getUint32(48, true) };
+}
+
+/**
+ * Pure: the LK -> Kaeru chained-header check over `read(offset, count)`, which
+ * resolves to a Uint8Array or null. Any short or unreadable read fails closed.
+ * Returns the Kaeru header's offset, or null.
+ */
+export async function kaeruChainOffset(read) {
+  const lk = parseLkHeader(await read(0, LK_HEADER_MIN));
+  if (!lk || lk.name !== "LK" || lk.ext === LK_EXT_MAGIC) return null;
+  let offset = LK_HEADER_DEFAULT + lk.dataSize;
+  offset += (LK_ALIGNMENT - (offset % LK_ALIGNMENT)) % LK_ALIGNMENT;
+  if (!Number.isSafeInteger(offset)) return null;
+  const kaeru = parseLkHeader(await read(offset, LK_HEADER_MIN));
+  return kaeru && kaeru.name === "kaeru" && kaeru.ext === LK_EXT_MAGIC ? offset : null;
+}
+
+/**
+ * Verifies the whole Kaeru boot chain in expdb from recovery, exactly as the
+ * command-line installer does before it trusts a recovery device it did not put
+ * there (`_adb_recovery_is_verified`): the expdb node is resolved from sysfs
+ * PARTNAME (exactly one match), and the LK header must chain to a Kaeru header.
+ *
+ * `readKaeruHeader` only reads the first 16 bytes of the pinned partition, which
+ * proves an LK header but not that Kaeru follows it. That was enough when this
+ * page itself had just sent the unlock; it is not enough for a device that
+ * arrives already in TWRP with no history on this page.
+ */
+export async function verifyKaeruChain(adb) {
+  const listing = await adb.shell("grep -l '^PARTNAME=expdb$' /sys/class/block/*/uevent");
+  const nodes = new Set();
+  for (const line of String(listing?.stdout ?? "").split(/\r?\n/)) {
+    const match = /^\/sys\/class\/block\/([A-Za-z0-9]+)\/uevent$/.exec(line.trim());
+    if (match) nodes.add(match[1]);
+  }
+  if (nodes.size !== 1) {
+    throw new StageError("recovery", `expdb could not be resolved to exactly one block device (found ${nodes.size})`);
+  }
+  const [node] = nodes;
+  const read = async (offset, count) => {
+    const reply = await adb.shell(`od -v -An -tx1 -j ${offset} -N ${count} /dev/block/${node}`);
+    const tokens = String(reply?.stdout ?? "").trim().split(/\s+/).filter(Boolean);
+    if (tokens.length !== count || !tokens.every((token) => /^[0-9a-f]{2}$/i.test(token))) return null;
+    return Uint8Array.from(tokens, (token) => parseInt(token, 16));
+  };
+  const offset = await kaeruChainOffset(read);
+  if (offset === null) {
+    throw new StageError("recovery", "expdb does not hold the LK → Kaeru header chain, so this Echo's unlock is not proven");
+  }
+  return { node, kaeruOffset: offset };
+}
+
 /**
  * Probes an opened ADB session and refuses it unless it is the selected TWRP
  * device: TWRP must be running, the serial must match the frozen fastboot

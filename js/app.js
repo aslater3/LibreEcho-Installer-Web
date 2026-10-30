@@ -7,7 +7,7 @@
 
 import { Terminal } from "./terminal.js";
 import { webusbSupport, describeUsbDevice, requestRecoveryDevice, recoveryChooserFilters, maskSerial } from "./device.js";
-import { protocolSupport, openFastboot, openAdb, grantedAdbDevices } from "./transports.js";
+import { protocolSupport, openFastboot, openAdb, grantedAdbDevices, RECOVERY_NOT_FASTBOOT_CODE } from "./transports.js";
 import {
   installerConfig,
   fetchReleaseIndex,
@@ -17,9 +17,9 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, RecoverySerialMismatch, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, rebootAndWait, boardMatches, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
+import { STAGES, StageError, RecoveryStopped, RecoverySerialMismatch, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, verifyKaeruChain, rebootAndWait, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
 import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
-import { PROFILES, payloadForProfile, isBuildDescription } from "./profiles.js";
+import { payloadForProfile, isBuildDescription } from "./profiles.js";
 import {
   installableBoards,
   profileForBoard,
@@ -1040,7 +1040,7 @@ export async function verifyBundle(fileList, { automatic = false, target = null 
  */
 export const EMPTY_FASTBOOT_IDENTITY_MESSAGE = "the device did not answer fastboot";
 
-export async function queryDevice({ any = false, open = openFastboot } = {}) {
+export async function queryDevice({ any = false, open = openFastboot, recoveryOpen = openAdb } = {}) {
   // The page opens one USB connection at a time. Taken BEFORE any await and
   // before the state reset below, so a refused query cannot invalidate an
   // identity an in-flight ADB operation is still using.
@@ -1048,10 +1048,26 @@ export async function queryDevice({ any = false, open = openFastboot } = {}) {
   // deviceQueryEpoch contract already makes the older one close its own session.
   const releaseOperation = beginDeviceOperation("query", { shareWith: ["query"] });
   if (!releaseOperation) return null;
+  let inRecovery = null;
   try {
     return await runDeviceQuery({ any, open });
+  } catch (error) {
+    // The chosen Echo is in TWRP, not fastboot. The operator already granted this
+    // exact USB device, so carry straight on into the recovery entry with it
+    // rather than sending them to another button (issue #322). Never during a
+    // run: a run's own query must fail closed exactly as before.
+    if (error?.code !== RECOVERY_NOT_FASTBOOT_CODE || !error.recoveryDevice || state.running || state.identity) throw error;
+    inRecovery = error.recoveryDevice;
   } finally {
     releaseOperation();
+  }
+  terminal.info("this Echo is in recovery, not fastboot; reading its identity from recovery on the same USB device "
+    + "(no second permission prompt, and the unlock is never sent from here)");
+  try {
+    return await startFromRecovery({ request: async () => inRecovery, open: recoveryOpen });
+  } catch (error) {
+    terminal.error(`starting from recovery failed: ${error.message}`);
+    return null;
   }
 }
 
@@ -1666,7 +1682,11 @@ async function claimRecoveryDevice(device, { expectedSerial, expectedBoard, iden
  * starts clean.
  */
 export async function startFromRecovery({ request = null, open = openAdb } = {}) {
-  if (state.running || state.fetchingBundle) {
+  // A download in progress does not block it: like the fastboot query, it only
+  // reads the device, and every install gate is evaluated again at Run. Issue
+  // #322: the button was greyed out during the download, so the operator
+  // pressed the only enabled recovery button, which needed a fastboot identity.
+  if (state.running) {
     throw new StageError("recovery", "starting from recovery is only available while no install is running");
   }
   if (state.identity) {
@@ -1751,7 +1771,10 @@ async function runRecoveryEntry({ request, open }) {
     state.recoveryGrantInFlight = false;
   }
   const identity = state.identity;
-  renderDevicePanel(identity, assessIdentity(identity, undefined,
+  // The target is the board the device reported, never the menu choice. When
+  // the selected build is for another board, say so now: the install gate
+  // already refuses it, and the operator should not find out at Run.
+  renderDevicePanel(identity, assessIdentity(identity, terminal,
     { selectedBoard: state.target?.board ?? state.bundleBoard ?? null }));
   setStatus(dom.statusDevice, `${identity.product} · unlocked · found in recovery · ${identity.serialMasked}`, "ok");
   setStatus(dom.statusPayload, "not needed — unlock skipped (device was already unlocked)", "ok");
@@ -1777,8 +1800,12 @@ export async function probeRecoveryEntry({ client, terminal } = {}) {
   const [twrpVersion = "", device = "", serial = ""] = String(probe?.stdout ?? "")
     .split(/\r?\n/).map((line) => line.trim());
   terminal?.line(`recovery probe: twrp=${twrpVersion || "(none)"} device=${device || "(none)"} serial=${maskSerial(serial)}`);
-  if (!/^\d/.test(twrpVersion)) {
-    throw new StageError("recovery", "ADB answered but TWRP is not running on the device you chose");
+  // The TWRP marker: the command-line installer's charset bound, and a version
+  // number. A running LibreEcho image answers ADB on 18d1:d001 too, and has no
+  // ro.twrp.version, so this is what tells the two apart.
+  if (!/^\d/.test(twrpVersion) || !TWRP_MARKER.test(twrpVersion)) {
+    throw new StageError("recovery", "ADB answered but TWRP is not running on the device you chose. "
+      + "If the Echo shows the black fastboot screen, use “Query device” instead; if it is already running LibreEcho, it is installed and needs nothing from this step");
   }
   if (!serial) {
     throw new StageError("recovery", "the chosen device reports no serial; refusing to identify it from recovery alone");
@@ -1788,22 +1815,46 @@ export async function probeRecoveryEntry({ client, terminal } = {}) {
     throw new StageError("recovery",
       `recovery board ${device || "(empty)"} is not a LibreEcho target (only RADAR and BISCUIT are); refusing to continue`);
   }
+  // Both reads are required. readKaeruHeader pins expdb's geometry and returns
+  // the 16-byte header every later write compares against; verifyKaeruChain is
+  // the command-line installer's full LK -> Kaeru chain check, which is what
+  // proves the unlock happened on an Echo this page never unlocked.
   const header = await readKaeruHeader(client);
+  try {
+    await verifyKaeruChain(client);
+  } catch (error) {
+    throw new StageError("recovery", `${error.message}. Nothing was written. Do not run the unlock again from this page; `
+      + "report this with the log so the device's state can be checked first");
+  }
+  terminal?.ok(`recovery identity checks passed: TWRP ${twrpVersion}, board ${device}, expdb LK → Kaeru chain intact`);
   return { twrpVersion, device, serial, profile, header };
 }
+
+/** `ro.twrp.version` as the command-line installer bounds it. */
+const TWRP_MARKER = /^[A-Za-z0-9._+-]{1,64}$/;
 
 /**
  * The profile a recovery environment's `ro.product.device` names. Biscuit's
  * kernel answers with the platform codename (`omni_biscuit`) as well as with the
- * board name, so a codename match is required there; every other board is only
- * accepted through the declared `boardMatches` alias set, never a substring.
+ * board name. Only the exact names in RECOVERY_DEVICE_NAMES are accepted.
  */
 function recoveryProfileForBoard(observed) {
   const name = String(observed ?? "").trim().toLowerCase();
-  if (!name) return null;
-  if (name.includes("biscuit")) return profileForBoard("biscuit");
-  return PROFILES.find((profile) => boardMatches(name, profile.board)) ?? null;
+  for (const [board, names] of Object.entries(RECOVERY_DEVICE_NAMES)) {
+    if (names.includes(name)) return profileForBoard(board);
+  }
+  return null;
 }
+
+/**
+ * The exact `ro.product.device` values a LibreEcho TWRP reports. The first of
+ * each is the command-line installer's `ADB_DEVICE_PROP`; the others are the
+ * board name itself and Biscuit's omni codename. An exact list, never a substring.
+ */
+const RECOVERY_DEVICE_NAMES = Object.freeze({
+  radar_puffin: Object.freeze(["radar", "radar_puffin"]),
+  biscuit: Object.freeze(["biscuit", "omni_biscuit"]),
+});
 
 /**
  * The identity a recovery entry earns, in the shape every existing gate reads.
@@ -2181,7 +2232,19 @@ async function runRecoveryGrant({ request = null, open = openAdb,
   }
 }
 
-async function findRecovery() {
+function findRecovery() {
+  // With no fastboot identity there is no serial to look for, so this button
+  // used to fail with "select and identify the fastboot device first" while the
+  // fastboot query pointed back at recovery (issue #322). Read the identity from
+  // recovery instead. No await precedes it, so the click still opens Chrome's list.
+  if (!state.identity) {
+    terminal.info("no device is identified on this page yet; reading your Echo's identity from recovery instead");
+    return startFromRecovery();
+  }
+  return findIdentifiedRecovery();
+}
+
+async function findIdentifiedRecovery() {
   currentStage("recovery");
   const session = await awaitRecovery({ timeoutMs: 30000 });
   terminal.ok("the selected TWRP device has an intact Kaeru expdb header");
@@ -2544,7 +2607,7 @@ function refreshUsbButtons() {
   // a fastboot query or an in-progress run.
   // After the unlock was sent (or a different-serial Echo was seen in TWRP) it
   // may also replace the fastboot identity; see recoveryEntrySwitchAvailable.
-  dom.buttons.recoveryEntry.disabled = busy || operationBusy
+  dom.buttons.recoveryEntry.disabled = (state.identity === null ? running : busy) || operationBusy
     || (state.identity !== null && !recoveryEntrySwitchAvailable());
 }
 

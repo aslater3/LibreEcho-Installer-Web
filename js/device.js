@@ -137,8 +137,18 @@ export async function requestDevice(mode) {
   return navigator.usb.requestDevice({ filters: table.filters });
 }
 
-/** Recovery's measured USB identity: [measured] TWRP presents 18d1:4ee2. */
-export const RECOVERY_USB_IDS = Object.freeze([{ vendorId: 0x18d1, productId: 0x4ee2 }]);
+/**
+ * Recovery's USB identities. [measured] Radar's TWRP presents 18d1:4ee2.
+ * [reported, issue #322] an Echo Dot 2 in TWRP presented 18d1:d001
+ * ("MT8163-ARM32-ADB"), so a chooser scoped to 4ee2 alone listed nothing for it.
+ * 18d1:d001 is also what LibreEcho's own adbd presents once installed: the
+ * VID:PID never decides that a device is in TWRP. `ro.twrp.version`, the board,
+ * the serial and the Kaeru expdb chain, all read back over ADB, do.
+ */
+export const RECOVERY_USB_IDS = Object.freeze([
+  Object.freeze({ vendorId: 0x18d1, productId: 0x4ee2 }),
+  Object.freeze({ vendorId: 0x18d1, productId: 0xd001 }),
+]);
 
 /**
  * WebUSB filter list for the recovery permission prompt: the TWRP VID:PID and
