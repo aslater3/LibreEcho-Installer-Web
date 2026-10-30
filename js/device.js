@@ -138,12 +138,21 @@ export async function requestDevice(mode) {
 }
 
 /**
- * Recovery's USB identities. [measured] Radar's TWRP presents 18d1:4ee2.
- * [reported, issue #322] an Echo Dot 2 in TWRP presented 18d1:d001
- * ("MT8163-ARM32-ADB"), so a chooser scoped to 4ee2 alone listed nothing for it.
- * 18d1:d001 is also what LibreEcho's own adbd presents once installed: the
- * VID:PID never decides that a device is in TWRP. `ro.twrp.version`, the board,
- * the serial and the Kaeru expdb chain, all read back over ADB, do.
+ * The USB identities the recovery chooser lists.
+ *
+ * 18d1:4ee2 is TWRP: [measured] on Radar, and the Echo Dot 2's TWRP enumerates
+ * as 18d1:4ee2 too (issue aslater3/LibreEcho#322, the reporter's own log).
+ *
+ * 18d1:d001 ("MT8163-ARM32-ADB") is NOT a recovery. It is LibreEcho's own adbd
+ * on an installed image (no getprop, banner `device::` with empty props). #26
+ * added it here believing it was the Dot's TWRP; it stays in the list for one
+ * reason only: an Echo that is already running LibreEcho can be picked, is
+ * recognised as an installed LibreEcho (InstalledLibreEchoFound) and is handed
+ * to the read-only post-install check, instead of being refused with "TWRP is
+ * not running". It is never accepted as TWRP.
+ *
+ * The VID:PID never decides that a device is in TWRP. `ro.twrp.version`, the
+ * board, the serial and the Kaeru expdb chain, all read back over ADB, do.
  */
 export const RECOVERY_USB_IDS = Object.freeze([
   Object.freeze({ vendorId: 0x18d1, productId: 0x4ee2 }),

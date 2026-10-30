@@ -256,8 +256,9 @@ test('a cancelled chooser changes nothing', async () => {
 });
 
 test('the chooser is VID:PID-only, never unfiltered, when there is no serial yet', () => {
-  // 18d1:4ee2 is Radar's TWRP; 18d1:d001 is what an Echo Dot's TWRP presented in
-  // issue #322. Neither decides acceptance: the ADB-read checks do.
+  // 18d1:4ee2 is TWRP (Radar and Echo Dot); 18d1:d001 is LibreEcho's own adbd,
+  // listed only so an installed LibreEcho can be recognised (issue #28).
+  // Neither decides acceptance: the ADB-read checks do.
   assert.deepEqual(recoveryChooserFilters({ serial: null }),
     [{ vendorId: 0x18d1, productId: 0x4ee2 }, { vendorId: 0x18d1, productId: 0xd001 }]);
 });

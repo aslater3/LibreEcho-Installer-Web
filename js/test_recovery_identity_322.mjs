@@ -5,8 +5,12 @@
 //     fastboot device first" (it only reuses a fastboot identity), while
 //   * the fastboot query correctly refused the ADB device and pointed back at
 //     "My Echo is already in recovery", and
-//   * that button was greyed out during the download, and its chooser listed
-//     only Radar's TWRP (18d1:4ee2), so the Dot's TWRP on 18d1:d001 never showed.
+//   * that button was greyed out during the download.
+//
+// Correction (issue #28): #26 also believed the Dot's TWRP enumerated as
+// 18d1:d001. It does not: the Dot's TWRP is 18d1:4ee2, like Radar's, and
+// 18d1:d001 is LibreEcho's own adbd on an installed Echo. d001 stays in the
+// chooser only so an installed LibreEcho can be recognised (test_resume_28.mjs).
 //
 // These pin the way out: every recovery button identifies the device from TWRP
 // itself with the command-line installer's checks (board, TWRP marker, expdb
@@ -80,8 +84,9 @@ const HEADER = '88 16 88 58 70 b2 03 00 4c 4b 00 00 00 00 00 00';
 const SERIAL = 'TEST-DOT-0322';
 
 /**
- * The Dot from the report: a USBDevice on 18d1:d001 whose only interface is
- * ADB (ff/42/01). The real openFastboot reads its descriptors and refuses it.
+ * The Dot from the report, in TWRP: a USBDevice on 18d1:4ee2 whose only
+ * interface is ADB (ff/42/01). The real openFastboot reads its descriptors and
+ * refuses it.
  */
 function dotUsbDevice() {
   const endpoints = [
@@ -89,7 +94,7 @@ function dotUsbDevice() {
     { direction: 'out', type: 'bulk', endpointNumber: 2, packetSize: 64 },
   ];
   return {
-    vendorId: 0x18d1, productId: 0xd001, productName: 'MT8163-ARM32-ADB', serialNumber: SERIAL,
+    vendorId: 0x18d1, productId: 0x4ee2, productName: 'Echo', serialNumber: SERIAL,
     opened: false, closeCalls: 0, releaseCalls: [],
     configuration: { interfaces: [{ interfaceNumber: 0, interfaceClass: 0xff, alternate: 0,
       alternates: [{ alternateSetting: 0, interfaceClass: 0xff, interfaceSubclass: 0x42, interfaceProtocol: 0x01, endpoints }] }] },
@@ -290,7 +295,7 @@ for (const [name, options, pattern] of CHAIN_REFUSALS) {
   });
 }
 
-test('a running LibreEcho on 18d1:d001 is not TWRP and is refused with a next step', async () => {
+test('an ADB device without TWRP or LibreEcho markers is refused with a next step', async () => {
   freshPage();
   const client = twrpClient({ twrp: '' });
   await assert.rejects(app.startFromRecovery({ request: async () => dotUsbDevice(),
