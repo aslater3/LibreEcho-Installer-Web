@@ -13,6 +13,12 @@
 // There is no bulk /cache staging and no legacy fallback: a bundle without
 // protocol 2 is refused before any device mutation. The helper's exit status is
 // not the outcome — the receipt is.
+//
+// Before any phase runs, the page reads the helper's own transaction guard and
+// last receipt (read-only) and decides from THEM where the install stands; see
+// `classifyDirectTransaction` for the state machine. The browser-side
+// localStorage attempt guard is only ever satisfied by a device state that
+// proves the earlier attempt's outcome.
 
 import { sha256Blob, sha256Bytes } from "./sha256.js";
 import { parseCacheFreeBytes, StageError, RecoveryStopped } from "./stages.js";
@@ -25,6 +31,8 @@ export const DIRECT_STATE_DIR = "/cache/libreecho-direct";
 export const DIRECT_HELPER_PATH = `${DIRECT_STATE_DIR}/libreecho-direct-install.sh`;
 export const DIRECT_MANIFEST_PATH = `${DIRECT_STATE_DIR}/bundle.manifest`;
 export const DIRECT_RECEIPT_PATH = `${DIRECT_STATE_DIR}/receipt`;
+/** The helper's monotone transaction guard (written before every mutation). */
+export const DIRECT_TRANSACTION_PATH = `${DIRECT_STATE_DIR}/transaction.state`;
 export const DIRECT_LOG_PATH = `${DIRECT_STATE_DIR}/install.log`;
 export const DIRECT_INCOMING_DIR = "/data/libreecho/incoming";
 export const DIRECT_HELPER_MEMBER = "libreecho-direct-install.sh";
@@ -273,9 +281,17 @@ async function readDirectLog(adb, tail = 40) {
  * that is never silently repeated. `--reset-transaction` is never automatic;
  * there is deliberately no code path that resets it. The non-mutating
  * `finalize --dry-run` is not guarded, so it never blocks the real finalize.
+ *
+ * `deviceAllowsRepeat` is the ONLY way past an existing guard entry, and only
+ * `classifyDirectTransaction` sets it: it is true when the Echo's own
+ * transaction guard, read immediately before this run, proves that an earlier
+ * attempt of this phase either never reached its first mutation or is one the
+ * helper itself guarantees to be safe to repeat (see the state machine there).
+ * Without that proof the refusal stands.
  */
 export async function runDirectPhase({ adb, phase, dryRun = false, serialRaw, tag,
-  bundleManifestSha256, target, release, stateDir, incomingDir, deviceDigest = null, terminal, isCancelled = null } = {}) {
+  bundleManifestSha256, target, release, stateDir, incomingDir, deviceDigest = null, terminal, isCancelled = null,
+  deviceAllowsRepeat = false, transactionPhase = null } = {}) {
   if (!adb?.shell) throw new StageError("install", "a recovery ADB session is required to run a phase");
   if (isCancelled?.()) throw new RecoveryStopped();
   if (!globalThis.crypto?.getRandomValues) throw new StageError("install", "secure invocation randomness is unavailable");
@@ -288,7 +304,15 @@ export async function runDirectPhase({ adb, phase, dryRun = false, serialRaw, ta
     const key = `libreecho.direct.${await sha256Bytes(new TextEncoder().encode(`${serialRaw}:${tag}:${phase}`))}`;
     if (isCancelled?.()) throw new RecoveryStopped();
     try {
-      if (localStorage.getItem(key)) throw new StageError("install", `${phase} phase already attempted; classify the device and receipt before any repeat`);
+      if (localStorage.getItem(key)) {
+        if (!deviceAllowsRepeat) {
+          throw new StageError("install", `the ${phase} phase was already attempted from this browser on this Echo, and the Echo's own `
+            + `install state (${DIRECT_TRANSACTION_PATH}) does not prove what that attempt did, so it is not run again. `
+            + "Nothing was run. Leave the Echo in TWRP and report this with the log so its state can be checked first");
+        }
+        terminal?.info(`this browser started the ${phase} phase on this Echo before; the Echo's install state `
+          + `(phase=${transactionPhase || "none recorded"}) proves that attempt left nothing unresolved, so ${phase} runs again`);
+      }
       localStorage.setItem(key, "pending-or-completed");
     } catch (error) {
       if (error instanceof StageError) throw error;
@@ -362,4 +386,298 @@ export async function pushDirectPayloads({ adb, roles, files, sums, terminal, is
   }
   terminal?.endProgress?.();
   return { pushedBytes, fileCount: roles.length };
+}
+
+// ---------------------------------------------------------------------------
+// Resume from the Echo's own transaction state (issue #28)
+// ---------------------------------------------------------------------------
+//
+// The helper keeps the authoritative record of a direct install on the device:
+//
+//   transaction.state  protocol, target, release, bundle_manifest_sha256,
+//                      device_digest, format_state, phase. Monotone:
+//                      prepare -> initialize -> transfer -> finalizing ->
+//                      finalized. Every phase persists it (and syncs) BEFORE
+//                      its first mutation, and refuses to run when it is later
+//                      than the phase may be.
+//   receipt            the outcome of the LAST helper invocation only. Every
+//                      invocation first replaces it with result=failed, so it
+//                      says nothing about earlier phases.
+//
+// The page used to keep its own attempt guard in localStorage (one key per
+// serial, release tag and phase, set BEFORE the phase runs) and refused any
+// repeat outright. That is the right default — an attempt whose outcome is
+// unknown must never be silently repeated — but it had no way out: a browser
+// that had run a whole, successful install could never get past "prepare phase
+// already attempted" again (aslater3/LibreEcho#322).
+//
+// The way out is the device's own guard, read before any phase runs. It is
+// bound to this build (bundle manifest digest, target, release) and to this
+// device (the helper's device digest, recomputed here when TWRP can answer for
+// it), and then decides:
+//
+//   transaction.state                     receipt          the page does         an earlier browser attempt
+//                                                                                 of these phases may repeat
+//   ------------------------------------  ---------------  --------------------  --------------------------
+//   cannot be read, or /cache unmounted   -                start at prepare      none (old behaviour)
+//   absent                                -                start at prepare      prepare initialize transfer finalize
+//   bound to another bundle/target/       -                REFUSE (conflict)     -
+//     release/device
+//   malformed, unknown protocol/phase/    -                REFUSE (unreadable)   -
+//     format_state, impossible pair
+//   phase '' or prepare, format absent    -                start at prepare      prepare initialize transfer finalize
+//   phase initialize, format formatting   -                REFUSE (format-       -
+//                                                            uncertain)
+//   phase initialize, format formatted    -                start at transfer     transfer finalize
+//   phase transfer, format formatted      -                start at transfer     transfer finalize
+//   phase finalizing                      -                REFUSE (finalize-     -
+//                                                            uncertain)
+//   phase finalized                       result=installed COMPLETE: no phase    - (nothing runs)
+//                                         bound to the       runs; reboot into
+//                                         same build and     LibreEcho and hand
+//                                         device             over to setup (#24)
+//   phase finalized                       anything else    REFUSE (finalized-    -
+//                                                            unconfirmed)
+//
+// Why each permitted repeat is safe (all of it is enforced again by the helper
+// itself, which re-checks the guard on every invocation):
+//   * absent: every phase writes the guard before its first mutation, and
+//     initialize/transfer/finalize refuse without it, so no earlier attempt
+//     changed anything the helper tracks.
+//   * prepare/absent: an earlier prepare either changed nothing or rewrote the
+//     userdata GPT entry to the contract size from the same first sector, which
+//     is idempotent (and a no-op once the new table is live after the reboot);
+//     the helper explicitly allows prepare here. initialize persists
+//     phase=initialize, format_state=formatting before it formats, so an
+//     earlier initialize never formatted. transfer and finalize need
+//     format_state=formatted, so earlier attempts were refused unchanged.
+//   * initialize|transfer/formatted: format_state=formatted is written only
+//     after the format and the tree completed. transfer may repeat by the
+//     helper's own rule (it only creates the landing directory and re-checks
+//     free space); payload pushes overwrite. finalize persists phase=finalizing
+//     before its first boot-slot write, so an earlier finalize wrote nothing.
+//
+// Never: `--reset-transaction` is never sent, a refused state is never worked
+// around, and an uncertain format or finalize is never repeated.
+
+/**
+ * Read-only, one round trip: each file is fenced so "absent" and "unreadable"
+ * differ. "Absent" only counts when /cache is a mounted filesystem: on an
+ * unmounted /cache a missing file proves nothing, so that read is unreadable.
+ */
+export const DIRECT_TRANSACTION_READ_COMMAND = [
+  "if grep -q ' /cache ' /proc/mounts; then echo __LE_CACHE__ mounted; else echo __LE_CACHE__ unmounted; fi",
+  ...[DIRECT_TRANSACTION_PATH, DIRECT_RECEIPT_PATH]
+    .map((path) => `if [ -f ${path} ]; then echo __LE_BEGIN__ ${path}; cat ${path}; echo; echo __LE_END__ ${path}; `
+      + `else echo __LE_ABSENT__ ${path}; fi`),
+].join("; ");
+
+/**
+ * Read-only: the inputs of the helper's `compute_device_digest` — the serial
+ * TWRP reports and the userdata partition, resolved by name the way the helper
+ * does (by-name link first, else sysfs PARTNAME). The GUID is read separately.
+ */
+export const DEVICE_IDENTITY_READ_COMMAND = [
+  'echo "le_serial=$(getprop ro.serialno)"',
+  'echo "le_boot_serial=$(getprop ro.boot.serialno)"',
+  'echo "le_byname=$(readlink -f /dev/block/by-name/userdata 2>/dev/null)"',
+  'for u in /sys/class/block/mmcblk0p*/uevent; do grep -qx PARTNAME=userdata "$u" 2>/dev/null && echo "le_sysfs=$(basename "$(dirname "$u")")"; done',
+].join("; ");
+
+const TRANSACTION_PHASES = ["", "prepare", "initialize", "transfer", "finalizing", "finalized"];
+const FORMAT_STATES = ["", "absent", "formatting", "formatted"];
+const ALL_PHASES = Object.freeze(["prepare", "initialize", "transfer", "finalize"]);
+
+/** Strict `key=value` lines; a malformed or duplicate line makes the whole file unreadable. */
+function parseKeyValues(text) {
+  const fields = Object.create(null);
+  for (const line of String(text ?? "").split("\n")) {
+    if (line === "") continue;
+    const match = /^([a-z][a-z0-9_]*)=(.*)$/.exec(line);
+    if (!match || Object.hasOwn(fields, match[1])) return null;
+    fields[match[1]] = match[2];
+  }
+  return fields;
+}
+
+/** Splits DIRECT_TRANSACTION_READ_COMMAND output into the two files, or reports it unreadable. */
+export function parseTransactionRead(stdout) {
+  const text = String(stdout ?? "").replace(/\r/g, "");
+  const lines = text.split("\n");
+  if (!lines.includes("__LE_CACHE__ mounted")) return { readable: false };
+  const files = {};
+  for (const [name, path] of [["state", DIRECT_TRANSACTION_PATH], ["receipt", DIRECT_RECEIPT_PATH]]) {
+    const absent = lines.includes(`__LE_ABSENT__ ${path}`);
+    const beginMarker = `__LE_BEGIN__ ${path}\n`;
+    const begin = text.indexOf(beginMarker);
+    const start = begin + beginMarker.length;
+    const end = begin === -1 ? -1 : text.indexOf(`\n__LE_END__ ${path}`, start - 1);
+    if (absent && begin === -1) files[name] = { present: false, text: null };
+    else if (!absent && begin !== -1 && end >= start - 1) files[name] = { present: true, text: text.slice(start, Math.max(start, end)) };
+    else return { readable: false };
+  }
+  return { readable: true, ...files };
+}
+
+/**
+ * Recomputes the helper's device digest (sha256 of `target=`, `serial=` and
+ * `userdata_guid=` lines) from TWRP, read-only. Returns null whenever any input
+ * cannot be read: the caller then binds the receipt to the guard instead.
+ */
+export async function computeDeviceDigest({ adb, target } = {}) {
+  try {
+    const fields = new Map();
+    const sysfs = [];
+    const reply = await adb.shell(DEVICE_IDENTITY_READ_COMMAND);
+    for (const raw of String(reply?.stdout ?? "").replace(/\r/g, "").split("\n")) {
+      const match = /^(le_[a-z_]+)=(.*)$/.exec(raw.trim());
+      if (!match) continue;
+      if (match[1] === "le_sysfs") sysfs.push(match[2]);
+      else if (!fields.has(match[1])) fields.set(match[1], match[2].trim());
+    }
+    const serial = fields.get("le_serial") || fields.get("le_boot_serial") || "";
+    if (!serial || /\s/.test(serial)) return null;
+    const byName = /^\/dev\/block\/(mmcblk0p\d+)$/.exec(fields.get("le_byname") ?? "")?.[1];
+    const node = byName ?? (sysfs.length === 1 && /^mmcblk0p\d+$/.test(sysfs[0]) ? sysfs[0] : null);
+    if (!node) return null;
+    const number = node.slice("mmcblk0p".length);
+    const info = await adb.shell(`/sbin/sgdisk --info=${number} /dev/block/mmcblk0`);
+    const guid = /^Partition unique GUID: (.*)$/m.exec(String(info?.stdout ?? "").replace(/\r/g, ""))?.[1] ?? "";
+    if (!guid) return null;
+    return await sha256Bytes(new TextEncoder().encode(`target=${target}\nserial=${serial}\nuserdata_guid=${guid}\n`));
+  } catch {
+    return null;
+  }
+}
+
+/** What to say about a refused device state: the state, why, and the one safe next step. */
+const REPORT_NEXT_STEP = "Leave the Echo in TWRP, do not run the install again, and report this with the log "
+  + "(Report a problem) so the device's state can be checked first. This page never resets an install transaction.";
+
+/**
+ * The state machine above, as a pure decision. `read` is `parseTransactionRead`
+ * output, `expected` the verified build (`bundleManifestSha256`, `target`,
+ * `release`) and `deviceDigest` the recomputed digest or null.
+ *
+ * Returns `{ status, resumeAt, allowRepeat, transaction, receipt, code, message }`:
+ *   status "unknown"  — the state could not be read; run as before, every browser guard stands.
+ *   status "fresh"    — no transaction on the device; start at prepare.
+ *   status "resume"   — start at `resumeAt` ("prepare" or "transfer").
+ *   status "complete" — finalized and confirmed: run nothing, hand over to LibreEcho.
+ *   status "refuse"   — run nothing; `message` names the state and the safe next step.
+ * `allowRepeat` lists the phases whose earlier browser attempt the device state settles.
+ */
+export async function classifyDirectTransaction({ read, expected, deviceDigest = null } = {}) {
+  const base = { resumeAt: null, allowRepeat: [], transaction: null, receipt: null, code: null };
+  const refuse = (code, message, extra = {}) => ({ ...base, ...extra, status: "refuse", code, message });
+  if (!read?.readable) {
+    return { ...base, status: "unknown", resumeAt: "prepare",
+      message: `the Echo's install state (${DIRECT_TRANSACTION_PATH}) could not be read; starting at prepare with every earlier attempt from this browser still refused` };
+  }
+  if (!read.state.present) {
+    return { ...base, status: "fresh", resumeAt: "prepare", allowRepeat: [...ALL_PHASES],
+      message: "no install transaction is recorded on this Echo; starting at prepare" };
+  }
+  const transaction = parseKeyValues(read.state.text);
+  const receipt = read.receipt.present ? parseKeyValues(read.receipt.text) : null;
+  const extra = { transaction, receipt };
+  if (!transaction) {
+    return refuse("transaction-unreadable", `the Echo's install state (${DIRECT_TRANSACTION_PATH}) is malformed, so how far `
+      + `the install got cannot be proven. Nothing was run. ${REPORT_NEXT_STEP}`, extra);
+  }
+  const phase = transaction.phase ?? "";
+  const format = transaction.format_state ?? "";
+  const described = `phase=${phase || "(none)"}, format_state=${format || "(none)"}`;
+  if (transaction.protocol !== "2" || !TRANSACTION_PHASES.includes(phase) || !FORMAT_STATES.includes(format)
+    || !/^[a-f0-9]{64}$/.test(transaction.device_digest ?? "")) {
+    return refuse("transaction-unreadable", `the Echo's install state (${described}, protocol=${transaction.protocol ?? "(none)"}) `
+      + `is not one this page understands, so how far the install got cannot be proven. Nothing was run. ${REPORT_NEXT_STEP}`, extra);
+  }
+  // Bound to this build and this device, or nothing of it is trusted.
+  const conflicts = [];
+  if (transaction.bundle_manifest_sha256 !== expected?.bundleManifestSha256) conflicts.push("bundle manifest");
+  if (transaction.target !== expected?.target) conflicts.push("target");
+  if (transaction.release !== expected?.release) conflicts.push("release");
+  if (conflicts.length) {
+    const recorded = `release ${transaction.release || "(none)"}, target ${transaction.target || "(none)"}`;
+    const next = phase === "finalized"
+      ? "That install finished: restart the Echo normally to start LibreEcho, and update it from LibreEcho itself."
+      : `To continue that install, choose release ${transaction.release || "(the recorded one)"} for this Echo and press Install again.`;
+    return refuse("transaction-conflict", `this Echo holds an install transaction for a different build (${recorded}, `
+      + `${described}; different ${conflicts.join(", ")}). This page never runs a phase over, repeats or resets another `
+      + `transaction, so nothing was run. ${next}`, extra);
+  }
+  if (deviceDigest !== null && transaction.device_digest !== deviceDigest) {
+    return refuse("transaction-conflict", `the Echo's install state (${described}) was recorded for a different device `
+      + `identity (serial or userdata partition) than this Echo reports now. Nothing was run. ${REPORT_NEXT_STEP}`, extra);
+  }
+  const bound = `${described}, release ${transaction.release}, target ${transaction.target}, bound to this build`;
+  if ((phase === "" || phase === "prepare") && (format === "" || format === "absent")) {
+    return { ...base, ...extra, status: "resume", resumeAt: "prepare", allowRepeat: [...ALL_PHASES],
+      message: `the Echo's install state is ${bound}: userdata is not formatted yet, and prepare is safe to repeat `
+        + "(it changes nothing once userdata already matches), so the install continues at prepare" };
+  }
+  if (phase === "initialize" && format === "formatting") {
+    return refuse("format-uncertain", `the Echo's install state is ${described}: formatting userdata started but was `
+      + `never confirmed. A format whose outcome is unknown is never repeated automatically, so nothing was run. ${REPORT_NEXT_STEP}`, extra);
+  }
+  if ((phase === "initialize" || phase === "transfer") && format === "formatted") {
+    return { ...base, ...extra, status: "resume", resumeAt: "transfer", allowRepeat: ["transfer", "finalize"],
+      message: `the Echo's install state is ${bound}: userdata is already prepared and formatted, so prepare and `
+        + "initialize are not run again and the install continues at transfer" };
+  }
+  if (phase === "finalizing") {
+    return refuse("finalize-uncertain", `the Echo's install state is ${described}: finalize started writing the boot `
+      + `slots but never confirmed that it finished. That is never repeated automatically, so nothing was run. ${REPORT_NEXT_STEP}`, extra);
+  }
+  if (phase === "finalized") {
+    const why = await finalizedReceiptProblem({ receipt, transaction, expected, deviceDigest });
+    if (why) {
+      return refuse("finalized-unconfirmed", `the Echo's install state records the install as finished (${described}), `
+        + `but its last receipt does not confirm it (${why}). Nothing was run and nothing will be repeated. Restart the `
+        + "Echo normally; if LibreEcho starts, finish setup as the guide's step 5 describes. If it does not, report this with the log.", extra);
+    }
+    return { ...base, ...extra, status: "complete",
+      message: `the Echo's install state is ${bound}, and its receipt confirms result=installed: `
+        + "the install already finished, so no phase runs again" };
+  }
+  return refuse("transaction-unreadable", `the Echo's install state (${described}) is not a combination the installer `
+    + `writes, so how far the install got cannot be proven. Nothing was run. ${REPORT_NEXT_STEP}`, extra);
+}
+
+/** Why a finalized transaction's receipt does not confirm the install, or null when it does. */
+async function finalizedReceiptProblem({ receipt, transaction, expected, deviceDigest }) {
+  if (!receipt) return "no readable receipt";
+  if (receipt.result !== "installed") return `result=${receipt.result ?? "(none)"}${receipt.error ? ` error=${receipt.error}` : ""}`;
+  const binding = { protocol: "2", phase: "finalize", bundle_manifest_sha256: expected.bundleManifestSha256,
+    target: expected.target, release: expected.release, device_digest: transaction.device_digest };
+  for (const [key, value] of Object.entries(binding)) {
+    if (receipt[key] !== value) return `receipt ${key} does not match`;
+  }
+  if (deviceDigest !== null && receipt.device_digest !== deviceDigest) return "receipt device does not match";
+  const invocation = await sha256Bytes(new TextEncoder().encode(
+    `2|finalize|${expected.bundleManifestSha256}|${transaction.device_digest}|${expected.target}|${expected.release}`));
+  if (receipt.invocation_sha256 !== invocation) return "receipt invocation digest does not match";
+  return null;
+}
+
+/**
+ * Reads the Echo's transaction guard and receipt (read-only) and classifies
+ * them. A transport failure is "unknown": the run then behaves exactly as it
+ * did before this existed, with every browser guard in force.
+ */
+export async function inspectDirectTransaction({ adb, bundleManifestSha256, target, release, terminal } = {}) {
+  let read = { readable: false };
+  try {
+    read = parseTransactionRead((await adb.shell(DIRECT_TRANSACTION_READ_COMMAND))?.stdout);
+  } catch (error) {
+    terminal?.warn(`the Echo's install state could not be read (${error.message})`);
+  }
+  const deviceDigest = read.readable && read.state.present ? await computeDeviceDigest({ adb, target }) : null;
+  if (read.readable && read.state.present) {
+    terminal?.line(deviceDigest
+      ? "device binding: the install state's device digest was recomputed from this Echo"
+      : "device binding: the device digest could not be recomputed here; the receipt is bound to the install state's digest instead");
+  }
+  return classifyDirectTransaction({ read, expected: { bundleManifestSha256, target, release }, deviceDigest });
 }

@@ -17,8 +17,8 @@ import {
   releasePageUrl,
   amonetArchiveUrl,
 } from "./release.js";
-import { STAGES, StageError, RecoveryStopped, RecoverySerialMismatch, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, verifyKaeruChain, rebootAndWait, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
-import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase } from "./direct-install.js";
+import { STAGES, StageError, RecoveryStopped, RecoverySerialMismatch, InstalledLibreEchoFound, probeInstalledLibreEcho, MANUAL_RECOVERY_STEPS, createMutex, validateRecoverySession, readFastbootIdentity, assessIdentity, submitUnlockPayload, readKaeruHeader, verifyKaeruChain, rebootAndWait, RECOVERY_TIMEOUT_MS, RECOVERY_POLL_INTERVAL_MS } from "./stages.js";
+import { DIRECT_PROTOCOL, DIRECT_INCOMING_DIR, prepareDirectInstall, pushDirectControl, pushDirectPayloads, runDirectPhase, inspectDirectTransaction } from "./direct-install.js";
 import { payloadForProfile, isBuildDescription } from "./profiles.js";
 import {
   installableBoards,
@@ -160,6 +160,15 @@ export const state = {
   // serial, seen during the current or last recovery wait. It is never used
   // automatically; it points the operator at "My Echo is already in recovery".
   recoveryOtherSerial: null,
+  // Set when, during the current or last recovery wait, the device that answered
+  // ADB was an installed LibreEcho (18d1:d001) rather than TWRP:
+  // `{ sameSerial, target }`. Issue #28: the page used to say only "TWRP is not
+  // running" and keep waiting.
+  recoveryLibreEcho: null,
+  // True once this run has sent its first install phase to the helper. A
+  // LibreEcho that boots instead of TWRP before that means "already installed";
+  // after it (the reboot after prepare), it means "enter recovery by hand".
+  installPhaseStarted: false,
   // Set by the silent already-granted probe; suppresses the permission button
   // entirely when this page already holds access for the selected device.
   recoveryAlreadyGranted: false,
@@ -179,6 +188,9 @@ export const state = {
   postInstallIp: null,
   postInstallSerial: "",
   postInstallGeneration: 0,
+  // True when the post-install check was started for an Echo found already
+  // running LibreEcho, rather than right after this page's own install.
+  postInstallFound: false,
 };
 
 function setStatus(node, text, kind = "pending") {
@@ -1483,6 +1495,7 @@ function enterRecoveryWaitingUI(deadline = null) {
   // not silently suppress a click this run genuinely needs.
   state.recoveryAlreadyGranted = false;
   state.recoveryOtherSerial = null;
+  state.recoveryLibreEcho = null;
   if (dom.buttons.grantRecovery) dom.buttons.grantRecovery.textContent = "Allow USB access to TWRP…";
   if (dom.recoveryWait) {
     dom.recoveryWait.style.display = "";
@@ -1540,7 +1553,10 @@ function renderRecoveryCallout() {
   const body = document.createElement("span");
   const countdown = document.createElement("span");
   countdown.id = "recovery-callout-countdown";
-  if (state.recoveryOtherSerial) {
+  if (state.recoveryLibreEcho?.sameSerial) {
+    title.textContent = "Your Echo started LibreEcho, not TWRP";
+    body.textContent = ` ${libreEchoDuringWaitText()} `;
+  } else if (state.recoveryOtherSerial) {
     title.textContent = "An Echo in recovery reports a different serial";
     body.textContent = ` It reports ${state.recoveryOtherSerial}, not ${state.identity?.serialMasked ?? "the fastboot serial"}, so this page will not use it by itself. `
       + "If it is the Echo you just unlocked, stop waiting, then press “My Echo is already in recovery”. "
@@ -1697,11 +1713,25 @@ export async function startFromRecovery({ request = null, open = openAdb } = {})
   // an ADB poll already has this one USB interface.
   const releaseOperation = beginDeviceOperation("entry");
   if (!releaseOperation) return null;
+  let found = null;
   try {
     return await runRecoveryEntry({ request, open });
+  } catch (error) {
+    if (!(error instanceof InstalledLibreEchoFound)) throw error;
+    found = error;
   } finally {
     releaseOperation();
   }
+  // The operator chose an Echo that is running LibreEcho (18d1:d001): it is
+  // installed, not in recovery. Nothing is identified or bound; the device is
+  // the one they picked in Chrome's list, so hand over to the read-only
+  // post-install check for that serial, which shows how to open setup.
+  terminal.ok(`${found.message}; it needs nothing from the recovery step`);
+  terminal.info("checking LibreEcho on this Echo (read-only), then showing how to open its setup page; "
+    + `to install again instead, put it into recovery by hand: ${MANUAL_RECOVERY_STEPS}`);
+  await (postInstallHook ?? waitForLibreEcho)({ serial: found.serial, found: true })
+    .catch((error) => terminal.warn(`checking LibreEcho failed: ${error.message}`));
+  return null;
 }
 
 /** The body of `startFromRecovery`, with the page-wide USB slot already claimed. */
@@ -1801,9 +1831,12 @@ export async function probeRecoveryEntry({ client, terminal } = {}) {
     .split(/\r?\n/).map((line) => line.trim());
   terminal?.line(`recovery probe: twrp=${twrpVersion || "(none)"} device=${device || "(none)"} serial=${maskSerial(serial)}`);
   // The TWRP marker: the command-line installer's charset bound, and a version
-  // number. A running LibreEcho image answers ADB on 18d1:d001 too, and has no
-  // ro.twrp.version, so this is what tells the two apart.
+  // number. An installed LibreEcho answers ADB on its own 18d1:d001 and has no
+  // getprop at all, so this is what tells the two apart. When the device then
+  // shows LibreEcho's own markers it is reported as exactly that (issue #28).
   if (!/^\d/.test(twrpVersion) || !TWRP_MARKER.test(twrpVersion)) {
+    const running = await probeInstalledLibreEcho(client);
+    if (running) throw new InstalledLibreEchoFound(running);
     throw new StageError("recovery", "ADB answered but TWRP is not running on the device you chose. "
       + "If the Echo shows the black fastboot screen, use “Query device” instead; if it is already running LibreEcho, it is installed and needs nothing from this step");
   }
@@ -1959,12 +1992,45 @@ export const USB_BUSY_HINT = "Another program on this computer is using your Ech
   + "the unlock is never sent again from there.";
 
 /**
+ * What to tell the operator when their own Echo answers as LibreEcho during a
+ * recovery wait. Before this run sent any install phase, LibreEcho running means
+ * it is already installed: Stop hands over to setup. After a phase (the reboot
+ * that follows prepare), the install is part-way and must continue from TWRP.
+ */
+function libreEchoDuringWaitText() {
+  const manual = `put it into recovery by hand: ${MANUAL_RECOVERY_STEPS}. This page keeps waiting and continues by itself when TWRP appears`;
+  return state.installPhaseStarted
+    ? `The install is part-way through and must continue from TWRP, so ${manual}. If the countdown runs out first, `
+      + "press Install again: the page reads the Echo's own install state and resumes from it, without repeating anything whose outcome is unknown."
+    : "LibreEcho is already installed on it. To finish setting it up, press Stop: the page then checks LibreEcho and shows how to open setup. "
+      + `To install again instead, ${manual}.`;
+}
+
+/**
  * Records what a refused recovery candidate means for the operator: an Echo in
  * TWRP whose ADB serial is not the fastboot serial (shown in the wait UI with
  * the way forward), or a USB interface held by another program. Each kind is
  * logged once per wait so the log stays readable.
  */
 function noteRecoveryRefusal(error, logged) {
+  if (error instanceof InstalledLibreEchoFound) {
+    if (error.sameSerial) {
+      if (!state.recoveryLibreEcho?.sameSerial) {
+        state.recoveryLibreEcho = { sameSerial: true, target: error.target };
+        renderRecoveryCallout();
+        refreshControls();
+      }
+      if (!logged.has("libreecho:same")) {
+        logged.add("libreecho:same");
+        terminal.warn(`your Echo answered as LibreEcho (target ${error.target}), not TWRP. ${libreEchoDuringWaitText()}`);
+      }
+    } else if (!logged.has(`libreecho:${error.serial}`)) {
+      logged.add(`libreecho:${error.serial}`);
+      terminal.warn(`an Echo running LibreEcho (serial ${maskSerial(error.serial)}) is connected; it is not the Echo `
+        + "this page identified, so it is not used");
+    }
+    return true;
+  }
   if (error instanceof RecoverySerialMismatch) {
     const masked = maskSerial(error.observedSerial);
     if (state.recoveryOtherSerial !== masked) {
@@ -2034,6 +2100,7 @@ async function pollGrantedRecovery({ expectedSerial, expectedBoard, identity, ep
       }
       // ADB has answered with a serial: this device is settled for the wait.
       if (error instanceof RecoverySerialMismatch) mismatch?.identified(device);
+      if (error instanceof InstalledLibreEchoFound && !error.sameSerial) mismatch?.identified(device);
       if (!noteRecoveryRefusal(error, refusals)) terminal.line(`ignoring a granted recovery candidate: ${error.message}`);
     }
   }
@@ -2112,11 +2179,11 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
         terminal.line(`recovery poll failed: ${error.message}`);
       }
       if (claimed) { accepted = true; return { client: claimed.client, header: state.kaeruHeader }; }
-      if (Date.now() >= deadline) throw new StageError("recovery", "timed out waiting for TWRP on the selected serial");
+      if (Date.now() >= deadline) throw recoveryTimeoutError();
       await recoverySleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())), controller.signal);
     }
   } catch (error) {
-    if (timedOut) throw new StageError("recovery", "timed out waiting for TWRP on the selected serial");
+    if (timedOut) throw recoveryTimeoutError();
     throw error;
   } finally {
     clearTimeout(deadlineTimer);
@@ -2134,6 +2201,20 @@ export async function awaitRecovery({ timeoutMs = RECOVERY_TIMEOUT_MS, intervalM
     }
     refreshControls();
   }
+}
+
+/**
+ * The recovery-wait timeout. When the identified Echo answered as LibreEcho
+ * during the wait, TWRP is not coming back by itself: say how to enter it by
+ * hand and that Install resumes from the Echo's own state.
+ */
+function recoveryTimeoutError() {
+  if (!state.recoveryLibreEcho?.sameSerial) {
+    return new StageError("recovery", "timed out waiting for TWRP on the selected serial");
+  }
+  return new StageError("recovery", "timed out waiting for TWRP: your Echo started LibreEcho instead. "
+    + `Put it into recovery by hand: ${MANUAL_RECOVERY_STEPS}. Then press Install again: the page reads the Echo's own `
+    + "install state and resumes from it, without repeating anything whose outcome is unknown");
 }
 
 export async function grantRecovery(options = {}) {
@@ -2395,6 +2476,19 @@ function primaryAction() {
     if (post) return post;
   }
   if (state.running) {
+    if (state.recoveryWaiting && state.recoveryLibreEcho?.sameSerial) {
+      // Issue #28: the identified Echo answered as LibreEcho, not TWRP.
+      return state.installPhaseStarted
+        ? { step: "connect-device", label: "Waiting for TWRP", kind: "warn", suppressed: true,
+          message: "Your Echo started LibreEcho instead of TWRP. The install is part-way through and continues from TWRP.",
+          hint: `Put it into recovery by hand: ${MANUAL_RECOVERY_STEPS}. This page continues by itself when TWRP appears.`,
+          secondary: "If the countdown runs out, press Install again: it resumes from the Echo's own install state." }
+        : { step: "connect-device", label: "Stop and check LibreEcho", kind: "action", focus: true,
+          message: "Your Echo is running LibreEcho, so LibreEcho is already installed on it.",
+          hint: "To finish setting it up, press this: the page checks LibreEcho and shows how to open setup. "
+            + `To install again instead, put it into recovery by hand: ${MANUAL_RECOVERY_STEPS}.`,
+          secondary: "Checking only reads; nothing is reinstalled.", run: () => requestStop() };
+    }
     if (state.recoveryWaiting) {
       if (state.recoveryAlreadyGranted) {
         // This origin already holds permission for the device and the poller is
@@ -2746,6 +2840,8 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
   state.abort = false;
   state.stageProgress = {};
   state.receipts = [];
+  state.installPhaseStarted = false;
+  state.recoveryLibreEcho = null;
   endPostInstall();
   setRunning(true);
   terminal.phase(1, STAGES.length, dryRun ? "rehearsal: no writes" : "browser one-shot install");
@@ -2886,80 +2982,120 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
       isCancelled: () => state.abort,
     };
 
-    currentStage("stage");
-    // Only the bounded helper and the anchor manifest reach /cache: no payload is
-    // ever staged there, and the legacy `/cache/libreecho-bundle` path is unused.
-    await pushDirectControl({ adb: state.adb, helperBytes: state.directHelper, manifestText: state.directManifestText, terminal, isCancelled: () => state.abort });
-    state.stageProgress.stage = "done";
-    assertNotAborted("stage");
+    // Issue #28: before any phase, read the Echo's own install record (read-only)
+    // and let it decide where this install stands. See the state machine in
+    // direct-install.js (`classifyDirectTransaction`). The device's record, not
+    // this browser's attempt guard, is the source of truth; the guard is only
+    // ever satisfied by a device state that proves the earlier outcome.
+    const transaction = await inspectDirectTransaction({ adb: state.adb, bundleManifestSha256: phaseShared.bundleManifestSha256,
+      target: phaseShared.target, release: phaseShared.release, terminal });
+    assertNotAborted("recovery");
+    if (transaction.status === "refuse") throw new StageError("install", transaction.message);
+    if (transaction.status === "unknown") terminal.warn(transaction.message);
+    else terminal.info(transaction.message);
+    const allowRepeat = new Set(transaction.allowRepeat);
+    const transactionPhase = transaction.transaction?.phase ?? null;
+    const phaseRun = (phase, options = {}) => {
+      state.installPhaseStarted = true;
+      return runDirectPhase({ ...phaseShared, phase, deviceAllowsRepeat: allowRepeat.has(phase), transactionPhase, ...options });
+    };
 
-    currentStage("prepare");
-    const prepared = await runDirectPhase({ ...phaseShared, phase: "prepare" });
-    state.receipts.push(prepared);
-    phaseShared.deviceDigest = prepared.device_digest;
-    if (!["prepare-ok", "prepare-noop"].includes(prepared.result)) {
-      throw new StageError("prepare", `the prepare phase returned result=${prepared.result ?? "unknown"}`);
-    }
-    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-      throw new StageError("install", "expdb Kaeru header changed during the prepare phase; do not reboot");
-    }
-    assertNotAborted("prepare");
-    if (prepared.reboot_required === "1") {
-      terminal.info("userdata was reshaped; rebooting recovery before it can be initialized");
-      await rebootAndWait({ adb: state.adb, target: "recovery", terminal });
-      // The reboot disconnected the pre-reboot session: drop it so the next wait
-      // opens a fresh serial-bound session instead of reusing the stale handle.
-      invalidateRecovery({ close: false });
-      const next = await awaitRecovery(recovery);
-      state.adb = next.client;
-      phaseShared.adb = state.adb;
-      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-        throw new StageError("install", "expdb Kaeru header changed after recovery reboot; do not install");
+    if (transaction.status === "complete") {
+      // Finished earlier (in this browser or another): nothing is pushed and no
+      // phase runs. Reboot into LibreEcho and hand over to setup, as after a run.
+      terminal.ok("LibreEcho is already installed on this Echo (install state finalized, receipt result=installed); "
+        + "skipping every install phase");
+      state.receipts.push(transaction.receipt);
+      for (const stage of ["stage", "prepare", "initialize", "transfer", "finalize"]) state.stageProgress[stage] = "done";
+    } else {
+      const resumeAtTransfer = transaction.resumeAt === "transfer";
+
+      currentStage("stage");
+      // Only the bounded helper and the anchor manifest reach /cache: no payload is
+      // ever staged there, and the legacy `/cache/libreecho-bundle` path is unused.
+      await pushDirectControl({ adb: state.adb, helperBytes: state.directHelper, manifestText: state.directManifestText, terminal, isCancelled: () => state.abort });
+      state.stageProgress.stage = "done";
+      assertNotAborted("stage");
+
+      if (resumeAtTransfer) {
+        // prepare and initialize are proven complete by the device; their receipts
+        // must now be bound to the device digest the install state recorded.
+        phaseShared.deviceDigest = transaction.transaction.device_digest;
+        terminal.ok("prepare and initialize already completed on this Echo (userdata is formatted); not repeating them");
+        state.stageProgress.prepare = "done";
+        state.stageProgress.initialize = "done";
+      } else {
+        currentStage("prepare");
+        const prepared = await phaseRun("prepare");
+        state.receipts.push(prepared);
+        phaseShared.deviceDigest = prepared.device_digest;
+        if (!["prepare-ok", "prepare-noop"].includes(prepared.result)) {
+          throw new StageError("prepare", `the prepare phase returned result=${prepared.result ?? "unknown"}`);
+        }
+        if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+          throw new StageError("install", "expdb Kaeru header changed during the prepare phase; do not reboot");
+        }
+        assertNotAborted("prepare");
+        if (prepared.reboot_required === "1") {
+          terminal.info("userdata was reshaped; rebooting recovery before it can be initialized");
+          await rebootAndWait({ adb: state.adb, target: "recovery", terminal });
+          // The reboot disconnected the pre-reboot session: drop it so the next wait
+          // opens a fresh serial-bound session instead of reusing the stale handle.
+          // If the Echo boots LibreEcho instead of TWRP, the wait says so and how to
+          // enter recovery by hand; Install then resumes here from the device state.
+          invalidateRecovery({ close: false });
+          const next = await awaitRecovery(recovery);
+          state.adb = next.client;
+          phaseShared.adb = state.adb;
+          if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+            throw new StageError("install", "expdb Kaeru header changed after recovery reboot; do not install");
+          }
+        }
+        state.stageProgress.prepare = "done";
+        assertNotAborted("prepare");
+
+        currentStage("initialize");
+        const initialized = await phaseRun("initialize");
+        state.receipts.push(initialized);
+        if (initialized.result !== "initialized") {
+          throw new StageError("initialize", `the initialize phase returned result=${initialized.result ?? "unknown"}`);
+        }
+        if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+          throw new StageError("install", "expdb Kaeru header changed during initialize; do not install");
+        }
+        state.stageProgress.initialize = "done";
+        assertNotAborted("initialize");
       }
-    }
-    state.stageProgress.prepare = "done";
-    assertNotAborted("prepare");
 
-    currentStage("initialize");
-    const initialized = await runDirectPhase({ ...phaseShared, phase: "initialize" });
-    state.receipts.push(initialized);
-    if (initialized.result !== "initialized") {
-      throw new StageError("initialize", `the initialize phase returned result=${initialized.result ?? "unknown"}`);
-    }
-    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-      throw new StageError("install", "expdb Kaeru header changed during initialize; do not install");
-    }
-    state.stageProgress.initialize = "done";
-    assertNotAborted("initialize");
+      currentStage("transfer");
+      const transferred = await phaseRun("transfer");
+      state.receipts.push(transferred);
+      if (transferred.result !== "transferred") {
+        throw new StageError("transfer", `the transfer phase returned result=${transferred.result ?? "unknown"}`);
+      }
+      assertNotAborted("transfer");
+      const pushed = await pushDirectPayloads({ adb: state.adb, roles: state.directRoles, files: state.files, sums: state.sums, terminal, isCancelled: () => state.abort });
+      terminal.ok(`pushed ${pushed.fileCount} verified payload(s) into ${DIRECT_INCOMING_DIR}`);
+      state.stageProgress.transfer = "done";
+      assertNotAborted("transfer");
 
-    currentStage("transfer");
-    const transferred = await runDirectPhase({ ...phaseShared, phase: "transfer" });
-    state.receipts.push(transferred);
-    if (transferred.result !== "transferred") {
-      throw new StageError("transfer", `the transfer phase returned result=${transferred.result ?? "unknown"}`);
+      currentStage("finalize");
+      // The landed-completely gate: finalize --dry-run verifies every upload by
+      // digest and writes nothing. Only then is the real finalize (no format) run.
+      const rehearsal = await phaseRun("finalize", { dryRun: true });
+      if (rehearsal.result !== "dry-run-ok") {
+        throw new StageError("finalize", `the landed-completely check returned result=${rehearsal.result ?? "unknown"}`);
+      }
+      const finalized = await phaseRun("finalize");
+      state.receipts.push(finalized);
+      if (finalized.result !== "installed") {
+        throw new StageError("finalize", `the finalize phase returned result=${finalized.result ?? "unknown"}`);
+      }
+      if (await readKaeruHeader(state.adb) !== kaeruBefore) {
+        throw new StageError("install", "expdb Kaeru header changed during finalize; do not reboot");
+      }
+      state.stageProgress.finalize = "done";
     }
-    assertNotAborted("transfer");
-    const pushed = await pushDirectPayloads({ adb: state.adb, roles: state.directRoles, files: state.files, sums: state.sums, terminal, isCancelled: () => state.abort });
-    terminal.ok(`pushed ${pushed.fileCount} verified payload(s) into ${DIRECT_INCOMING_DIR}`);
-    state.stageProgress.transfer = "done";
-    assertNotAborted("transfer");
-
-    currentStage("finalize");
-    // The landed-completely gate: finalize --dry-run verifies every upload by
-    // digest and writes nothing. Only then is the real finalize (no format) run.
-    const rehearsal = await runDirectPhase({ ...phaseShared, phase: "finalize", dryRun: true });
-    if (rehearsal.result !== "dry-run-ok") {
-      throw new StageError("finalize", `the landed-completely check returned result=${rehearsal.result ?? "unknown"}`);
-    }
-    const finalized = await runDirectPhase({ ...phaseShared, phase: "finalize" });
-    state.receipts.push(finalized);
-    if (finalized.result !== "installed") {
-      throw new StageError("finalize", `the finalize phase returned result=${finalized.result ?? "unknown"}`);
-    }
-    if (await readKaeruHeader(state.adb) !== kaeruBefore) {
-      throw new StageError("install", "expdb Kaeru header changed during finalize; do not reboot");
-    }
-    state.stageProgress.finalize = "done";
 
     currentStage("verify");
     terminal.phase(STAGES.length, STAGES.length, "verify and reboot");
@@ -2972,9 +3108,18 @@ export async function runInstall({ dryRun = false, recovery = {} } = {}) {
     afterInstall = { serial: state.identity?.serialRaw ?? "" };
   } catch (error) {
     const stage = error instanceof StageError ? error.stage : "unknown";
+    // Issue #28: the identified Echo answered as LibreEcho during the recovery
+    // wait before this run sent any install phase. It is already installed, so
+    // once the run has ended, hand over to the read-only post-install check.
+    if (!dryRun && !state.installPhaseStarted && state.recoveryLibreEcho?.sameSerial && state.identity?.serialRaw) {
+      afterInstall = { serial: state.identity.serialRaw, found: true };
+    }
     terminal.error(`${stage} stage failed: ${error.message}`);
     if (error.detail) terminal.line(String(error.detail));
     terminal.info("nothing further was attempted. Preserve the current device state; do not re-run a submitted unlock or installer ZIP without classifying its result first.");
+    if (afterInstall?.found) {
+      terminal.info("your Echo is running LibreEcho, so it is already installed; checking it (read-only) and showing how to open its setup page");
+    }
     // The failure must be visible without scrolling back to the log.
     const failedStep = stepCardForStage(stage) ?? "install";
     setStatusBar({ step: failedStep, message: `${stage} stage failed: ${error.message}`,
@@ -3023,6 +3168,7 @@ function endPostInstall() {
   state.postInstallGeneration += 1;
   state.postInstall = null;
   state.postInstallIp = null;
+  state.postInstallFound = false;
 }
 
 async function findGrantedRunningEcho({ serial, deadline, generation }) {
@@ -3046,10 +3192,13 @@ async function findGrantedRunningEcho({ serial, deadline, generation }) {
  */
 export async function waitForLibreEcho({ serial = state.postInstallSerial || state.identity?.serialRaw || "",
   request = false, chooser = (filters) => navigator.usb.requestDevice({ filters }), open = openAdb,
-  pollOptions = {} } = {}) {
+  pollOptions = {}, found = null } = {}) {
   state.postInstallGeneration += 1;
   const generation = state.postInstallGeneration;
   const superseded = () => generation !== state.postInstallGeneration;
+  // `found` marks an Echo that was already running LibreEcho (issue #28) rather
+  // than one this page just installed; "Check my Echo" keeps whichever it was.
+  if (found !== null) state.postInstallFound = found === true;
   state.postInstallSerial = serial;
   state.postInstall = "booting";
   refreshStatusBar();
@@ -3125,7 +3274,9 @@ function postInstallAction() {
   switch (s) {
     case "booting":
       return { step: "install", label: "Check my Echo", kind: "pending",
-        message: "Installed. Your Echo is restarting into LibreEcho; keep it plugged in while this page checks that it started.",
+        message: state.postInstallFound
+          ? "LibreEcho is already installed on your Echo; keep it plugged in while this page checks that it is running."
+          : "Installed. Your Echo is restarting into LibreEcho; keep it plugged in while this page checks that it started.",
         hint: "This usually takes one to two minutes. If nothing happens, press Check my Echo and choose your Echo's ADB device in Chrome's list (the only one the list offers).",
         secondary: "Checking only reads; nothing is reinstalled.", run: check };
     case "checking":

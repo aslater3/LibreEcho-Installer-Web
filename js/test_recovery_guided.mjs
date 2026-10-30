@@ -116,8 +116,9 @@ test('the recovery chooser filter is the TWRP VID:PID only, never narrowed by se
 test('the recovery chooser is never unfiltered and never class-filtered', () => {
   for (const serial of ['TEST-DOT', '', '   ', null, undefined]) {
     const filters = recoveryChooserFilters({ serial });
-    // Radar's TWRP (4ee2) and the Echo Dot TWRP identity from issue #322 (d001).
-    assert.equal(filters.length, 2, 'the chooser must list exactly the two recovery USB identities');
+    // TWRP (4ee2, Radar and Echo Dot) and LibreEcho's own adbd (d001), which is
+    // listed only so an installed LibreEcho can be recognised, never as TWRP.
+    assert.equal(filters.length, 2, 'the chooser must list exactly TWRP and the installed-LibreEcho identity');
     for (const filter of filters) {
       assert.ok(Number.isInteger(filter.vendorId) && Number.isInteger(filter.productId),
         'the filter must stay scoped to recovery VID:PID');

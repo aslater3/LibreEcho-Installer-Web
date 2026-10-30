@@ -81,6 +81,58 @@ export class RecoverySerialMismatch extends StageError {
 }
 
 /**
+ * How to put an unlocked (Kaeru) Echo into TWRP by hand, from the install
+ * guide's "Which button to hold" table (aslater3/LibreEcho docs/install). The
+ * same for the Echo 2nd Gen and the Echo Dot 2nd Gen.
+ */
+export const MANUAL_RECOVERY_STEPS = "unplug the Echo, hold Volume Up (+) only (both volume buttons together are ignored), "
+  + "plug it back in while still holding it, and keep holding it for a few seconds";
+
+/**
+ * Read-only markers of an installed LibreEcho, asked only after a device has
+ * failed the TWRP check. LibreEcho's own adbd (18d1:d001) has no `getprop`; the
+ * image carries its target identity in /etc/libreecho/target (`target_id=`)
+ * and the bootloader's serial on the kernel command line.
+ */
+export const LIBREECHO_IDENTITY_COMMAND = [
+  "echo le_target=$(sed -n 's/^target_id=//p' /etc/libreecho/target 2>/dev/null | head -n 1)",
+  "echo le_serial=$(tr ' ' '\\n' < /proc/cmdline 2>/dev/null | sed -n 's/^androidboot.serialno=//p' | head -n 1)",
+].join("; ");
+
+/** `{ target, serial }` when the device answers as an installed LibreEcho, else null. Never throws. */
+export async function probeInstalledLibreEcho(client) {
+  try {
+    const reply = await client.shell(LIBREECHO_IDENTITY_COMMAND);
+    const fields = new Map();
+    for (const raw of String(reply?.stdout ?? "").split(/\r?\n/)) {
+      const match = /^(le_target|le_serial)=(.*)$/.exec(raw.trim());
+      if (match && !fields.has(match[1])) fields.set(match[1], match[2].trim());
+    }
+    const target = fields.get("le_target") ?? "";
+    if (!/^[a-z][a-z0-9_]{0,31}$/.test(target)) return null;
+    const serial = fields.get("le_serial") ?? "";
+    return { target, serial: /^[A-Za-z0-9._-]{1,64}$/.test(serial) ? serial : "" };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Raised instead of "TWRP is not running" when the device that answered ADB is
+ * an installed LibreEcho (issue #28): its adbd is 18d1:d001, not a recovery.
+ * `sameSerial` says whether it is the Echo the page has identified.
+ */
+export class InstalledLibreEchoFound extends StageError {
+  constructor({ target = "", serial = "", expectedSerial = "" } = {}) {
+    super("recovery", `this Echo is running LibreEcho (target ${target || "unknown"}), not TWRP, so LibreEcho is already installed on it`);
+    this.name = "InstalledLibreEchoFound";
+    this.target = target;
+    this.serial = serial;
+    this.sameSerial = Boolean(serial && expectedSerial && serial === expectedSerial);
+  }
+}
+
+/**
  * How long a recovery wait tolerates TWRP not appearing, in milliseconds.
  *
  * Ten minutes, not three: the operator may have to reboot the device by hand and
@@ -446,6 +498,9 @@ export async function validateRecoverySession({ client, expectedSerial, expected
   const [twrpVersion = "", device = "", serial = ""] = lines;
   terminal?.line(`adb probe: twrp=${twrpVersion || "(none)"} device=${device || "(none)"} serial=${maskSerial(serial)}`);
   if (!/^\d/.test(twrpVersion)) {
+    // 18d1:d001 is LibreEcho's own adbd: say so rather than "not TWRP".
+    const running = await probeInstalledLibreEcho(client);
+    if (running) throw new InstalledLibreEchoFound({ ...running, expectedSerial });
     throw new StageError("recovery", "ADB answered but TWRP is not running on the selected device");
   }
   if (!expectedSerial) {
